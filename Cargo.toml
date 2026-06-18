@@ -1,0 +1,65 @@
+[package]
+name = "tmu-rs"
+version = "0.4.0"
+edition = "2021"
+description = "Bit-packed weighted multiclass Tsetlin Machine in Rust, with bit-parallel/multi-threaded training, a fast booleanizer, and ports of the TMU classification demos."
+license = "MIT"
+autoexamples = false
+
+[dependencies]
+rayon = { version = "1", optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[features]
+default = []
+parallel = ["dep:rayon"]
+
+[[bin]]
+name = "tmu-rs"
+path = "src/main.rs"
+
+[lib]
+name = "tmu_rs"
+path = "src/lib.rs"
+
+# --- ports of the TMU classification demos ---
+[[example]]
+name = "xor"               # TMU XORDemo
+path = "examples/xor.rs"
+
+[[example]]
+name = "noisy_xor"         # TMU NoisyXORDemo
+path = "examples/noisy_xor.rs"
+
+[[example]]
+name = "interpretability"  # TMU InterpretabilityDemo
+path = "examples/interpretability.rs"
+
+[[example]]
+name = "breast_cancer"     # TMU BreastCancerDemo
+path = "examples/breast_cancer.rs"
+
+[[example]]
+name = "mnist"             # TMU MNISTDemo / MNISTDemoWeightedClauses
+path = "examples/mnist.rs"
+
+[[example]]
+name = "imdb"              # TMU IMDbTextCategorizationDemo
+path = "examples/imdb.rs"
+
+[[example]]
+name = "ndr_flows"         # extra: network-flow detection (not in TMU)
+path = "examples/ndr_flows.rs"
+
+[[bench]]
+name = "throughput"
+path = "benches/throughput.rs"
+harness = false
+
+# Build with: RUSTFLAGS="-C target-cpu=native" cargo build --release
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
