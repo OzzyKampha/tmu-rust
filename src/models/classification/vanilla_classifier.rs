@@ -27,6 +27,12 @@ pub struct TsetlinMachine {
     boost_true_positive: bool,
     max_included_literals: usize,
     clause_drop_p: f64,
+    /// Per-literal dropout probability during training (mirrors TMU's `literal_drop_p`).
+    literal_drop_p: f64,
+    /// Dedicated RNG for literal-active mask generation (independent of clause/class RNGs).
+    literal_rng: Rng,
+    /// Precomputed binary digits for Bernoulli(1 - literal_drop_p) mask generation.
+    dig_lit_active: Vec<u8>,
 
     /// Bit-plane TA counters. Clause `cj = c*CPC + j` occupies
     /// `state[cj*state_bits*words .. (cj+1)*state_bits*words]`; within that
@@ -112,6 +118,9 @@ impl TsetlinMachine {
             .map(|c| Rng::new(seed ^ (c as u64 + n_clauses as u64 + 1).wrapping_mul(GOLDEN)))
             .collect();
 
+        // Dedicated seed for literal-active RNG so it doesn't disturb the other streams.
+        let literal_rng = Rng::new(seed ^ 0x4C49_5445_5241_4C21u64);
+
         TsetlinMachine {
             n_classes,
             n_features,
@@ -124,6 +133,9 @@ impl TsetlinMachine {
             boost_true_positive,
             max_included_literals: usize::MAX,
             clause_drop_p: 0.0,
+            literal_drop_p: 0.0,
+            literal_rng,
+            dig_lit_active: digits_of(1.0, MASK_BITS),
             state,
             weights: vec![1i32; n_clauses],
             rngs,
@@ -148,6 +160,18 @@ impl TsetlinMachine {
     pub fn clause_drop_p(mut self, p: f64) -> Self {
         assert!((0.0..1.0).contains(&p), "clause_drop_p must be in [0, 1)");
         self.clause_drop_p = p;
+        self
+    }
+
+    /// Per-literal dropout probability during training (default: 0.0 = no drop).
+    ///
+    /// Each literal is independently suppressed with this probability on every
+    /// training sample — both its feedback and its contribution to the firing
+    /// check are masked out.  Mirrors TMU's `literal_drop_p`.
+    pub fn literal_drop_p(mut self, p: f64) -> Self {
+        assert!((0.0..1.0).contains(&p), "literal_drop_p must be in [0, 1)");
+        self.literal_drop_p = p;
+        self.dig_lit_active = digits_of(1.0 - p, MASK_BITS);
         self
     }
 
@@ -279,16 +303,18 @@ impl TsetlinMachine {
     fn fire_train(&self, c: usize, j: usize) -> bool {
         let cb = self.clause_base(c, j);
         let bw = self.state_bits * self.words;
+        let all_active: Vec<u64> = vec![!0u64; self.words];
         crate::clause_bank::dense::clause_fire(
             &self.state[cb..cb + bw],
             &self.literals,
             &self.valid,
             self.words,
             self.state_bits,
+            &all_active,
         )
     }
 
-    fn class_sum_train(&self, c: usize) -> i32 {
+    fn class_sum_train(&self, c: usize, lit_active: &[u64]) -> i32 {
         let cps = self.clauses_per_class;
         let words = self.words;
         let sb = self.state_bits;
@@ -299,8 +325,8 @@ impl TsetlinMachine {
         for j in 0..cps {
             let jbase = base + j * bw + tb_offset;
             let mut fired = true;
-            for k in 0..words {
-                if self.state[jbase + k] & self.valid[k] & !self.literals[k] != 0 {
+            for (k, &la) in lit_active.iter().enumerate() {
+                if self.state[jbase + k] & self.valid[k] & la & !self.literals[k] != 0 {
                     fired = false;
                     break;
                 }
@@ -314,8 +340,7 @@ impl TsetlinMachine {
     }
 
     #[cfg_attr(feature = "parallel", allow(dead_code))]
-    fn update_class(&mut self, c: usize, target: u8) {
-        let sum = self.class_sum_train(c);
+    fn update_class(&mut self, c: usize, target: u8, sum: i32, lit_active: &[u64]) {
         let cps = self.clauses_per_class;
         let words = self.words;
         let sb = self.state_bits;
@@ -366,9 +391,10 @@ impl TsetlinMachine {
             if (target == 1) == positive {
                 clause_type_i(
                     chunk, w, lit, val, words, sb, boost, &inv_mask, &keep_mask, wmax, max_inc,
+                    lit_active,
                 );
             } else {
-                clause_type_ii(chunk, w, lit, val, words, sb);
+                clause_type_ii(chunk, w, lit, val, words, sb, lit_active);
             }
         }
     }
@@ -388,6 +414,7 @@ impl TsetlinMachine {
         valid: &[u64],
         dig_inv: &[u8],
         dig_keep: &[u8],
+        lit_active: &[u64],
         cps: usize,
         words: usize,
         sb: usize,
@@ -428,9 +455,10 @@ impl TsetlinMachine {
             if (target == 1) == positive {
                 clause_type_i(
                     chunk, w, lit, valid, words, sb, boost, &inv_mask, &keep_mask, wmax, max_inc,
+                    lit_active,
                 );
             } else {
-                clause_type_ii(chunk, w, lit, valid, words, sb);
+                clause_type_ii(chunk, w, lit, valid, words, sb, lit_active);
             }
         }
     }
@@ -445,19 +473,28 @@ impl TsetlinMachine {
             neg = self.rng.below(self.n_classes);
         }
 
+        // Generate per-sample literal-active mask once; shared by both class updates.
+        let words = self.words;
+        let lit_active: Vec<u64> = if self.literal_drop_p > 0.0 {
+            let rng = &mut self.literal_rng;
+            let dig = &self.dig_lit_active;
+            (0..words).map(|_| bmask_word(rng, dig)).collect()
+        } else {
+            vec![!0u64; words]
+        };
+
         #[cfg(feature = "parallel")]
         {
             // Compute both class sums concurrently (read-only).
             let (sum_y, sum_neg) = rayon::join(
-                || self.class_sum_train(y),
-                || self.class_sum_train(neg),
+                || self.class_sum_train(y, &lit_active),
+                || self.class_sum_train(neg, &lit_active),
             );
 
             // Extract disjoint per-class slices for y and neg, then run both
             // class updates in parallel — each class owns exclusive state/weight/rng slices.
             let cps = self.clauses_per_class;
             let bw = self.state_bits * self.words;
-            let words = self.words;
             let sb = self.state_bits;
             let boost = self.boost_true_positive;
             let wmax = self.threshold;
@@ -503,13 +540,13 @@ impl TsetlinMachine {
                 || {
                     Self::update_class_par(
                         sum_y, 1, cs_y, cw_y, cr_y, crng_y, lit_sl, val, dig_inv, dig_keep,
-                        cps, words, sb, boost, wmax, max_inc, drop_p,
+                        &lit_active, cps, words, sb, boost, wmax, max_inc, drop_p,
                     )
                 },
                 || {
                     Self::update_class_par(
                         sum_neg, 0, cs_neg, cw_neg, cr_neg, crng_neg, lit_sl, val, dig_inv,
-                        dig_keep, cps, words, sb, boost, wmax, max_inc, drop_p,
+                        dig_keep, &lit_active, cps, words, sb, boost, wmax, max_inc, drop_p,
                     )
                 },
             );
@@ -517,8 +554,10 @@ impl TsetlinMachine {
 
         #[cfg(not(feature = "parallel"))]
         {
-            self.update_class(y, 1);
-            self.update_class(neg, 0);
+            let sum_y = self.class_sum_train(y, &lit_active);
+            let sum_neg = self.class_sum_train(neg, &lit_active);
+            self.update_class(y, 1, sum_y, &lit_active);
+            self.update_class(neg, 0, sum_neg, &lit_active);
         }
     }
 
@@ -853,11 +892,12 @@ mod tests {
         let valid = vec![0b1111_1111u64];
         let inv_mask = vec![!0u64];
         let keep_mask = vec![!0u64];
+        let all_active = vec![!0u64; words];
         let mut weight = 5i32;
 
         clause_type_i(
             &mut chunk, &mut weight, &lit, &valid,
-            words, sb, false, &inv_mask, &keep_mask, 10, max_included,
+            words, sb, false, &inv_mask, &keep_mask, 10, max_included, &all_active,
         );
 
         let n_after = (chunk[top] & valid[0]).count_ones() as usize;
@@ -1031,5 +1071,36 @@ mod tests {
         let lit = vec![0u64];
         let valid = vec![1u64];
         assert!(!fire_predict(&state, 0, &lit, &valid, words));
+    }
+
+    // ---- literal_drop_p -------------------------------------------------------
+
+    #[test]
+    fn literal_drop_p_one_leaves_state_unchanged() {
+        let (xtr, ytr) = make_xor(200, 0.0, 30);
+        let xtr_r = as_slices(&xtr);
+        let mut tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42)
+            .literal_drop_p(0.9999);
+        let state_before = tm.state.clone();
+        tm.fit_epoch(&xtr_r, &ytr);
+        let state_changed = tm.state.iter().zip(&state_before).filter(|(a, b)| a != b).count();
+        let total = tm.state.len();
+        assert!(
+            state_changed < total / 100,
+            "literal_drop_p≈1 should leave >99% of state unchanged, but {state_changed}/{total} changed"
+        );
+    }
+
+    #[test]
+    fn literal_drop_p_zero_trains_normally() {
+        let (xtr, ytr) = make_xor(2000, 0.0, 31);
+        let (xte, yte) = make_xor(500, 0.0, 41);
+        let mut tm = TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 8, true, 42)
+            .literal_drop_p(0.0);
+        for _ in 0..10 {
+            tm.fit_epoch(&as_slices(&xtr), &ytr);
+        }
+        let acc = tm.accuracy(&as_slices(&xte), &yte);
+        assert!(acc > 0.90, "literal_drop_p=0 should still converge, got {acc}");
     }
 }

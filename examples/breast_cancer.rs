@@ -11,7 +11,7 @@
 use tmu_rs::{data, Booleanizer, Rng, TsetlinMachine};
 
 fn main() {
-    let epochs: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(25);
+    let epochs: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(50);
     let path = "data/breast_cancer.csv";
 
     let (xs, ys) = data::read_numeric_csv(path).unwrap_or_else(|e| {

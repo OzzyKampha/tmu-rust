@@ -76,8 +76,14 @@ pub(crate) fn fire_predict(
 }
 
 /// Firing check for training — early exit on first violation.
+///
 /// `chunk` is the full `state_bits * words` slice for one clause; the top
 /// bit-plane (offset `(sb-1)*words`) is the include bitset.
+/// `lit_active` masks which literals participate: inactive bits are treated as
+/// absent from the clause, so they cannot cause a violation.  Pass all-ones
+/// (`&[!0u64; words]`) when no literal dropout is in effect.
+///
+/// Mirrors TMU's `cb_calculate_clause_output_feedback` use of `literal_active`.
 #[inline(always)]
 pub(crate) fn clause_fire(
     chunk: &[u64],
@@ -85,10 +91,12 @@ pub(crate) fn clause_fire(
     valid: &[u64],
     words: usize,
     sb: usize,
+    lit_active: &[u64],
 ) -> bool {
     let tb = (sb - 1) * words;
     for k in 0..words {
-        let inc = chunk[tb + k] & valid[k];
+        // Only active included literals can cause a violation.
+        let inc = chunk[tb + k] & valid[k] & lit_active[k];
         if inc & !lit[k] != 0 {
             return false;
         }
@@ -155,9 +163,16 @@ pub(crate) fn bmask_word(rng: &mut Rng, digits: &[u8]) -> u64 {
 
 /// Type Ia / Ib feedback for one clause.
 ///
-/// * Ia path (fires && under literal limit): weight++, include literals present,
-///   exclude literals absent (with probability masks).
-/// * Ib path (doesn't fire, or at/over limit): exclude literals absent only.
+/// * Ia path (fires && under literal limit): weight++, include active literals
+///   present, exclude active literals absent (with probability masks).
+/// * Ib path (doesn't fire, or at/over limit): exclude active literals absent.
+///
+/// `lit_active` is the per-sample literal dropout mask (Bernoulli(1-p) per bit).
+/// Pass all-ones when `literal_drop_p == 0`.  Mirrors TMU's `cb_type_i_feedback`
+/// use of `literal_active`.
+///
+/// Note: `max_included` counts **all** included literals (not just active ones),
+/// matching TMU's `cb_number_of_include_actions` check.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn clause_type_i(
     chunk: &mut [u64],
@@ -171,9 +186,11 @@ pub(crate) fn clause_type_i(
     keep_mask: &[u64],
     wmax: i32,
     max_included: usize,
+    lit_active: &[u64],
 ) {
-    let out = clause_fire(chunk, lit, valid, words, sb);
+    let out = clause_fire(chunk, lit, valid, words, sb, lit_active);
     let tb = (sb - 1) * words;
+    // Include count uses all valid literals regardless of dropout — matches TMU.
     let under_limit = max_included == usize::MAX || {
         let n: u32 = (0..words).map(|k| (chunk[tb + k] & valid[k]).count_ones()).sum();
         (n as usize) < max_included
@@ -182,22 +199,26 @@ pub(crate) fn clause_type_i(
         *weight = (*weight + 1).min(wmax);
         for k in 0..words {
             let litw = lit[k];
+            let la = lit_active[k];
             let inc_mask = if boost {
-                litw & valid[k]
+                litw & valid[k] & la
             } else {
-                litw & keep_mask[k] & valid[k]
+                litw & keep_mask[k] & valid[k] & la
             };
             clause_inc(chunk, words, sb, k, inc_mask);
-            clause_dec(chunk, words, sb, k, !litw & inv_mask[k] & valid[k]);
+            clause_dec(chunk, words, sb, k, !litw & inv_mask[k] & valid[k] & la);
         }
     } else {
         for k in 0..words {
-            clause_dec(chunk, words, sb, k, inv_mask[k] & valid[k]);
+            clause_dec(chunk, words, sb, k, inv_mask[k] & valid[k] & lit_active[k]);
         }
     }
 }
 
-/// Type II feedback for one clause: fires → weight--, include absent literals.
+/// Type II feedback for one clause: fires → weight--, include absent active literals.
+///
+/// `lit_active` is the per-sample literal dropout mask.  Mirrors TMU's
+/// `cb_type_ii_feedback` use of `literal_active`.
 pub(crate) fn clause_type_ii(
     chunk: &mut [u64],
     weight: &mut i32,
@@ -205,15 +226,16 @@ pub(crate) fn clause_type_ii(
     valid: &[u64],
     words: usize,
     sb: usize,
+    lit_active: &[u64],
 ) {
-    if !clause_fire(chunk, lit, valid, words, sb) {
+    if !clause_fire(chunk, lit, valid, words, sb, lit_active) {
         return;
     }
     *weight = (*weight - 1).max(1);
     let tb = (sb - 1) * words;
     for k in 0..words {
         let excluded = !chunk[tb + k];
-        let inc_mask = !lit[k] & excluded & valid[k];
+        let inc_mask = !lit[k] & excluded & valid[k] & lit_active[k];
         clause_inc(chunk, words, sb, k, inc_mask);
     }
 }
