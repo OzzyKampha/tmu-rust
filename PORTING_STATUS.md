@@ -53,4 +53,8 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | `BreastCancerDemo` | `breast_cancer` | ✅ Validated | ~99–100% test accuracy |
 | `MNISTDemo` / `MNISTDemoWeightedClauses` | `mnist` | ✅ Validated | ~93% (2000 clauses, T=50, s=10.0) |
 | `IMDbTextCategorizationDemo` | `imdb` | ✅ Validated | 2000 clauses, T=80, s=10.0 |
+| Convolutional demos | — | ❌ Not ported | Requires `ConvolutionalTM` |
+| Regression demos | — | ❌ Not ported | Requires `TMRegressor` |
+| Autoencoder demos | — | ❌ Not ported | Requires `TMAutoEncoder` |
+| Coalesced demos | — | ❌ Not ported | Requires `TMCoalesced` |
 
