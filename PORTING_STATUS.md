@@ -32,23 +32,13 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | Configurable TA state bits | ✅ | 2–16 bits per automaton counter |
 | Absorbing state tracking | ✅ | `absorbed_include_fraction()`, `absorbed_exclude_fraction()` |
 | Clause rule extraction | ✅ | `clause_rule()`, `clause_is_positive()` |
+| Booleanizer | ✅ | Quantile-based continuous-to-binary encoder |
 | Multi-threaded training | ✅ | `--features parallel` (Rayon) |
 | Pre-packed dataset API | ✅ | `pack_dataset()` + `fit_epoch_packed()` |
 | Batch prediction | ✅ | `predict_batch_packed()` |
 | Raw class scores | ✅ | `scores_packed()` |
 | GPU / CUDA acceleration | ❌ Not planned | |
 | Imbalanced-class weighting | ❌ Not planned | Per-class clause weights |
-
----
-
-## Booleanizer
-
-| Feature | Status | Notes |
-|---|---|---|
-| Quantile-based encoder | ✅ | `n_thresholds` per feature |
-| Fit on training data | ✅ | `Booleanizer::fit()` |
-| Row transform | ✅ | `transform_row()` |
-| Bit origin (interpretability) | ✅ | `bit_origin()` maps bit index → (feature, threshold) |
 
 ---
 
@@ -62,9 +52,5 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | `BreastCancerDemo` | `breast_cancer` | ✅ Validated | ~99–100% test accuracy |
 | `MNISTDemo` / `MNISTDemoWeightedClauses` | `mnist` | ✅ Validated | ~93% (2000 clauses, T=50, s=10.0) |
 | `IMDbTextCategorizationDemo` | `imdb` | ✅ Validated | 2000 clauses, T=80, s=10.0 |
-| Convolutional demos | — | ❌ Not ported | Requires `ConvolutionalTM` |
-| Regression demos | — | ❌ Not ported | Requires `TMRegressor` |
-| Autoencoder demos | — | ❌ Not ported | Requires `TMAutoEncoder` |
-| Coalesced demos | — | ❌ Not ported | Requires `TMCoalesced` |
 | *(extra)* `ndr_flows` | `ndr_flows` | ✅ Complete | Synthetic network-flow detection; not part of TMU |
 
