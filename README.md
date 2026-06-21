@@ -13,6 +13,7 @@ For a full breakdown of what has been ported and what is missing, see [PORTING_S
 - Bit-packed clause bank for cache-efficient inference and training
 - Weighted multiclass classification (`TMClassifier`)
 - Optional multi-threaded training via [Rayon](https://github.com/rayon-rs/rayon) (`--features parallel`)
+- Type-safe `Encoder` for binary, numeric (quantile booleanization), and categorical inputs
 - Fast booleanizer for continuous-valued inputs
 - Ports of the core TMU classification demos
 
@@ -59,8 +60,14 @@ The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) multiclass 
 | `MNISTDemo` / `MNISTDemoWeightedClauses` | `mnist` | MNIST | see [Data preparation](#data-preparation) |
 | `IMDbTextCategorizationDemo` | `imdb` | Keras IMDb | see [Data preparation](#data-preparation) |
 | *(extra)* | `ndr_flows` | — | `cargo run --release --example ndr_flows` |
+| *(extra)* | `bench_training` | — | `cargo run --release --example bench_training` |
+| *(extra)* | `absorb_timing` | — | `cargo run --release --example absorb_timing` |
 
 `ndr_flows` is not part of TMU — it is a synthetic network-flow detection example demonstrating the booleanizer and interpretable rule extraction.
+
+`bench_training` measures training throughput (sequential vs parallel) at IMDB-scale clause counts using a synthetic dataset — no download required. Compare with and without `--features parallel`.
+
+`absorb_timing` trains on a synthetic XOR dataset at various `state_bits` settings and prints per-epoch accuracy alongside absorbing-state fractions.
 
 ---
 
@@ -93,11 +100,13 @@ cargo run --release --features parallel --example imdb
 
 ```
 src/
-  booleanizer.rs       # Continuous-to-binary encoder
+  encoder.rs           # Type-safe Encoder (binary / numeric / categorical)
+  booleanizer.rs       # Quantile booleanization (used by Encoder)
   clause_bank/         # Bit-packed clause storage and update logic
   models/              # TMClassifier and supporting types
   rng.rs               # Fast RNG
 examples/              # Demo programs (ports of TMU + extras)
+benches/               # Criterion throughput benchmarks
 scripts/               # Python data preparation scripts
 data/tmu/              # cair/tmu submodule (reference implementation)
 ```
