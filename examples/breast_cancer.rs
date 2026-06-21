@@ -10,6 +10,7 @@
 
 use tmu_rs::{data, Booleanizer, Rng, TsetlinMachine};
 
+/// Load the Breast Cancer CSV, booleanize numeric features, and train a TM with 80/20 split.
 fn main() {
     let epochs: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(50);
     let path = "data/breast_cancer.csv";

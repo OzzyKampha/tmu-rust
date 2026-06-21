@@ -17,6 +17,7 @@ use tmu_rs::{data, TsetlinMachine};
 
 const N_FEATURES: usize = 5000; // must match scripts/prepare_imdb.py
 
+/// Load pre-processed IMDb bag-of-words data and train a weighted TM for the configured number of epochs.
 fn main() {
     let epochs: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(40);
 

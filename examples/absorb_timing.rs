@@ -1,6 +1,7 @@
 use std::time::Instant;
 use tmu_rs::{Rng, TsetlinMachine};
 
+/// Train a TM for `n_epochs` with the given `state_bits` and print per-epoch accuracy and absorbing fractions.
 fn run(label: &str, state_bits: u8, n_epochs: usize) {
     let n_features = 30usize;
     let n_train    = 2000usize;
@@ -40,6 +41,7 @@ fn run(label: &str, state_bits: u8, n_epochs: usize) {
     }
 }
 
+/// Compare absorbing convergence speed between low and high `state_bits` configurations.
 fn main() {
     // state_bits=2: max=3, min=0 — absorbs fast (needs only 3 consecutive incs/decs)
     run("fast absorb", 2, 200);

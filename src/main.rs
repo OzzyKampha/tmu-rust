@@ -1,3 +1,4 @@
+/// Print the crate version and a list of available example commands.
 fn main() {
     println!("tmu-rs {} — weighted multiclass Tsetlin Machine", env!("CARGO_PKG_VERSION"));
     println!("Examples:");

@@ -55,6 +55,7 @@ pub struct TsetlinMachine {
 }
 
 impl TsetlinMachine {
+    /// Create a TsetlinMachine with default settings: 8 state bits, boost enabled, seed 42.
     pub fn new(
         n_classes: usize,
         n_features: usize,
@@ -65,6 +66,13 @@ impl TsetlinMachine {
         Self::with_config(n_classes, n_features, clauses_per_class, threshold, s, 8, true, 42)
     }
 
+    /// Create a TsetlinMachine with full configuration.
+    ///
+    /// * `state_bits` — TA counter precision in bits (2–16); higher values slow convergence but
+    ///   allow absorbing states to provide stronger regularisation.
+    /// * `boost_true_positive` — if `true`, Type Ia feedback always includes present literals
+    ///   (skips the stochastic keep mask), matching TMU's `boost_true_positive_feedback`.
+    /// * `seed` — master RNG seed; fully deterministic for a given seed.
     #[allow(clippy::too_many_arguments)]
     pub fn with_config(
         n_classes: usize,
@@ -177,32 +185,40 @@ impl TsetlinMachine {
 
     // ---- dimensions / accessors ------------------------------------------
 
+    /// Return the number of output classes.
     pub fn n_classes(&self) -> usize {
         self.n_classes
     }
+    /// Return the number of input features.
     pub fn n_features(&self) -> usize {
         self.n_features
     }
+    /// Return the number of clauses allocated per class.
     pub fn clauses_per_class(&self) -> usize {
         self.clauses_per_class
     }
+    /// Return the number of 64-bit words used to represent one packed sample.
     pub fn words_per_sample(&self) -> usize {
         self.words
     }
+    /// Return the specificity parameter `s` used for Type I feedback probability.
     pub fn s(&self) -> f64 {
         self.s
     }
+    /// Return the integer weight of clause `clause` for class `class`.
     pub fn clause_weight(&self, class: usize, clause: usize) -> i32 {
         self.weights[class * self.clauses_per_class + clause]
     }
 
     // ---- internal indexing -----------------------------------------------
 
+    /// Return the flat index into `state` for the first word of clause `j` in class `c`.
     #[inline(always)]
     fn clause_base(&self, c: usize, j: usize) -> usize {
         (c * self.clauses_per_class + j) * self.state_bits * self.words
     }
 
+    /// Return the flat index into `state` for the top (include) bit-plane of clause `j` in class `c`.
     #[inline(always)]
     fn top_base(&self, c: usize, j: usize) -> usize {
         self.clause_base(c, j) + (self.state_bits - 1) * self.words
@@ -217,6 +233,7 @@ impl TsetlinMachine {
     }
 
 
+    /// Pack a raw feature vector using this model's `n_features` into `out`.
     #[inline]
     pub fn pack_sample(&self, x: &[u8], out: &mut [u64]) {
         crate::clause_bank::dense::pack(x, self.n_features, out);
@@ -224,6 +241,7 @@ impl TsetlinMachine {
 
     // ---- inference -------------------------------------------------------
 
+    /// Predict the class for an already-packed literal vector, returning the class index with the highest clamped sum.
     #[inline]
     pub fn predict_packed(&self, lit: &[u64]) -> usize {
         debug_assert_eq!(lit.len(), self.words);
@@ -253,6 +271,7 @@ impl TsetlinMachine {
         best
     }
 
+    /// Fill `out` with the clamped weighted clause sums for each class given a packed literal vector.
     pub fn scores_packed(&self, lit: &[u64], out: &mut [i32]) {
         debug_assert_eq!(out.len(), self.n_classes);
         let cps = self.clauses_per_class;
@@ -274,12 +293,14 @@ impl TsetlinMachine {
         }
     }
 
+    /// Predict the class for an unpacked binary feature vector.
     pub fn predict(&self, x: &[u8]) -> usize {
         let mut lit = vec![0u64; self.words];
         self.pack_sample(x, &mut lit);
         self.predict_packed(&lit)
     }
 
+    /// Predict classes for a batch of `n` pre-packed samples, returning one class index per sample.
     pub fn predict_batch_packed(&self, packed: &[u64], n: usize) -> Vec<usize> {
         debug_assert_eq!(packed.len(), n * self.words);
         let w = self.words;
@@ -298,6 +319,7 @@ impl TsetlinMachine {
 
     // ---- training helpers ------------------------------------------------
 
+    /// Check whether clause `j` of class `c` fires against the current `self.literals` buffer (training variant, with dropout support).
     #[allow(dead_code)]
     #[inline(always)]
     fn fire_train(&self, c: usize, j: usize) -> bool {
@@ -314,6 +336,8 @@ impl TsetlinMachine {
         )
     }
 
+    /// Compute the clamped weighted clause sum for class `c` using the current `self.literals` buffer.
+    /// `lit_active` is the per-sample literal dropout mask for this training step.
     fn class_sum_train(&self, c: usize, lit_active: &[u64]) -> i32 {
         let cps = self.clauses_per_class;
         let words = self.words;
@@ -339,6 +363,10 @@ impl TsetlinMachine {
         sum.clamp(-self.threshold, self.threshold)
     }
 
+    /// Apply Type I / II feedback to all clauses of class `c`.
+    ///
+    /// `target` is 1 for the true class and 0 for the sampled negative class.
+    /// `sum` is the pre-computed clamped clause sum from `class_sum_train`.
     #[cfg_attr(feature = "parallel", allow(dead_code))]
     fn update_class(&mut self, c: usize, target: u8, sum: i32, lit_active: &[u64]) {
         let cps = self.clauses_per_class;
@@ -399,8 +427,8 @@ impl TsetlinMachine {
         }
     }
 
-    // Standalone class-update kernel — takes explicit slices so it can be called
-    // from a rayon::join closure without needing &mut self.
+    /// Standalone class-update kernel for the `parallel` feature — operates on explicit mutable
+    /// slices so it can be called from a `rayon::join` closure without a `&mut self` borrow.
     #[cfg(feature = "parallel")]
     #[allow(clippy::too_many_arguments)]
     fn update_class_par(
@@ -463,6 +491,8 @@ impl TsetlinMachine {
         }
     }
 
+    /// Train on a single pre-packed sample `lit` with true label `y`.
+    /// Randomly selects one negative class and applies feedback to both the true and negative class.
     pub fn fit_one_packed(&mut self, lit: &[u64], y: usize) {
         debug_assert_eq!(lit.len(), self.words);
         debug_assert!(y < self.n_classes);
@@ -561,6 +591,7 @@ impl TsetlinMachine {
         }
     }
 
+    /// Train on a single unpacked binary feature vector `x` with true label `y`.
     pub fn fit_one(&mut self, x: &[u8], y: usize) {
         debug_assert!(y < self.n_classes);
         let nf = self.n_features;
@@ -569,6 +600,7 @@ impl TsetlinMachine {
         self.fit_one_packed(&lit, y);
     }
 
+    /// Run one training epoch over `n` pre-packed samples, shuffling the order each epoch.
     pub fn fit_epoch_packed(&mut self, packed: &[u64], n: usize, ys: &[usize]) {
         debug_assert_eq!(packed.len(), n * self.words);
         assert_eq!(n, ys.len());
@@ -583,6 +615,7 @@ impl TsetlinMachine {
         }
     }
 
+    /// Pack `xs` and run one training epoch, shuffling the order each epoch.
     pub fn fit_epoch(&mut self, xs: &[&[u8]], ys: &[usize]) {
         assert_eq!(xs.len(), ys.len());
         let n = xs.len();
@@ -597,6 +630,7 @@ impl TsetlinMachine {
 
     // ---- dataset helpers -------------------------------------------------
 
+    /// Pack an entire dataset into a flat `Vec<u64>` of concatenated literal vectors.
     pub fn pack_dataset(&self, xs: &[&[u8]]) -> Vec<u64> {
         let n = xs.len();
         let w = self.words;
@@ -608,6 +642,7 @@ impl TsetlinMachine {
         packed
     }
 
+    /// Compute the fraction of correctly predicted samples from a pre-packed dataset.
     pub fn accuracy_packed(&self, packed: &[u64], n: usize, ys: &[usize]) -> f64 {
         debug_assert_eq!(packed.len(), n * self.words);
         assert_eq!(n, ys.len());
@@ -627,6 +662,7 @@ impl TsetlinMachine {
         correct as f64 / n as f64
     }
 
+    /// Pack `xs` and compute classification accuracy against `ys`.
     pub fn accuracy(&self, xs: &[&[u8]], ys: &[usize]) -> f64 {
         let packed = self.pack_dataset(xs);
         self.accuracy_packed(&packed, xs.len(), ys)
@@ -677,6 +713,7 @@ impl TsetlinMachine {
 
     // ---- interpretability ------------------------------------------------
 
+    /// Return the included literals for clause `clause` of `class` as `(feature_index, is_negated)` pairs.
     pub fn clause_rule(&self, class: usize, clause: usize) -> Vec<(usize, bool)> {
         let mut rule = Vec::new();
         let tb = self.top_base(class, clause);
@@ -693,6 +730,7 @@ impl TsetlinMachine {
         rule
     }
 
+    /// Return `true` if `clause` is a positive clause (even index → votes for the class).
     pub fn clause_is_positive(&self, clause: usize) -> bool {
         clause & 1 == 0
     }
@@ -705,6 +743,7 @@ mod tests {
 
     // ---- helpers -------------------------------------------------------------
 
+    /// Generate `n` XOR samples (12 random bits, label = bit0 XOR bit1) with optional label noise.
     fn make_xor(n: usize, noise: f64, seed: u64) -> (Vec<Vec<u8>>, Vec<usize>) {
         let mut rng = Rng::new(seed);
         let mut xs = Vec::with_capacity(n);
@@ -721,6 +760,7 @@ mod tests {
         (xs, ys)
     }
 
+    /// Convert a slice of owned vectors to a slice of byte slices for API calls.
     fn as_slices(xs: &[Vec<u8>]) -> Vec<&[u8]> {
         xs.iter().map(|v| v.as_slice()).collect()
     }
@@ -1149,8 +1189,7 @@ mod tests {
 
     // ---- absorbing states -------------------------------------------------------
 
-    // Helper: build a one-word chunk with `sb` state planes.
-    // `states[l]` is the integer TA state for literal bit `l`.
+    /// Build a one-word chunk with `sb` state planes; `states[l]` is the integer TA state for literal bit `l`.
     fn make_chunk(sb: usize, states: &[(usize, u64)]) -> Vec<u64> {
         let words = 1usize;
         let mut chunk = vec![0u64; sb * words];
@@ -1164,7 +1203,7 @@ mod tests {
         chunk
     }
 
-    // Read back TA state for literal bit `l` from a one-word chunk.
+    /// Read back the integer TA state for literal bit `l` from a one-word chunk.
     fn read_state(chunk: &[u64], sb: usize, l: usize) -> u64 {
         (0..sb).fold(0u64, |acc, b| acc | (((chunk[b] >> l) & 1) << b))
     }

@@ -9,6 +9,7 @@
 use std::fs;
 use std::io;
 
+/// Convenience constructor for an `InvalidData` I/O error with the given message.
 fn invalid(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }

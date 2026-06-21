@@ -10,6 +10,7 @@ use tmu_rs::{Rng, TsetlinMachine};
 const N_FEATURES: usize = 20;
 const NOISE: f64 = 0.1;
 
+/// Generate `n` XOR samples over `N_FEATURES` random bits with label noise probability `noise`.
 fn make(n: usize, noise: f64, seed: u64) -> (Vec<Vec<u8>>, Vec<usize>) {
     let mut rng = Rng::new(seed);
     let mut xs = Vec::with_capacity(n);
@@ -26,6 +27,7 @@ fn make(n: usize, noise: f64, seed: u64) -> (Vec<Vec<u8>>, Vec<usize>) {
     (xs, ys)
 }
 
+/// Train on a noisy XOR dataset for 20 epochs and print per-epoch test accuracy.
 fn main() {
     let (xtr, ytr) = make(5000, NOISE, 1);
     let (xte, yte) = make(5000, 0.0, 2); // clean test set

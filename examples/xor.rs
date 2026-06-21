@@ -7,6 +7,7 @@
 
 use tmu_rs::{Rng, TsetlinMachine};
 
+/// Generate `n` noise-free 2-bit XOR samples.
 fn make(n: usize, seed: u64) -> (Vec<Vec<u8>>, Vec<usize>) {
     let mut rng = Rng::new(seed);
     let mut xs = Vec::with_capacity(n);
@@ -20,6 +21,7 @@ fn make(n: usize, seed: u64) -> (Vec<Vec<u8>>, Vec<usize>) {
     (xs, ys)
 }
 
+/// Train a 4-clause TM on noise-free XOR for 60 epochs and print per-epoch accuracy.
 fn main() {
     let (xtr, ytr) = make(1000, 1);
     let (xte, yte) = make(1000, 2);
