@@ -33,9 +33,14 @@ Note: AVX2 fast paths in the clause update loops are also activated at **runtime
 pip install tmu numpy
 ```
 
-`tmu` requires a C compiler to build its extension. On Linux install `build-essential`;
-on macOS, Xcode command-line tools. The Python benchmark uses the `"CPU"` platform
-(C extension), not the pure-Python fallback.
+`tmu` requires a C compiler and libffi to build its CFFI extension. On Linux:
+
+```sh
+sudo apt install build-essential libffi-dev
+```
+
+On macOS, Xcode command-line tools provide both. The Python benchmark uses the
+`"CPU"` platform (CFFI C extension), not the pure-Python fallback.
 
 ---
 
