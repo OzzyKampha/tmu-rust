@@ -111,62 +111,34 @@ workload exercises the hot SIMD loops and the Rayon parallel path at realistic s
 
 ---
 
-## Sample output
-
-### Rust sequential (`cargo run --release --example bench_training`)
-
-```
-Mode   : SEQUENTIAL
-Config : 2 classes · 1000 features · 10000 clauses/class · 2000 training samples
-Workload: 40 M clause updates per epoch
-
-epoch          ms     samples/s   Mclause-ups/s
-    0      800.3          2499            50.0
-    1      720.1          2777            55.6
-    ...
-    7      290.4          6889           137.8
-
-── Summary (8 timed epochs) ────────────────────────────────────────────────────
-  median   510.2 ms  |  mean   555.3 ms  |  min   290.4 ms  |  max   800.3 ms
-  throughput  :      3920 samples/s          78.4 Mclause-updates/s
-```
-
-### Python TMU (`python scripts/compare_tmu.py`)
-
-```
-Mode   : Python TMU  [large (IMDb-scale)]
-Config : 2 classes · 1000 features · 10000 clauses/class · 2000 training samples
-Workload: 40 M clause updates per epoch
-
-epoch          ms     samples/s   Mclause-ups/s
-    0     3200.1           625            12.5
-    1     3050.4           655            13.1
-    ...
-    7     2800.7           714            14.3
-
-── Summary (8 timed epochs) ────────────────────────────────────────────────────
-  median  3025.3 ms  |  mean  3050.1 ms  |  min  2800.7 ms  |  max  3200.1 ms
-  throughput  :       661 samples/s          13.2 Mclause-updates/s
-```
-
-### Summary table (from `compare.sh --parallel`)
+## Sample output (4-core cloud VM, `compare.sh --parallel --native`)
 
 ```
 ══════════════════════════════════════════════════════════════════════
   COMPARISON SUMMARY
   (config: 2 classes · 1000 features · 10000 clauses/class · IMDb-scale)
 ══════════════════════════════════════════════════════════════════════
-  Runner                            Median ms    Mclause-ups/s
+  Runner                               Median ms     Mclause-ups/s
   ────────────────────────────────────────────────────────────────────
-  Rust (sequential)                  510.2 ms             78.4
-  Rust (parallel, Rayon)              85.3 ms            468.8
-  Python TMU (C extension)          3025.3 ms             13.2
+  Rust (sequential)                    5899.2 ms               6.8
+  Rust (parallel, Rayon)               3985.2 ms              10.0
+  Python TMU (C extension)            20884.4 ms               1.9
 ══════════════════════════════════════════════════════════════════════
-  Rust sequential speedup over Python: 5.9x
-  Rust parallel  speedup over Python: 35.5x
+  Rust sequential speedup over Python: 3.5x
+  Rust parallel  speedup over Python: 5.2x
 ```
 
-*(Numbers are illustrative — actual results vary by hardware, CPU frequency, and cache state.)*
+**Notes on these numbers:**
+
+- The Rayon gain is modest (1.5×) on a 4-core VM; expect proportionally larger
+  gains on many-core hardware.
+- Per-epoch time decreases sharply as clauses absorb — for Rust sequential the
+  range is 12 357 ms (epoch 0) → 3 911 ms (epoch 7). The median captures the
+  mid-training cost, not the steady-state cost.
+- Python TMU uses a CFFI C extension (`tmu.tmulib`). Its slowness relative to the
+  "150–400 ms" reference in bench\_training.rs is expected: that reference was for
+  the cair/tmu IMDb config which uses **2 000 total clauses** (1 000/class).
+  This benchmark uses **20 000 total** (10 000/class) — 10× more work per epoch.
 
 ---
 

@@ -93,7 +93,9 @@ if [[ $PYTHON_OK -eq 1 ]]; then
     echo "══════════════════════════════════════════════"
     echo "  PYTHON TMU  (compare_tmu.py${PY_ARGS:+ $PY_ARGS})"
     echo "══════════════════════════════════════════════"
-    python3 scripts/compare_tmu.py $PY_ARGS | tee "$py_out"
+    python3 scripts/compare_tmu.py $PY_ARGS 2>&1 \
+        | grep -v 'pycuda\|cuda_profiler\|clause_bank_cuda\|No module named' \
+        | tee "$py_out"
 fi
 
 # ── Parse summary metrics ─────────────────────────────────────────────────────
