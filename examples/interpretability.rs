@@ -7,7 +7,7 @@
 //!
 //! `cargo run --release --example interpretability`
 
-use tmu_rs::{Rng, TsetlinMachine};
+use tmu_rs::{Encoder, Rng, TsetlinMachine};
 
 const N_FEATURES: usize = 20;
 const NOISE: f64 = 0.1;
@@ -50,17 +50,18 @@ fn main() {
     let (xtr, ytr) = make(5000, NOISE, 1);
     let (xte, yte) = make_clean(5000, 2);
 
+    let encoder = Encoder::for_binary(N_FEATURES);
     // boost_true_positive_feedback=0 (False) — matches TMU InterpretabilityDemo default
-    let mut tm = TsetlinMachine::with_config(2, N_FEATURES, 10, 10, 3.0, 8, false, 42);
+    let mut tm = TsetlinMachine::with_config(2, encoder.n_features(), 10, 10, 3.0, 8, false, 42);
 
     let xtr_r: Vec<&[u8]> = xtr.iter().map(|v| v.as_slice()).collect();
     let xte_r: Vec<&[u8]> = xte.iter().map(|v| v.as_slice()).collect();
-    let packed_tr = tm.pack_dataset(&xtr_r);
-    let packed_te = tm.pack_dataset(&xte_r);
+    let packed_tr = encoder.encode_batch(&xtr_r);
+    let packed_te = encoder.encode_batch(&xte_r);
 
     for _epoch in 1..=20 {
-        tm.fit_epoch_packed(&packed_tr, xtr.len(), &ytr);
-        let acc = tm.accuracy_packed(&packed_te, xte.len(), &yte);
+        tm.fit_epoch(&packed_tr, &ytr);
+        let acc = tm.accuracy(&packed_te, &yte);
         println!("Accuracy: {:.2}", acc * 100.0);
     }
 

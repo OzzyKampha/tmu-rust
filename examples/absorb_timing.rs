@@ -1,5 +1,5 @@
 use std::time::Instant;
-use tmu_rs::{Rng, TsetlinMachine};
+use tmu_rs::{Encoder, Rng, TsetlinMachine};
 
 /// Train a TM for `n_epochs` with the given `state_bits` and print per-epoch accuracy and absorbing fractions.
 fn run(label: &str, state_bits: u8, n_epochs: usize) {
@@ -16,8 +16,11 @@ fn run(label: &str, state_bits: u8, n_epochs: usize) {
     let ys: Vec<usize> = xs.iter().map(|x| (x[0] ^ x[1]) as usize).collect();
     let xs_ref: Vec<&[u8]> = xs.iter().map(|v| v.as_slice()).collect();
 
+    let encoder = Encoder::for_binary(n_features);
+    let packed = encoder.encode_batch(&xs_ref);
+
     let mut tm = TsetlinMachine::with_config(
-        2, n_features, n_clauses, threshold, s, state_bits, true, 1,
+        2, encoder.n_features(), n_clauses, threshold, s, state_bits, true, 1,
     );
 
     println!("\n── {} (state_bits={}) ──", label, state_bits);
@@ -26,13 +29,10 @@ fn run(label: &str, state_bits: u8, n_epochs: usize) {
 
     for epoch in 0..n_epochs {
         let t = Instant::now();
-        tm.fit_epoch(&xs_ref, &ys);
+        tm.fit_epoch(&packed, &ys);
         let us = t.elapsed().as_micros();
 
-        let correct = xs_ref.iter().zip(ys.iter())
-            .filter(|(x, &y)| tm.predict(x) == y)
-            .count();
-        let acc = 100.0 * correct as f64 / n_train as f64;
+        let acc = 100.0 * tm.accuracy(&packed, &ys);
         let abs_inc = tm.absorbed_include_fraction() * 100.0;
         let abs_exc = tm.absorbed_exclude_fraction() * 100.0;
 

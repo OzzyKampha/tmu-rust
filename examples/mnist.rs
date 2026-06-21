@@ -17,9 +17,9 @@
 
 use std::io::Write;
 use std::time::Instant;
-use tmu_rs::{data, TsetlinMachine};
+use tmu_rs::{data, Encoder, TsetlinMachine};
 
-/// Load binarized MNIST, pack it once, and run the training loop reporting per-epoch accuracy and throughput.
+/// Load binarized MNIST, encode it once, and run the training loop reporting per-epoch accuracy and throughput.
 fn main() {
     let mut args = std::env::args().skip(1);
     let epochs: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(2);
@@ -54,17 +54,18 @@ fn main() {
     println!("  tip: prefix with RUSTFLAGS=\"-C target-cpu=native\" for AVX2 vectorisation");
     println!();
 
-    let mut tm = TsetlinMachine::with_config(10, n_features, clauses, threshold, s, 8, true, 42)
+    let encoder = Encoder::for_binary(n_features);
+    let mut tm = TsetlinMachine::with_config(10, encoder.n_features(), clauses, threshold, s, 8, true, 42)
         .max_included_literals(32);
 
-    // ---- pack once ----------------------------------------------------------
-    print!("Packing data... ");
+    // ---- encode once --------------------------------------------------------
+    print!("Encoding data... ");
     std::io::stdout().flush().ok();
     let t_pack = Instant::now();
     let xtr_r: Vec<&[u8]> = xtr.iter().map(|v| v.as_slice()).collect();
     let xte_r: Vec<&[u8]> = xte.iter().map(|v| v.as_slice()).collect();
-    let packed_tr = tm.pack_dataset(&xtr_r);
-    let packed_te = tm.pack_dataset(&xte_r);
+    let packed_tr = encoder.encode_batch(&xtr_r);
+    let packed_te = encoder.encode_batch(&xte_r);
     println!("done ({:.2}s)", t_pack.elapsed().as_secs_f64());
     println!();
 
@@ -85,7 +86,7 @@ fn main() {
         std::io::stdout().flush().ok();
 
         let t_train = Instant::now();
-        tm.fit_epoch_packed(&packed_tr, xtr.len(), &ytr);
+        tm.fit_epoch(&packed_tr, &ytr);
         let train_secs = t_train.elapsed().as_secs_f64();
         let throughput = xtr.len() as f64 / train_secs;
 
@@ -95,7 +96,7 @@ fn main() {
         std::io::stdout().flush().ok();
 
         let t_eval = Instant::now();
-        let acc = tm.accuracy_packed(&packed_te, xte.len(), &yte);
+        let acc = tm.accuracy(&packed_te, &yte);
         let eval_secs = t_eval.elapsed().as_secs_f64();
 
         println!(

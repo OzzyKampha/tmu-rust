@@ -8,6 +8,7 @@ use crate::clause_bank::dense::{
 };
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::PARALLEL_MIN;
+use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
 
 /// A bit-packed weighted multiclass Tsetlin Machine.
@@ -224,26 +225,11 @@ impl TsetlinMachine {
         self.clause_base(c, j) + (self.state_bits - 1) * self.words
     }
 
-    // ---- packing (thin wrappers over clause_bank::pack) ------------------
-
-    /// Pack a raw feature vector into the bit-interleaved literal representation.
-    #[inline]
-    pub fn pack(x: &[u8], n_features: usize, out: &mut [u64]) {
-        crate::clause_bank::dense::pack(x, n_features, out);
-    }
-
-
-    /// Pack a raw feature vector using this model's `n_features` into `out`.
-    #[inline]
-    pub fn pack_sample(&self, x: &[u8], out: &mut [u64]) {
-        crate::clause_bank::dense::pack(x, self.n_features, out);
-    }
-
     // ---- inference -------------------------------------------------------
 
-    /// Predict the class for an already-packed literal vector, returning the class index with the highest clamped sum.
+    /// Internal: predict from a raw literal slice without allocation.
     #[inline]
-    pub fn predict_packed(&self, lit: &[u64]) -> usize {
+    fn predict_lit(&self, lit: &[u64]) -> usize {
         debug_assert_eq!(lit.len(), self.words);
         let cps = self.clauses_per_class;
         let bw = self.state_bits * self.words;
@@ -271,8 +257,15 @@ impl TsetlinMachine {
         best
     }
 
-    /// Fill `out` with the clamped weighted clause sums for each class given a packed literal vector.
-    pub fn scores_packed(&self, lit: &[u64], out: &mut [i32]) {
+    /// Predict the class for an encoded sample.
+    #[inline]
+    pub fn predict(&self, sample: &EncodedSample) -> usize {
+        self.predict_lit(&sample.0)
+    }
+
+    /// Fill `out` with the clamped weighted clause sums for each class for an encoded sample.
+    pub fn scores(&self, sample: &EncodedSample, out: &mut [i32]) {
+        let lit = &sample.0;
         debug_assert_eq!(out.len(), self.n_classes);
         let cps = self.clauses_per_class;
         let bw = self.state_bits * self.words;
@@ -293,28 +286,21 @@ impl TsetlinMachine {
         }
     }
 
-    /// Predict the class for an unpacked binary feature vector.
-    pub fn predict(&self, x: &[u8]) -> usize {
-        let mut lit = vec![0u64; self.words];
-        self.pack_sample(x, &mut lit);
-        self.predict_packed(&lit)
-    }
-
-    /// Predict classes for a batch of `n` pre-packed samples, returning one class index per sample.
-    pub fn predict_batch_packed(&self, packed: &[u64], n: usize) -> Vec<usize> {
-        debug_assert_eq!(packed.len(), n * self.words);
+    /// Predict classes for all samples in an encoded batch, returning one class index per sample.
+    pub fn predict_batch(&self, batch: &EncodedBatch) -> Vec<usize> {
+        debug_assert_eq!(batch.data.len(), batch.n * self.words);
+        let packed = batch.data.as_slice();
+        let n = batch.n;
         let w = self.words;
         #[cfg(feature = "parallel")]
         if n >= PARALLEL_MIN && self.clauses_per_class >= PARALLEL_MIN {
             use rayon::prelude::*;
             return (0..n)
                 .into_par_iter()
-                .map(|i| self.predict_packed(&packed[i * w..(i + 1) * w]))
+                .map(|i| self.predict_lit(&packed[i * w..(i + 1) * w]))
                 .collect();
         }
-        (0..n)
-            .map(|i| self.predict_packed(&packed[i * w..(i + 1) * w]))
-            .collect()
+        (0..n).map(|i| self.predict_lit(&packed[i * w..(i + 1) * w])).collect()
     }
 
     // ---- training helpers ------------------------------------------------
@@ -491,9 +477,8 @@ impl TsetlinMachine {
         }
     }
 
-    /// Train on a single pre-packed sample `lit` with true label `y`.
-    /// Randomly selects one negative class and applies feedback to both the true and negative class.
-    pub fn fit_one_packed(&mut self, lit: &[u64], y: usize) {
+    /// Internal: train from a raw literal slice without allocation.
+    fn fit_one_lit(&mut self, lit: &[u64], y: usize) {
         debug_assert_eq!(lit.len(), self.words);
         debug_assert!(y < self.n_classes);
         self.literals.copy_from_slice(lit);
@@ -591,18 +576,15 @@ impl TsetlinMachine {
         }
     }
 
-    /// Train on a single unpacked binary feature vector `x` with true label `y`.
-    pub fn fit_one(&mut self, x: &[u8], y: usize) {
-        debug_assert!(y < self.n_classes);
-        let nf = self.n_features;
-        let mut lit = vec![0u64; self.words];
-        crate::clause_bank::dense::pack(x, nf, &mut lit);
-        self.fit_one_packed(&lit, y);
+    /// Train on a single encoded sample with true label `y`.
+    pub fn fit_one(&mut self, sample: &EncodedSample, y: usize) {
+        self.fit_one_lit(&sample.0, y);
     }
 
-    /// Run one training epoch over `n` pre-packed samples, shuffling the order each epoch.
-    pub fn fit_epoch_packed(&mut self, packed: &[u64], n: usize, ys: &[usize]) {
-        debug_assert_eq!(packed.len(), n * self.words);
+    /// Run one training epoch over an encoded batch, shuffling the order each epoch.
+    pub fn fit_epoch(&mut self, batch: &EncodedBatch, ys: &[usize]) {
+        debug_assert_eq!(batch.words, self.words);
+        let n = batch.n;
         assert_eq!(n, ys.len());
         let mut order: Vec<usize> = (0..n).collect();
         for i in (1..n).rev() {
@@ -610,62 +592,34 @@ impl TsetlinMachine {
             order.swap(i, k);
         }
         let w = self.words;
+        let data = batch.data.as_slice();
         for &i in &order {
-            self.fit_one_packed(&packed[i * w..(i + 1) * w], ys[i]);
+            self.fit_one_lit(&data[i * w..(i + 1) * w], ys[i]);
         }
-    }
-
-    /// Pack `xs` and run one training epoch, shuffling the order each epoch.
-    pub fn fit_epoch(&mut self, xs: &[&[u8]], ys: &[usize]) {
-        assert_eq!(xs.len(), ys.len());
-        let n = xs.len();
-        let w = self.words;
-        let nf = self.n_features;
-        let mut packed = vec![0u64; n * w];
-        for (i, x) in xs.iter().enumerate() {
-            crate::clause_bank::dense::pack(x, nf, &mut packed[i * w..(i + 1) * w]);
-        }
-        self.fit_epoch_packed(&packed, n, ys);
     }
 
     // ---- dataset helpers -------------------------------------------------
 
-    /// Pack an entire dataset into a flat `Vec<u64>` of concatenated literal vectors.
-    pub fn pack_dataset(&self, xs: &[&[u8]]) -> Vec<u64> {
-        let n = xs.len();
-        let w = self.words;
-        let nf = self.n_features;
-        let mut packed = vec![0u64; n * w];
-        for (i, x) in xs.iter().enumerate() {
-            crate::clause_bank::dense::pack(x, nf, &mut packed[i * w..(i + 1) * w]);
-        }
-        packed
-    }
-
-    /// Compute the fraction of correctly predicted samples from a pre-packed dataset.
-    pub fn accuracy_packed(&self, packed: &[u64], n: usize, ys: &[usize]) -> f64 {
-        debug_assert_eq!(packed.len(), n * self.words);
-        assert_eq!(n, ys.len());
+    /// Compute the fraction of correctly predicted samples in an encoded batch.
+    pub fn accuracy(&self, batch: &EncodedBatch, ys: &[usize]) -> f64 {
+        debug_assert_eq!(batch.data.len(), batch.n * self.words);
+        assert_eq!(batch.n, ys.len());
+        let packed = batch.data.as_slice();
+        let n = batch.n;
         let w = self.words;
         #[cfg(feature = "parallel")]
         if n >= PARALLEL_MIN {
             use rayon::prelude::*;
             let correct: usize = (0..n)
                 .into_par_iter()
-                .filter(|&i| self.predict_packed(&packed[i * w..(i + 1) * w]) == ys[i])
+                .filter(|&i| self.predict_lit(&packed[i * w..(i + 1) * w]) == ys[i])
                 .count();
             return correct as f64 / n as f64;
         }
         let correct = (0..n)
-            .filter(|&i| self.predict_packed(&packed[i * w..(i + 1) * w]) == ys[i])
+            .filter(|&i| self.predict_lit(&packed[i * w..(i + 1) * w]) == ys[i])
             .count();
         correct as f64 / n as f64
-    }
-
-    /// Pack `xs` and compute classification accuracy against `ys`.
-    pub fn accuracy(&self, xs: &[&[u8]], ys: &[usize]) -> f64 {
-        let packed = self.pack_dataset(xs);
-        self.accuracy_packed(&packed, xs.len(), ys)
     }
 
     // ---- absorbing state introspection ------------------------------------
@@ -740,8 +694,13 @@ impl TsetlinMachine {
 mod tests {
     use super::*;
     use crate::clause_bank::dense::{clause_dec, clause_inc, clause_type_i, clause_type_ii, fire_predict};
+    use crate::encoder::Encoder;
 
     // ---- helpers -------------------------------------------------------------
+
+    fn enc(n_features: usize) -> Encoder {
+        Encoder::for_binary(n_features)
+    }
 
     /// Generate `n` XOR samples (12 random bits, label = bit0 XOR bit1) with optional label noise.
     fn make_xor(n: usize, noise: f64, seed: u64) -> (Vec<Vec<u8>>, Vec<usize>) {
@@ -771,14 +730,15 @@ mod tests {
     fn weighted_learns_xor_with_few_clauses() {
         let (xtr, ytr) = make_xor(5000, 0.25, 1);
         let (xte, yte) = make_xor(2000, 0.0, 2);
-        let xtr_r = as_slices(&xtr);
-        let xte_r = as_slices(&xte);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let bte = e.encode_batch(&as_slices(&xte));
 
         let mut tm = TsetlinMachine::with_config(2, 12, 8, 15, 3.9, 8, true, 7);
         for _ in 0..15 {
-            tm.fit_epoch(&xtr_r, &ytr);
+            tm.fit_epoch(&btr, &ytr);
         }
-        let acc = tm.accuracy(&xte_r, &yte);
+        let acc = tm.accuracy(&bte, &yte);
         assert!(acc > 0.95, "expected >0.95, got {acc}");
         for c in 0..2 {
             for j in 0..tm.clauses_per_class() {
@@ -809,39 +769,39 @@ mod tests {
         }
     }
 
-    // ---- pack / predict API consistency --------------------------------------
+    // ---- encode / predict API consistency ------------------------------------
 
     #[test]
-    fn pack_roundtrip_predict_agrees() {
+    fn encode_predict_roundtrip_agrees() {
         let (xtr, ytr) = make_xor(500, 0.0, 10);
+        let e = enc(12);
         let mut tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42);
-        tm.fit_epoch(&as_slices(&xtr), &ytr);
+        tm.fit_epoch(&e.encode_batch(&as_slices(&xtr)), &ytr);
 
         let (xte, _) = make_xor(200, 0.0, 20);
         for x in &xte {
-            let unpacked = tm.predict(x);
-            let mut lit = vec![0u64; tm.words_per_sample()];
-            TsetlinMachine::pack(x, tm.n_features(), &mut lit);
-            let packed = tm.predict_packed(&lit);
-            assert_eq!(unpacked, packed, "predict and predict_packed disagree for {x:?}");
+            let s = e.encode_one(x);
+            let by_predict = tm.predict(&s);
+            let by_lit = tm.predict_lit(&s.0);
+            assert_eq!(by_predict, by_lit, "predict and predict_lit disagree for {x:?}");
         }
     }
 
     #[test]
-    fn accuracy_packed_matches_manual_loop() {
+    fn accuracy_matches_manual_loop() {
         let (xtr, ytr) = make_xor(500, 0.0, 11);
+        let e = enc(12);
         let mut tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42);
-        tm.fit_epoch(&as_slices(&xtr), &ytr);
+        tm.fit_epoch(&e.encode_batch(&as_slices(&xtr)), &ytr);
 
         let (xte, yte) = make_xor(300, 0.0, 21);
-        let xte_r = as_slices(&xte);
-        let packed = tm.pack_dataset(&xte_r);
+        let batch = e.encode_batch(&as_slices(&xte));
         let n = xte.len();
         let w = tm.words_per_sample();
 
-        let api_acc = tm.accuracy_packed(&packed, n, &yte);
+        let api_acc = tm.accuracy(&batch, &yte);
         let manual_correct = (0..n)
-            .filter(|&i| tm.predict_packed(&packed[i * w..(i + 1) * w]) == yte[i])
+            .filter(|&i| tm.predict_lit(&batch.data[i * w..(i + 1) * w]) == yte[i])
             .count();
         let manual_acc = manual_correct as f64 / n as f64;
 
@@ -849,49 +809,49 @@ mod tests {
     }
 
     #[test]
-    fn predict_batch_packed_matches_single() {
+    fn predict_batch_matches_single() {
         let (xtr, ytr) = make_xor(300, 0.0, 12);
+        let e = enc(12);
         let mut tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42);
-        tm.fit_epoch(&as_slices(&xtr), &ytr);
+        tm.fit_epoch(&e.encode_batch(&as_slices(&xtr)), &ytr);
 
         let (xte, _) = make_xor(100, 0.0, 22);
-        let xte_r = as_slices(&xte);
-        let packed = tm.pack_dataset(&xte_r);
+        let batch = e.encode_batch(&as_slices(&xte));
         let n = xte.len();
         let w = tm.words_per_sample();
 
-        let batch = tm.predict_batch_packed(&packed, n);
-        let single: Vec<usize> = (0..n)
-            .map(|i| tm.predict_packed(&packed[i * w..(i + 1) * w]))
+        let from_batch = tm.predict_batch(&batch);
+        let from_single: Vec<usize> = (0..n)
+            .map(|i| tm.predict_lit(&batch.data[i * w..(i + 1) * w]))
             .collect();
 
-        assert_eq!(batch, single);
+        assert_eq!(from_batch, from_single);
     }
 
-    // ---- scores_packed -------------------------------------------------------
+    // ---- scores -------------------------------------------------------
 
     #[test]
-    fn scores_packed_correct_class_wins_after_training() {
+    fn scores_correct_class_wins_after_training() {
         let (xtr, ytr) = make_xor(2000, 0.0, 13);
+        let e = enc(12);
         let mut tm = TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 8, true, 42);
         for _ in 0..10 {
-            tm.fit_epoch(&as_slices(&xtr), &ytr);
+            tm.fit_epoch(&e.encode_batch(&as_slices(&xtr)), &ytr);
         }
 
         let (xte, yte) = make_xor(100, 0.0, 23);
         let mut correct = 0usize;
         for (x, &y) in xte.iter().zip(&yte) {
-            let mut lit = vec![0u64; tm.words_per_sample()];
-            TsetlinMachine::pack(x, tm.n_features(), &mut lit);
-            let mut scores = vec![0i32; 2];
-            tm.scores_packed(&lit, &mut scores);
-            let pred = if scores[0] >= scores[1] { 0 } else { 1 };
+            let sample = e.encode_one(x);
+            let mut s = vec![0i32; 2];
+            tm.scores(&sample, &mut s);
+            let pred = if s[0] >= s[1] { 0 } else { 1 };
             if pred == y {
                 correct += 1;
             }
         }
         let acc = correct as f64 / 100.0;
-        assert!(acc > 0.90, "scores_packed acc {acc} too low");
+        assert!(acc > 0.90, "scores acc {acc} too low");
     }
 
     // ---- clause polarity -----------------------------------------------------
@@ -909,20 +869,21 @@ mod tests {
     #[test]
     fn same_seed_same_result() {
         let (xtr, ytr) = make_xor(500, 0.0, 14);
-        let xtr_r = as_slices(&xtr);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
 
         let mut tm1 = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 99);
         let mut tm2 = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 99);
         for _ in 0..5 {
-            tm1.fit_epoch(&xtr_r, &ytr);
-            tm2.fit_epoch(&xtr_r, &ytr);
+            tm1.fit_epoch(&btr, &ytr);
+            tm2.fit_epoch(&btr, &ytr);
         }
 
         let (xte, yte) = make_xor(200, 0.0, 24);
-        let xte_r = as_slices(&xte);
+        let bte = e.encode_batch(&as_slices(&xte));
         assert_eq!(
-            tm1.accuracy(&xte_r, &yte),
-            tm2.accuracy(&xte_r, &yte),
+            tm1.accuracy(&bte, &yte),
+            tm2.accuracy(&bte, &yte),
             "same seed must produce identical results"
         );
     }
@@ -932,11 +893,11 @@ mod tests {
     #[test]
     fn clause_drop_p_one_leaves_state_unchanged() {
         let (xtr, ytr) = make_xor(200, 0.0, 15);
-        let xtr_r = as_slices(&xtr);
+        let btr = enc(12).encode_batch(&as_slices(&xtr));
         let mut tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42)
             .clause_drop_p(0.9999);
         let state_before = tm.state.clone();
-        tm.fit_epoch(&xtr_r, &ytr);
+        tm.fit_epoch(&btr, &ytr);
         let state_changed = tm.state.iter().zip(&state_before).filter(|(a, b)| a != b).count();
         let total = tm.state.len();
         assert!(
@@ -949,12 +910,15 @@ mod tests {
     fn clause_drop_p_zero_trains_normally() {
         let (xtr, ytr) = make_xor(2000, 0.0, 16);
         let (xte, yte) = make_xor(500, 0.0, 26);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let bte = e.encode_batch(&as_slices(&xte));
         let mut tm = TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 8, true, 42)
             .clause_drop_p(0.0);
         for _ in 0..10 {
-            tm.fit_epoch(&as_slices(&xtr), &ytr);
+            tm.fit_epoch(&btr, &ytr);
         }
-        let acc = tm.accuracy(&as_slices(&xte), &yte);
+        let acc = tm.accuracy(&bte, &yte);
         assert!(acc > 0.90, "drop_p=0 should still converge, got {acc}");
     }
 
@@ -993,14 +957,14 @@ mod tests {
     #[test]
     fn max_included_literals_reduces_clause_size() {
         let (xtr, ytr) = make_xor(2000, 0.0, 17);
-        let xtr_r = as_slices(&xtr);
+        let btr = enc(12).encode_batch(&as_slices(&xtr));
 
         let mut tm_tight = TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 8, true, 42)
             .max_included_literals(2);
         let mut tm_free = TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 8, true, 42);
         for _ in 0..10 {
-            tm_tight.fit_epoch(&xtr_r, &ytr);
-            tm_free.fit_epoch(&xtr_r, &ytr);
+            tm_tight.fit_epoch(&btr, &ytr);
+            tm_free.fit_epoch(&btr, &ytr);
         }
 
         let avg = |tm: &TsetlinMachine| {
@@ -1044,11 +1008,14 @@ mod tests {
             yte.push(y);
         }
 
+        let e = enc(8);
+        let btr = e.encode_batch(&as_slices(&xs));
+        let bte = e.encode_batch(&as_slices(&xte));
         let mut tm = TsetlinMachine::with_config(4, 8, 20, 30, 3.9, 8, true, 42);
         for _ in 0..20 {
-            tm.fit_epoch(&as_slices(&xs), &ys);
+            tm.fit_epoch(&btr, &ys);
         }
-        let acc = tm.accuracy(&as_slices(&xte), &yte);
+        let acc = tm.accuracy(&bte, &yte);
         assert!(acc > 0.85, "4-class XOR should reach >0.85, got {acc}");
     }
 
@@ -1058,9 +1025,10 @@ mod tests {
     fn weights_stay_in_1_to_threshold() {
         let threshold = 20i32;
         let (xtr, ytr) = make_xor(1000, 0.1, 18);
+        let btr = enc(12).encode_batch(&as_slices(&xtr));
         let mut tm = TsetlinMachine::with_config(2, 12, 12, threshold, 3.9, 8, true, 42);
         for _ in 0..10 {
-            tm.fit_epoch(&as_slices(&xtr), &ytr);
+            tm.fit_epoch(&btr, &ytr);
         }
         for c in 0..2 {
             for j in 0..tm.clauses_per_class() {
@@ -1071,26 +1039,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    // ---- fit_epoch vs fit_epoch_packed equivalence ---------------------------
-
-    #[test]
-    fn fit_epoch_and_fit_epoch_packed_identical() {
-        let (xtr, ytr) = make_xor(300, 0.0, 19);
-        let xtr_r = as_slices(&xtr);
-
-        let mut tm_a = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 77);
-        let mut tm_b = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 77);
-
-        let packed = tm_b.pack_dataset(&xtr_r);
-        for _ in 0..5 {
-            tm_a.fit_epoch(&xtr_r, &ytr);
-            tm_b.fit_epoch_packed(&packed, xtr.len(), &ytr);
-        }
-
-        assert_eq!(tm_a.state, tm_b.state);
-        assert_eq!(tm_a.weights, tm_b.weights);
     }
 
     // ---- words_per_sample / pack dimensions ----------------------------------
@@ -1115,7 +1063,7 @@ mod tests {
         let x: Vec<u8> = vec![1, 0, 1, 0];
         let words = (2 * nf + 63) / 64;
         let mut lit = vec![0u64; words];
-        TsetlinMachine::pack(&x, nf, &mut lit);
+        crate::clause_bank::dense::pack(&x, nf, &mut lit);
         let bits = lit[0];
         assert_eq!((bits >> 0) & 1, 1, "x[0]=1: positive bit should be set");
         assert_eq!((bits >> 1) & 1, 0, "x[1]=0: positive bit should be clear");
@@ -1161,11 +1109,11 @@ mod tests {
     #[test]
     fn literal_drop_p_one_leaves_state_unchanged() {
         let (xtr, ytr) = make_xor(200, 0.0, 30);
-        let xtr_r = as_slices(&xtr);
+        let btr = enc(12).encode_batch(&as_slices(&xtr));
         let mut tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42)
             .literal_drop_p(0.9999);
         let state_before = tm.state.clone();
-        tm.fit_epoch(&xtr_r, &ytr);
+        tm.fit_epoch(&btr, &ytr);
         let state_changed = tm.state.iter().zip(&state_before).filter(|(a, b)| a != b).count();
         let total = tm.state.len();
         assert!(
@@ -1178,12 +1126,15 @@ mod tests {
     fn literal_drop_p_zero_trains_normally() {
         let (xtr, ytr) = make_xor(2000, 0.0, 31);
         let (xte, yte) = make_xor(500, 0.0, 41);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let bte = e.encode_batch(&as_slices(&xte));
         let mut tm = TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 8, true, 42)
             .literal_drop_p(0.0);
         for _ in 0..10 {
-            tm.fit_epoch(&as_slices(&xtr), &ytr);
+            tm.fit_epoch(&btr, &ytr);
         }
-        let acc = tm.accuracy(&as_slices(&xte), &yte);
+        let acc = tm.accuracy(&bte, &yte);
         assert!(acc > 0.90, "literal_drop_p=0 should still converge, got {acc}");
     }
 

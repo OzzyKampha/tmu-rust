@@ -9,9 +9,9 @@
 //!
 //! NOTE: the data here is synthetic, purely to exercise the pipeline. In
 //! production you'd feed real features (e.g. parsed from Zeek conn.log /
-//! Suricata EVE / NetFlow) into the same `Booleanizer` + `TsetlinMachine`.
+//! Suricata EVE / NetFlow) into the same `Encoder` + `TsetlinMachine`.
 
-use tmu_rs::{Booleanizer, Rng, TsetlinMachine};
+use tmu_rs::{Encoder, Rng, TsetlinMachine};
 
 const FEATURES: [&str; 8] = [
     "duration", "src_bytes", "dst_bytes", "src_pkts", "dst_pkts", "dport", "iat_var", "syn_ratio",
@@ -74,35 +74,25 @@ fn gen(n: usize, mal_frac: f64, seed: u64) -> (Vec<Vec<f64>>, Vec<usize>) {
     (xs, ys)
 }
 
-/// Run the full NDR pipeline: generate synthetic flows, booleanize, train TM, report metrics and rules.
+/// Run the full NDR pipeline: generate synthetic flows, encode, train TM, report metrics and rules.
 fn main() {
     let (xtr, ytr) = gen(4000, 0.3, 1);
     let (xte, yte) = gen(1500, 0.3, 2);
 
     let xtr_ref: Vec<&[f64]> = xtr.iter().map(|r| r.as_slice()).collect();
-    let booleanizer = Booleanizer::fit(&xtr_ref, 8, 8);
-    let n_bin = booleanizer.n_output_features();
-    println!("numeric features: 8  ->  binary features: {n_bin}\n");
+    let xte_ref: Vec<&[f64]> = xte.iter().map(|r| r.as_slice()).collect();
 
-    let btr: Vec<Vec<u8>> = xtr
-        .iter()
-        .map(|r| { let mut o = vec![0u8; n_bin]; booleanizer.transform_row(r, &mut o); o })
-        .collect();
-    let bte: Vec<Vec<u8>> = xte
-        .iter()
-        .map(|r| { let mut o = vec![0u8; n_bin]; booleanizer.transform_row(r, &mut o); o })
-        .collect();
+    let encoder = Encoder::fit_numeric(&xtr_ref, 8);
+    println!("numeric features: 8  ->  binary features: {}\n", encoder.n_features());
 
-    let mut tm = TsetlinMachine::with_config(2, n_bin, 40, 50, 4.0, 8, true, 7);
+    let mut tm = TsetlinMachine::with_config(2, encoder.n_features(), 40, 50, 4.0, 8, true, 7);
 
-    let btr_r: Vec<&[u8]> = btr.iter().map(|v| v.as_slice()).collect();
-    let bte_r: Vec<&[u8]> = bte.iter().map(|v| v.as_slice()).collect();
-    let packed_tr = tm.pack_dataset(&btr_r);
-    let packed_te = tm.pack_dataset(&bte_r);
+    let packed_tr = encoder.encode_batch_numeric(&xtr_ref);
+    let packed_te = encoder.encode_batch_numeric(&xte_ref);
 
     for epoch in 1..=8 {
-        tm.fit_epoch_packed(&packed_tr, btr.len(), &ytr);
-        let preds = tm.predict_batch_packed(&packed_te, bte.len());
+        tm.fit_epoch(&packed_tr, &ytr);
+        let preds = tm.predict_batch(&packed_te);
         let (mut tp, mut fp, mut tn, mut fn_) = (0usize, 0, 0, 0);
         for (&pred, &y) in preds.iter().zip(yte.iter()) {
             match (y, pred) {
@@ -112,7 +102,7 @@ fn main() {
                 _ => fn_ += 1,
             }
         }
-        let acc = (tp + tn) as f64 / bte.len() as f64;
+        let acc = (tp + tn) as f64 / xte.len() as f64;
         let prec = if tp + fp > 0 { tp as f64 / (tp + fp) as f64 } else { 0.0 };
         let rec = if tp + fn_ > 0 { tp as f64 / (tp + fn_) as f64 } else { 0.0 };
         println!("epoch {epoch}  acc={acc:.4}  precision={prec:.3}  recall={rec:.3}");
@@ -131,7 +121,7 @@ fn main() {
         let parts: Vec<String> = rule
             .iter()
             .map(|&(bit, negated)| {
-                let (f, thr) = booleanizer.bit_origin(bit);
+                let (f, thr) = encoder.bit_origin(bit);
                 let op = if negated { "<=" } else { ">" };
                 format!("{} {} {:.1}", FEATURES[f], op, thr)
             })
