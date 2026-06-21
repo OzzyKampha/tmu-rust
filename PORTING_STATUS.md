@@ -36,6 +36,7 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | Pre-packed dataset API | ✅ | `pack_dataset()` + `fit_epoch_packed()` |
 | Batch prediction | ✅ | `predict_batch_packed()` |
 | Raw class scores | ✅ | `scores_packed()` |
+| GPU / CUDA acceleration | ❌ Not planned | |
 
 ---
 
@@ -70,9 +71,5 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 
 ## Not yet planned
 
-The following have not been started and there are no current plans to add them:
-
-- Convolutional, coalesced, regression, autoencoder, and composite machine types
 - Imbalanced-class weighting (per-class clause weights)
-- GPU / CUDA acceleration
 - Python bindings
