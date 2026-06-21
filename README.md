@@ -4,7 +4,7 @@ A Rust port of the [cair/tmu](https://github.com/cair/tmu) Tsetlin Machine libra
 
 Implements a bit-packed, weighted multiclass Tsetlin Machine with bit-parallel and multi-threaded training, a fast booleanizer, and ports of the TMU classification demos.
 
-For a full breakdown of what has been ported and what is missing, see [PORTING_STATUS.md](PORTING_STATUS.md).
+For a full breakdown of what has been ported and what is missing, see [PORTING_STATUS.md](PORTING_STATUS.md). For a Python vs Rust throughput and accuracy comparison, see [BENCHMARKS.md](BENCHMARKS.md).
 
 ---
 
