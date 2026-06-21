@@ -49,8 +49,8 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | `XORDemo` | `xor` | ✅ Validated | 100% accuracy |
 | `NoisyXORDemo` | `noisy_xor` | ✅ Validated | Noisy labels, converges cleanly |
 | `InterpretabilityDemo` | `interpretability` | ✅ Validated | Prints extracted clause rules |
+| *(extra)* `ndr_flows` | `ndr_flows` | ✅ Complete | Synthetic network-flow detection; not part of TMU |
 | `BreastCancerDemo` | `breast_cancer` | ✅ Validated | ~99–100% test accuracy |
 | `MNISTDemo` / `MNISTDemoWeightedClauses` | `mnist` | ✅ Validated | ~93% (2000 clauses, T=50, s=10.0) |
 | `IMDbTextCategorizationDemo` | `imdb` | ✅ Validated | 2000 clauses, T=80, s=10.0 |
-| *(extra)* `ndr_flows` | `ndr_flows` | ✅ Complete | Synthetic network-flow detection; not part of TMU |
 
