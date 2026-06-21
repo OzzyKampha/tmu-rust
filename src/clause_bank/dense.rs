@@ -5,6 +5,14 @@
 //! future variants (coalesced, sparse, convolutional) reuse the same building
 //! blocks without duplicating bit-manipulation logic.
 //!
+//! ## TA counter storage
+//!
+//! TA counters are stored as `u8` (one byte per literal per clause), matching TMU's
+//! C extension default of 8-bit states.  This keeps the `ta` array 4× smaller than a
+//! `u32` layout (so a 10 000-clause model fits in L3 cache) and lets AVX2 process
+//! **32 counters per register** with native saturating arithmetic
+//! (`vpaddusb` / `vpsubusb` / `vpminub`).  `state_bits` is therefore capped at 2..=8.
+//!
 //! ## SIMD dispatch pattern
 //!
 //! The three hot update functions ([`rebuild_include`], [`type_i_update_bytes`],
@@ -129,20 +137,20 @@ pub(crate) fn clause_fire(
 /// A literal `l` is included when `ta[l] >= half`.  The result is ANDed with `valid`
 /// so padding bits beyond `n_literals` are always zero.
 ///
-/// **AVX2 path** (x86_64): processes 8 u32s per iteration.  Each lane is XOR-biased
-/// by `0x80000000` to convert unsigned `>=` to signed `>`, then `_mm256_cmpgt_epi32`
-/// produces a SIMD mask and `_mm256_movemask_ps` collapses 8 lanes → 8 bits in one
-/// instruction.  The scalar tail handles the remaining `n_literals % 8` values.
+/// **AVX2 path** (x86_64): processes 32 u8s per iteration.  Each lane is XOR-biased
+/// by `0x80` to convert unsigned `>=` to signed `>`, then `_mm256_cmpgt_epi8`
+/// produces a SIMD mask and `_mm256_movemask_epi8` collapses 32 lanes → 32 bits in
+/// one instruction.  The scalar tail handles the remaining `< 32` values.
 ///
 /// **Scalar fallback**: branchless `(ta[l] >= half) as u64 << bit` loop.
 #[inline]
 pub(crate) fn rebuild_include(
-    ta: &[u32],
+    ta: &[u8],
     inc: &mut [u64],
     valid: &[u64],
     words: usize,
     n_literals: usize,
-    half: u32,
+    half: u8,
 ) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -157,12 +165,12 @@ pub(crate) fn rebuild_include(
 /// Branchless scalar fallback for [`rebuild_include`] on non-AVX2 targets.
 #[inline]
 fn rebuild_include_scalar(
-    ta: &[u32],
+    ta: &[u8],
     inc: &mut [u64],
     valid: &[u64],
     words: usize,
     n_literals: usize,
-    half: u32,
+    half: u8,
 ) {
     for k in 0..words {
         let base = k * WORD_BITS;
@@ -175,27 +183,27 @@ fn rebuild_include_scalar(
     }
 }
 
-/// AVX2 implementation of [`rebuild_include`]: 8 comparisons → 8 bits per iteration.
+/// AVX2 implementation of [`rebuild_include`]: 32 comparisons → 32 bits per iteration.
 ///
 /// # Safety
 /// Caller must verify AVX2 is available.  All pointer reads stay within the `ta`
-/// slice (loop guard: `bit + 8 <= limit <= n_literals - base`).
+/// slice (loop guard: `bit + 32 <= limit <= n_literals - base`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn rebuild_include_avx2(
-    ta: &[u32],
+    ta: &[u8],
     inc: &mut [u64],
     valid: &[u64],
     words: usize,
     n_literals: usize,
-    half: u32,
+    half: u8,
 ) {
     use std::arch::x86_64::*;
 
-    // Bias both sides by 0x80000000 to convert unsigned >= to signed >.
-    // ta >= half  ↔  (ta ^ 0x80000000) > ((half-1) ^ 0x80000000)  [signed]
-    let bias = _mm256_set1_epi32(i32::MIN);
-    let threshold = _mm256_set1_epi32((half.wrapping_sub(1) ^ 0x8000_0000u32) as i32);
+    // Bias both sides by 0x80 to convert unsigned >= to signed >.
+    // ta >= half  ↔  (ta ^ 0x80) > ((half-1) ^ 0x80)  [signed i8]
+    let bias = _mm256_set1_epi8(i8::MIN);
+    let threshold = _mm256_set1_epi8((half.wrapping_sub(1) ^ 0x80) as i8);
 
     for k in 0..words {
         let base = k * WORD_BITS;
@@ -203,19 +211,19 @@ unsafe fn rebuild_include_avx2(
         let mut word = 0u64;
         let mut bit = 0usize;
 
-        // 8 literals per AVX2 iteration.
-        while bit + 8 <= limit {
-            // SAFETY: `bit + 8 <= limit <= n_literals - base`, so `base + bit + 8 <= n_literals`
+        // 32 literals per AVX2 iteration.
+        while bit + 32 <= limit {
+            // SAFETY: `bit + 32 <= limit <= n_literals - base`, so `base + bit + 32 <= n_literals`
             // which is within the `ta` slice. `_mm256_loadu_si256` is an unaligned load.
             let ptr = ta.as_ptr().add(base + bit) as *const __m256i;
             let chunk = _mm256_loadu_si256(ptr);
             let biased = _mm256_xor_si256(chunk, bias);
-            let cmp = _mm256_cmpgt_epi32(biased, threshold);
-            let bits8 = _mm256_movemask_ps(_mm256_castsi256_ps(cmp)) as u64;
-            word |= bits8 << bit;
-            bit += 8;
+            let cmp = _mm256_cmpgt_epi8(biased, threshold);
+            let bits32 = _mm256_movemask_epi8(cmp) as u32 as u64;
+            word |= bits32 << bit;
+            bit += 32;
         }
-        // Scalar tail for remaining < 8 literals.
+        // Scalar tail for remaining < 32 literals.
         while bit < limit {
             word |= ((ta[base + bit] >= half) as u64) << bit;
             bit += 1;
@@ -259,13 +267,13 @@ pub(crate) fn bmask_word(rng: &mut Rng, digits: &[u8]) -> u64 {
 /// Weight bookkeeping is the caller's responsibility; call this function after updating
 /// the weight.
 ///
-/// **AVX2 path**: 8 literals/iteration using `_mm256_cvtepu8_epi32` + `_mm256_min_epu32`.
-/// Saturating subtract is emulated as `max(a, dec) - dec` (AVX2 has no `vpsubsd_u32`).
+/// **AVX2 path**: 32 literals/iteration using native saturating byte arithmetic
+/// (`_mm256_adds_epu8` / `_mm256_subs_epu8`) and `_mm256_min_epu8` clamping.
 ///
 /// **Scalar fallback**: branchless per-literal arithmetic.
 #[inline(always)]
 pub(crate) fn type_i_update_bytes(
-    ta: &mut [u32],
+    ta: &mut [u8],
     n_literals: usize,
     fired_under: bool,
     boost: bool,
@@ -273,7 +281,7 @@ pub(crate) fn type_i_update_bytes(
     inv_b: &[u8],
     keep_b: &[u8],
     active_b: &[u8],
-    max_state: u32,
+    max_state: u8,
 ) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -293,7 +301,7 @@ pub(crate) fn type_i_update_bytes(
 /// Branchless scalar fallback for [`type_i_update_bytes`] on non-AVX2 targets.
 #[inline]
 fn type_i_update_bytes_scalar(
-    ta: &mut [u32],
+    ta: &mut [u8],
     n_literals: usize,
     fired_under: bool,
     boost: bool,
@@ -301,44 +309,43 @@ fn type_i_update_bytes_scalar(
     inv_b: &[u8],
     keep_b: &[u8],
     active_b: &[u8],
-    max_state: u32,
+    max_state: u8,
 ) {
-    let boost_u32 = boost as u32;
+    let boost_u8 = boost as u8;
     if fired_under {
         for l in 0..n_literals {
-            let la = active_b[l] as u32;
+            let la = active_b[l];
             let t = ta[l];
-            let present = lit_b[l] as u32;
-            let inc = present & (boost_u32 | keep_b[l] as u32) & la;
-            let not_at_max = (t < max_state) as u32;
-            let dec = (1 - present) & inv_b[l] as u32 & not_at_max & la;
-            ta[l] = (t + inc).min(max_state).saturating_sub(dec);
+            let present = lit_b[l];
+            let inc = present & (boost_u8 | keep_b[l]) & la;
+            let not_at_max = (t < max_state) as u8;
+            let dec = (1 - present) & inv_b[l] & not_at_max & la;
+            ta[l] = t.saturating_add(inc).min(max_state).saturating_sub(dec);
         }
     } else {
         for l in 0..n_literals {
-            let la = active_b[l] as u32;
+            let la = active_b[l];
             let t = ta[l];
-            let not_at_max = (t < max_state) as u32;
-            let dec = inv_b[l] as u32 & not_at_max & la;
+            let not_at_max = (t < max_state) as u8;
+            let dec = inv_b[l] & not_at_max & la;
             ta[l] = t.saturating_sub(dec);
         }
     }
 }
 
-/// AVX2 implementation of [`type_i_update_bytes`]: 8 literals per iteration.
+/// AVX2 implementation of [`type_i_update_bytes`]: 32 literals per iteration.
 ///
-/// Byte inputs are zero-extended to u32 with `_mm256_cvtepu8_epi32` (`vpmovsxbd`).
-/// Clamping uses `_mm256_min_epu32` (`vpminud`).  Saturating subtract is
-/// `max(a, dec) - dec` via `_mm256_max_epu32` + `_mm256_sub_epi32` — AVX2 has
-/// no unsigned 32-bit saturating subtract instruction.
+/// All inputs are already 0/1 bytes, so no widening is needed.  Increment is
+/// `_mm256_adds_epu8` then `_mm256_min_epu8` (caps at `max_state`); decrement is
+/// the native `_mm256_subs_epu8` (saturating unsigned byte subtract).
 ///
 /// # Safety
 /// Caller must verify AVX2 is available.  Pointer reads/writes stay within the
-/// `ta` slice (loop guard: `l + 8 <= n_literals`).
+/// `ta` slice (loop guard: `l + 32 <= n_literals`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn type_i_update_bytes_avx2(
-    ta: &mut [u32],
+    ta: &mut [u8],
     n_literals: usize,
     fired_under: bool,
     boost: bool,
@@ -346,84 +353,81 @@ unsafe fn type_i_update_bytes_avx2(
     inv_b: &[u8],
     keep_b: &[u8],
     active_b: &[u8],
-    max_state: u32,
+    max_state: u8,
 ) {
     use std::arch::x86_64::*;
 
-    let max_state_v = _mm256_set1_epi32(max_state as i32);
-    let ones = _mm256_set1_epi32(1);
-    let boost_v = _mm256_set1_epi32(boost as i32);
+    let max_state_v = _mm256_set1_epi8(max_state as i8);
+    let ones = _mm256_set1_epi8(1);
+    let all_ones = _mm256_set1_epi8(-1);
+    let boost_v = _mm256_set1_epi8(boost as i8);
 
-    // Load 8 bytes from a u8 slice pointer and zero-extend to 8 × i32.
-    // SAFETY: caller ensures at least 8 bytes remain at ptr (checked by loop bound).
-    macro_rules! load8 {
+    // Load 32 bytes (one full AVX2 register) from a u8 slice.
+    // SAFETY: caller ensures at least 32 bytes remain at ptr (checked by loop bound).
+    macro_rules! load32 {
         ($slice:expr, $off:expr) => {{
-            let ptr = $slice.as_ptr().add($off) as *const _;
-            _mm256_cvtepu8_epi32(_mm_loadl_epi64(ptr))
+            _mm256_loadu_si256($slice.as_ptr().add($off) as *const __m256i)
         }};
     }
 
     let mut l = 0usize;
 
     if fired_under {
-        while l + 8 <= n_literals {
-            // SAFETY: l + 8 <= n_literals, so all reads are in-bounds.
-            let ta_ptr = ta.as_ptr().add(l) as *const __m256i;
-            let t = _mm256_loadu_si256(ta_ptr);
-            let present = load8!(lit_b, l);
-            let keep_v = load8!(keep_b, l);
-            let inv_v = load8!(inv_b, l);
-            let la = load8!(active_b, l);
+        while l + 32 <= n_literals {
+            // SAFETY: l + 32 <= n_literals, so all reads are in-bounds.
+            let t = load32!(ta, l);
+            let present = load32!(lit_b, l);
+            let keep_v = load32!(keep_b, l);
+            let inv_v = load32!(inv_b, l);
+            let la = load32!(active_b, l);
 
             // inc = present & (boost | keep) & la  (all values 0 or 1)
             let inc = _mm256_and_si256(_mm256_and_si256(present, _mm256_or_si256(boost_v, keep_v)), la);
             // t_clamped = min(t + inc, max_state)
-            let t_clamped = _mm256_min_epu32(_mm256_add_epi32(t, inc), max_state_v);
+            let t_clamped = _mm256_min_epu8(_mm256_adds_epu8(t, inc), max_state_v);
 
             // absent = 1 - present
-            let absent = _mm256_sub_epi32(ones, present);
-            // not_at_max: 0xFFFFFFFF where t < max_state, 0 where t == max_state
-            let not_at_max = _mm256_andnot_si256(_mm256_cmpeq_epi32(t, max_state_v), _mm256_set1_epi32(-1));
-            // dec_01 = absent & inv & la (0 or 1); zeroed out where t == max_state
+            let absent = _mm256_sub_epi8(ones, present);
+            // not_at_max: 0xFF where t != max_state, 0 where t == max_state
+            let not_at_max = _mm256_andnot_si256(_mm256_cmpeq_epi8(t, max_state_v), all_ones);
+            // dec = absent & inv & la (0 or 1); zeroed out where t == max_state
             let dec = _mm256_and_si256(_mm256_and_si256(_mm256_and_si256(absent, inv_v), la), not_at_max);
 
-            // saturating_sub(t_clamped, dec): max(t_clamped, dec) - dec
-            let result = _mm256_sub_epi32(_mm256_max_epu32(t_clamped, dec), dec);
+            // native saturating unsigned byte subtract
+            let result = _mm256_subs_epu8(t_clamped, dec);
             _mm256_storeu_si256(ta.as_mut_ptr().add(l) as *mut __m256i, result);
-            l += 8;
+            l += 32;
         }
         // Scalar tail.
-        let boost_u32 = boost as u32;
+        let boost_u8 = boost as u8;
         while l < n_literals {
             let t = ta[l];
-            let present = lit_b[l] as u32;
-            let la = active_b[l] as u32;
-            let inc = present & (boost_u32 | keep_b[l] as u32) & la;
-            let not_at_max = (t < max_state) as u32;
-            let dec = (1 - present) & inv_b[l] as u32 & not_at_max & la;
-            ta[l] = (t + inc).min(max_state).saturating_sub(dec);
+            let present = lit_b[l];
+            let la = active_b[l];
+            let inc = present & (boost_u8 | keep_b[l]) & la;
+            let not_at_max = (t < max_state) as u8;
+            let dec = (1 - present) & inv_b[l] & not_at_max & la;
+            ta[l] = t.saturating_add(inc).min(max_state).saturating_sub(dec);
             l += 1;
         }
     } else {
-        while l + 8 <= n_literals {
-            // SAFETY: l + 8 <= n_literals, so all reads are in-bounds.
-            let ta_ptr = ta.as_ptr().add(l) as *const __m256i;
-            let t = _mm256_loadu_si256(ta_ptr);
-            let inv_v = load8!(inv_b, l);
-            let la = load8!(active_b, l);
+        while l + 32 <= n_literals {
+            // SAFETY: l + 32 <= n_literals, so all reads are in-bounds.
+            let t = load32!(ta, l);
+            let inv_v = load32!(inv_b, l);
+            let la = load32!(active_b, l);
 
-            let not_at_max = _mm256_andnot_si256(_mm256_cmpeq_epi32(t, max_state_v), _mm256_set1_epi32(-1));
+            let not_at_max = _mm256_andnot_si256(_mm256_cmpeq_epi8(t, max_state_v), all_ones);
             let dec = _mm256_and_si256(_mm256_and_si256(inv_v, la), not_at_max);
 
-            // saturating_sub: max(t, dec) - dec
-            let result = _mm256_sub_epi32(_mm256_max_epu32(t, dec), dec);
+            let result = _mm256_subs_epu8(t, dec);
             _mm256_storeu_si256(ta.as_mut_ptr().add(l) as *mut __m256i, result);
-            l += 8;
+            l += 32;
         }
         while l < n_literals {
             let t = ta[l];
-            let not_at_max = (t < max_state) as u32;
-            let dec = inv_b[l] as u32 & not_at_max & active_b[l] as u32;
+            let not_at_max = (t < max_state) as u8;
+            let dec = inv_b[l] & not_at_max & active_b[l];
             ta[l] = t.saturating_sub(dec);
             l += 1;
         }
@@ -442,18 +446,18 @@ unsafe fn type_i_update_bytes_avx2(
 /// - `lit_b`: 1 if the literal is present in the current sample, 0 if absent.
 /// - `active_b`: combined valid × literal-dropout mask.
 ///
-/// **AVX2 path**: 8 literals/iteration; unsigned comparisons use the `0x80000000`
-/// bias trick with `_mm256_cmpgt_epi32`.
+/// **AVX2 path**: 32 literals/iteration; unsigned comparisons use the `0x80`
+/// bias trick with `_mm256_cmpgt_epi8`.
 ///
 /// **Scalar fallback**: branchless per-literal arithmetic.
 #[inline(always)]
 pub(crate) fn type_ii_update_bytes(
-    ta: &mut [u32],
+    ta: &mut [u8],
     n_literals: usize,
     lit_b: &[u8],
     active_b: &[u8],
-    half: u32,
-    max_state: u32,
+    half: u8,
+    max_state: u8,
 ) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -468,98 +472,93 @@ pub(crate) fn type_ii_update_bytes(
 /// Branchless scalar fallback for [`type_ii_update_bytes`] on non-AVX2 targets.
 #[inline]
 fn type_ii_update_bytes_scalar(
-    ta: &mut [u32],
+    ta: &mut [u8],
     n_literals: usize,
     lit_b: &[u8],
     active_b: &[u8],
-    half: u32,
-    max_state: u32,
+    half: u8,
+    max_state: u8,
 ) {
     for l in 0..n_literals {
-        let la = active_b[l] as u32;
+        let la = active_b[l];
         let t = ta[l];
-        let absent = 1 - lit_b[l] as u32;
-        let excluded = (t < half) as u32;
-        let not_zero = (t > 0) as u32;
+        let absent = 1 - lit_b[l];
+        let excluded = (t < half) as u8;
+        let not_zero = (t > 0) as u8;
         let inc = absent & excluded & not_zero & la;
-        ta[l] = (t + inc).min(max_state);
+        ta[l] = t.saturating_add(inc).min(max_state);
     }
 }
 
-/// AVX2 implementation of [`type_ii_update_bytes`]: 8 literals per iteration.
+/// AVX2 implementation of [`type_ii_update_bytes`]: 32 literals per iteration.
 ///
 /// `t < half` and `t > 0` use the unsigned-compare bias trick: XOR both sides
-/// with `0x80000000` so unsigned `<` becomes signed `<` (`_mm256_cmpgt_epi32`
-/// with arguments swapped) and `> 0` becomes signed `> i32::MIN`.
+/// with `0x80` so unsigned `<` becomes signed `<` (`_mm256_cmpgt_epi8` with
+/// arguments swapped) and `> 0` becomes signed `> i8::MIN`.
 ///
 /// # Safety
 /// Caller must verify AVX2 is available.  Pointer reads/writes stay within the
-/// `ta` slice (loop guard: `l + 8 <= n_literals`).
+/// `ta` slice (loop guard: `l + 32 <= n_literals`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn type_ii_update_bytes_avx2(
-    ta: &mut [u32],
+    ta: &mut [u8],
     n_literals: usize,
     lit_b: &[u8],
     active_b: &[u8],
-    half: u32,
-    max_state: u32,
+    half: u8,
+    max_state: u8,
 ) {
     use std::arch::x86_64::*;
 
-    let max_state_v = _mm256_set1_epi32(max_state as i32);
-    let ones = _mm256_set1_epi32(1);
-    let bias = _mm256_set1_epi32(i32::MIN);
-    // t < half  ↔  (t ^ 0x80000000) < (half ^ 0x80000000)  [signed <]
-    //           ↔  (half ^ 0x80000000) > (t ^ 0x80000000)
-    let half_biased = _mm256_set1_epi32((half ^ 0x8000_0000u32) as i32);
-    // t > 0  ↔  (t ^ 0x80000000) > (0 ^ 0x80000000) = 0x80000000 [signed]
-    let zero_biased = bias; // 0 ^ 0x80000000 = 0x80000000 = i32::MIN
+    let max_state_v = _mm256_set1_epi8(max_state as i8);
+    let ones = _mm256_set1_epi8(1);
+    let bias = _mm256_set1_epi8(i8::MIN);
+    // t < half  ↔  (t ^ 0x80) < (half ^ 0x80)  ↔  (half ^ 0x80) > (t ^ 0x80)  [signed i8]
+    let half_biased = _mm256_set1_epi8((half ^ 0x80) as i8);
+    // t > 0  ↔  (t ^ 0x80) > (0 ^ 0x80) = 0x80 = i8::MIN  [signed i8]
+    let zero_biased = bias;
 
-    macro_rules! load8 {
+    macro_rules! load32 {
         ($slice:expr, $off:expr) => {{
-            let ptr = $slice.as_ptr().add($off) as *const _;
-            _mm256_cvtepu8_epi32(_mm_loadl_epi64(ptr))
+            _mm256_loadu_si256($slice.as_ptr().add($off) as *const __m256i)
         }};
     }
 
     let mut l = 0usize;
-    while l + 8 <= n_literals {
-        // SAFETY: l + 8 <= n_literals, all reads in-bounds.
-        let ta_ptr = ta.as_ptr().add(l) as *const __m256i;
-        let t = _mm256_loadu_si256(ta_ptr);
-        let lit_v = load8!(lit_b, l);
-        let la = load8!(active_b, l);
+    while l + 32 <= n_literals {
+        // SAFETY: l + 32 <= n_literals, all reads in-bounds.
+        let t = load32!(ta, l);
+        let lit_v = load32!(lit_b, l);
+        let la = load32!(active_b, l);
 
-        let absent = _mm256_sub_epi32(ones, lit_v); // 1 - lit (0 or 1)
+        let absent = _mm256_sub_epi8(ones, lit_v); // 1 - lit (0 or 1)
         let t_biased = _mm256_xor_si256(t, bias);
-        // excluded: 0xFFFFFFFF where t < half, 0 elsewhere
-        let excluded = _mm256_cmpgt_epi32(half_biased, t_biased);
-        // not_zero: 0xFFFFFFFF where t > 0, 0 where t == 0
-        let not_zero = _mm256_cmpgt_epi32(t_biased, zero_biased);
+        // excluded: 0xFF where t < half, 0 elsewhere
+        let excluded = _mm256_cmpgt_epi8(half_biased, t_biased);
+        // not_zero: 0xFF where t > 0, 0 where t == 0
+        let not_zero = _mm256_cmpgt_epi8(t_biased, zero_biased);
 
-        // inc = absent & excluded & not_zero & la
-        // absent and la are 0 or 1; excluded and not_zero are SIMD masks (0x00 or 0xFF)
-        // AND them all — result is 0 or 1 (from absent/la) masked by excluded/not_zero
+        // inc = absent & la (0 or 1) masked by excluded & not_zero (0x00 or 0xFF)
         let inc = _mm256_and_si256(
             _mm256_and_si256(absent, la),
             _mm256_and_si256(excluded, not_zero),
         );
 
         // t + inc, clamped to max_state
-        let result = _mm256_min_epu32(_mm256_add_epi32(t, inc), max_state_v);
+        let result = _mm256_min_epu8(_mm256_adds_epu8(t, inc), max_state_v);
         _mm256_storeu_si256(ta.as_mut_ptr().add(l) as *mut __m256i, result);
-        l += 8;
+        l += 32;
     }
     // Scalar tail.
     while l < n_literals {
         let t = ta[l];
-        let la = active_b[l] as u32;
-        let absent = 1 - lit_b[l] as u32;
-        let excluded = (t < half) as u32;
-        let not_zero = (t > 0) as u32;
+        let la = active_b[l];
+        let absent = 1 - lit_b[l];
+        let excluded = (t < half) as u8;
+        let not_zero = (t > 0) as u8;
         let inc = absent & excluded & not_zero & la;
-        ta[l] = (t + inc).min(max_state);
+        ta[l] = t.saturating_add(inc).min(max_state);
         l += 1;
     }
 }
@@ -588,7 +587,7 @@ unsafe fn type_ii_update_bytes_avx2(
 #[allow(dead_code)]
 #[inline(always)]
 pub(crate) fn clause_type_i_bytes(
-    ta: &mut [u32],
+    ta: &mut [u8],
     inc: &mut [u64],
     weight: &mut i32,
     lit: &[u64],
@@ -601,8 +600,8 @@ pub(crate) fn clause_type_i_bytes(
     wmax: i32,
     max_included: usize,
     lit_active: &[u64],
-    half: u32,
-    max_state: u32,
+    half: u8,
+    max_state: u8,
 ) {
     let fired = clause_fire(inc, lit, valid, words, lit_active);
     // Include count uses all valid literals regardless of dropout — matches TMU.
@@ -645,7 +644,7 @@ pub(crate) fn clause_type_i_bytes(
 #[allow(dead_code)]
 #[inline(always)]
 pub(crate) fn clause_type_ii_bytes(
-    ta: &mut [u32],
+    ta: &mut [u8],
     inc: &mut [u64],
     weight: &mut i32,
     lit: &[u64],
@@ -653,8 +652,8 @@ pub(crate) fn clause_type_ii_bytes(
     words: usize,
     n_literals: usize,
     lit_active: &[u64],
-    half: u32,
-    max_state: u32,
+    half: u8,
+    max_state: u8,
 ) {
     if !clause_fire(inc, lit, valid, words, lit_active) {
         return;
@@ -674,4 +673,185 @@ pub(crate) fn clause_type_ii_bytes(
 
     type_ii_update_bytes(ta, n_literals, &lit_b, &active_b, half, max_state);
     rebuild_include(ta, inc, valid, words, n_literals, half);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- clause_fire vs fire_predict on an empty clause ----------------------
+
+    #[test]
+    fn clause_fire_empty_returns_true() {
+        // An empty clause (no included literals) must fire during training so that
+        // Type Ib feedback still reaches it and can push excluded TAs toward 0.
+        let words = 2usize;
+        let inc = vec![0u64; words];
+        let lit = vec![0u64; words];
+        let valid = vec![!0u64; words];
+        let lit_active = vec![!0u64; words];
+        assert!(clause_fire(&inc, &lit, &valid, words, &lit_active));
+    }
+
+    #[test]
+    fn fire_predict_and_clause_fire_differ_on_empty() {
+        // The same all-zero include bitset must return different values for the
+        // inference path (fire_predict → false) vs the training path (clause_fire → true).
+        let words = 1usize;
+        let inc = vec![0u64];
+        let lit = vec![!0u64]; // all features present
+        let valid = vec![!0u64];
+        let lit_active = vec![!0u64];
+        assert!(!fire_predict(&inc, &lit, &valid, words), "inference: empty clause must not vote");
+        assert!(clause_fire(&inc, &lit, &valid, words, &lit_active), "training: empty clause must fire");
+    }
+
+    // ---- expand_bits_to_bytes round-trip ------------------------------------
+
+    #[test]
+    fn expand_bits_to_bytes_round_trips_pack() {
+        // pack() followed by expand_bits_to_bytes() must reproduce the original
+        // feature vector as 0/1 bytes for both positive and negated literals.
+        let n_features = 6usize;
+        let x: Vec<u8> = vec![1, 0, 1, 1, 0, 0];
+        let n_literals = 2 * n_features;
+        let words = words_for(n_literals);
+        let mut lit = vec![0u64; words];
+        pack(&x, n_features, &mut lit);
+
+        let bytes = expand_bits_to_bytes(&lit, n_literals);
+        assert_eq!(bytes.len(), n_literals);
+        for i in 0..n_features {
+            assert_eq!(bytes[i], x[i], "positive literal {i}");
+            assert_eq!(bytes[n_features + i], 1 - x[i], "negated literal {i}");
+        }
+    }
+
+    // ---- rebuild_include correctness -----------------------------------------
+
+    #[test]
+    fn rebuild_include_boundary_at_half() {
+        // ta[l] = half-1 must produce excluded (0); ta[l] = half must produce included (1).
+        let half = 128u8;
+        let n_literals = 2usize;
+        let words = 1usize;
+        let ta = vec![half - 1, half];
+        let valid = vec![0b11u64];
+        let mut inc = vec![0u64];
+        rebuild_include(&ta, &mut inc, &valid, words, n_literals, half);
+        assert_eq!(inc[0] & 1, 0, "ta = half-1 must be excluded");
+        assert_eq!((inc[0] >> 1) & 1, 1, "ta = half must be included");
+    }
+
+    #[test]
+    fn rebuild_include_all_excluded() {
+        // When every ta value is below half the entire include bitset must be zero.
+        let half = 4u8;
+        let n_literals = 8usize;
+        let words = 1usize;
+        let ta = vec![0u8, 1, 2, 3, 0, 1, 2, 3]; // all < 4
+        let valid = vec![0xFFu64];
+        let mut inc = vec![!0u64]; // start with all bits set to verify they get cleared
+        rebuild_include(&ta, &mut inc, &valid, words, n_literals, half);
+        assert_eq!(inc[0], 0, "all ta < half must produce an empty include bitset");
+    }
+
+    #[test]
+    fn rebuild_include_non_multiple_of_32() {
+        // n_literals not divisible by 32 exercises the scalar tail in both the AVX2
+        // and scalar paths.  Four sizes cover all tail lengths:
+        //   31 → 0 full AVX2 chunks + 31-element tail
+        //   33 → 1 chunk + 1-element tail
+        //   63 → 1 chunk + 31-element tail
+        //   65 → 2 full words; within the second word: 0 chunks + 1-element tail
+        for &n in &[31usize, 33, 63, 65] {
+            let half = 128u8;
+            let words = words_for(n);
+            // Even-indexed literals → included (ta=half); odd → excluded (ta=half-1).
+            let ta: Vec<u8> = (0..n).map(|l| if l % 2 == 0 { half } else { half - 1 }).collect();
+            let mut valid = vec![0u64; words];
+            for l in 0..n {
+                valid[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
+            }
+            let mut inc = vec![0u64; words];
+            rebuild_include(&ta, &mut inc, &valid, words, n, half);
+
+            for l in 0..n {
+                let got: u64 = (inc[l / WORD_BITS] >> (l % WORD_BITS)) & 1;
+                let expected: u64 = if l % 2 == 0 { 1 } else { 0 };
+                assert_eq!(got, expected, "n={n} literal {l}: expected {expected} got {got}");
+            }
+        }
+    }
+
+    // ---- state_bits boundary arithmetic -------------------------------------
+
+    #[test]
+    fn state_bits_2_min_constants() {
+        // state_bits=2 → half=2, max_state=3; verify saturation behaves correctly.
+        let state_bits: usize = 2;
+        let half = 1u8 << (state_bits - 1);
+        let max_state = ((1u16 << state_bits) - 1) as u8;
+        assert_eq!(half, 2u8);
+        assert_eq!(max_state, 3u8);
+        assert_eq!(3u8.saturating_add(1).min(max_state), 3u8, "saturate at 3");
+        assert_eq!(0u8.saturating_sub(1), 0u8, "saturate at 0");
+    }
+
+    #[test]
+    fn state_bits_8_max_no_overflow() {
+        // state_bits=8 → half=128, max_state=255.  Computing max_state via a u16
+        // intermediate avoids the `1u8 << 8` overflow that would occur with a direct u8 shift.
+        let state_bits: usize = 8;
+        let half = 1u8 << (state_bits - 1); // 1 << 7 = 128; no overflow
+        let max_state = ((1u16 << state_bits) - 1) as u8; // 255 via u16
+        assert_eq!(half, 128u8);
+        assert_eq!(max_state, 255u8);
+        assert_eq!(255u8.saturating_add(1).min(max_state), 255u8);
+    }
+
+    // ---- type_i_update_bytes Ib path ----------------------------------------
+
+    #[test]
+    fn type_i_ib_decrements_absent_non_max() {
+        // Ib path (fired_under=false): absent active literals are decremented
+        // unless they are at max_state (absorbing include state).
+        let n_literals = 4usize;
+        let max_state = 15u8;
+        let mut ta = vec![5u8, 1, 0, max_state];
+        let lit_b    = vec![0u8; 4]; // all absent
+        let inv_b    = vec![1u8; 4]; // always trigger decrement
+        let keep_b   = vec![0u8; 4];
+        let active_b = vec![1u8; 4];
+        type_i_update_bytes(&mut ta, n_literals, false, false, &lit_b, &inv_b, &keep_b, &active_b, max_state);
+        assert_eq!(ta[0], 4,         "5 - 1 = 4");
+        assert_eq!(ta[1], 0,         "1 - 1 = 0");
+        assert_eq!(ta[2], 0,         "0 - 1 saturates at 0");
+        assert_eq!(ta[3], max_state, "max_state is immune to Ib decrement");
+    }
+
+    // ---- type_ii_update_bytes logic ------------------------------------------
+
+    #[test]
+    fn type_ii_increments_absent_excluded_nonzero() {
+        // Type II increments only absent, excluded (ta < half), non-zero literals.
+        // Each of the five literals tests exactly one guard condition.
+        let half = 8u8;
+        let max_state = 15u8;
+        let n_literals = 5usize;
+        // lit 0: absent, excluded, non-zero  → incremented 3→4
+        // lit 1: present, excluded, non-zero → skipped (present guard)
+        // lit 2: absent, included (ta≥half)  → skipped (excluded guard)
+        // lit 3: absent, excluded, zero      → skipped (absorbing-exclude guard)
+        // lit 4: absent, excluded, non-zero  → incremented to the half boundary
+        let mut ta   = vec![3u8, 3, half, 0, half - 1];
+        let lit_b    = vec![0u8, 1, 0, 0, 0];
+        let active_b = vec![1u8; 5];
+        type_ii_update_bytes(&mut ta, n_literals, &lit_b, &active_b, half, max_state);
+        assert_eq!(ta[0], 4,    "absent excluded non-zero → incremented");
+        assert_eq!(ta[1], 3,    "present → unchanged");
+        assert_eq!(ta[2], half, "included (ta≥half) → unchanged");
+        assert_eq!(ta[3], 0,    "ta=0 (absorbing exclude) → stays at 0");
+        assert_eq!(ta[4], half, "absent excluded non-zero incremented to half");
+    }
 }

@@ -11,9 +11,9 @@ use crate::clause_bank::dense::PARALLEL_MIN;
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
 
-/// A weighted multiclass Tsetlin Machine with u32 per-TA counters (matches TMU C extension).
+/// A weighted multiclass Tsetlin Machine with u8 per-TA counters (matches TMU's 8-bit states).
 ///
-/// Each TA counter is a `u32` in `[0, max_state]`; the include bitset is maintained
+/// Each TA counter is a `u8` in `[0, max_state]`; the include bitset is maintained
 /// as a separate `Vec<u64>` for O(words) fire checks.  Optional clause-level parallelism
 /// via `--features parallel`.
 #[derive(Clone, Debug)]
@@ -35,16 +35,16 @@ pub struct TsetlinMachine {
     /// Precomputed binary digits for Bernoulli(1 - literal_drop_p) mask generation.
     dig_lit_active: Vec<u8>,
 
-    /// u32 TA counters.  Clause `cj = c*CPC + j` occupies
+    /// u8 TA counters (matches TMU's 8-bit states).  Clause `cj = c*CPC + j` occupies
     /// `ta[cj * n_literals .. (cj+1) * n_literals]`.
-    ta: Vec<u32>,
+    ta: Vec<u8>,
     /// Include bitset.  Clause `cj` occupies `include[cj * words .. (cj+1) * words]`.
     /// Rebuilt after every clause update; kept in sync with `ta`.
     include: Vec<u64>,
     /// TA threshold for inclusion: `ta[l] >= half` → literal l is included.
-    half: u32,
+    half: u8,
     /// Maximum TA counter value: `(1 << state_bits) - 1`.
-    max_state: u32,
+    max_state: u8,
 
     /// Per-clause integer weights (>= 1), indexed `c*CPC + j`.
     weights: Vec<i32>,
@@ -73,7 +73,7 @@ pub struct TsetlinMachine {
 #[inline]
 fn apply_one_clause(
     j: usize,
-    ta: &mut [u32],
+    ta: &mut [u8],
     inc: &mut [u64],
     w: &mut i32,
     rng: &mut Rng,
@@ -94,8 +94,8 @@ fn apply_one_clause(
     boost: bool,
     wmax: i32,
     max_inc: usize,
-    half: u32,
-    max_state: u32,
+    half: u8,
+    max_state: u8,
 ) {
     if !drop_mask.is_empty() && drop_mask[j] {
         return;
@@ -141,8 +141,9 @@ impl TsetlinMachine {
 
     /// Create a TsetlinMachine with full configuration.
     ///
-    /// * `state_bits` — TA counter precision in bits (2–16); higher values slow convergence but
-    ///   allow absorbing states to provide stronger regularisation.
+    /// * `state_bits` — TA counter precision in bits (2–8); higher values slow convergence but
+    ///   allow absorbing states to provide stronger regularisation.  Counters are stored as
+    ///   `u8`, so the maximum is 8 bits (matching TMU's default 8-bit states).
     /// * `boost_true_positive` — if `true`, Type Ia feedback always includes present literals
     ///   (skips the stochastic keep mask), matching TMU's `boost_true_positive_feedback`.
     /// * `seed` — master RNG seed; fully deterministic for a given seed.
@@ -162,7 +163,7 @@ impl TsetlinMachine {
         assert!(clauses_per_class >= 2);
         assert!(threshold >= 1);
         assert!(s > 1.0);
-        assert!((2..=16).contains(&state_bits), "state_bits must be in 2..=16");
+        assert!((2..=8).contains(&state_bits), "state_bits must be in 2..=8");
 
         let state_bits = state_bits as usize;
         let n_literals = 2 * n_features;
@@ -175,10 +176,11 @@ impl TsetlinMachine {
             valid[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
         }
 
-        let half = 1u32 << (state_bits - 1);
-        let max_state = (1u32 << state_bits) - 1;
+        let half = 1u8 << (state_bits - 1);
+        // Use a u16 intermediate so state_bits == 8 (max_state 255) doesn't overflow `1u8 << 8`.
+        let max_state = ((1u16 << state_bits) - 1) as u8;
 
-        let mut ta = vec![0u32; n_clauses * n_literals];
+        let mut ta = vec![0u8; n_clauses * n_literals];
         let mut include = vec![0u64; n_clauses * words];
         for cj in 0..n_clauses {
             let tb = cj * n_literals;
@@ -691,13 +693,13 @@ mod tests {
         let max_state = tm.max_state;
 
         // Saturating increment: adding 1 to max_state stays at max_state.
-        assert_eq!((max_state + 1).min(max_state), max_state);
+        assert_eq!(max_state.saturating_add(1).min(max_state), max_state);
         // Saturating decrement: subtracting 1 from 0 stays at 0.
-        assert_eq!(0u32.saturating_sub(1), 0);
+        assert_eq!(0u8.saturating_sub(1), 0);
 
         // Check the full range for a representative value.
-        let mut v = 0u32;
-        for _ in 0..1000 { v = (v + 1).min(max_state); }
+        let mut v = 0u8;
+        for _ in 0..1000 { v = v.saturating_add(1).min(max_state); }
         assert_eq!(v, max_state);
         for _ in 0..1000 { v = v.saturating_sub(1); }
         assert_eq!(v, 0);
@@ -862,12 +864,12 @@ mod tests {
     fn clause_type_i_stops_including_at_limit() {
         let n_literals = 8usize;
         let words = 1usize;
-        let half = 128u32;
-        let max_state = 255u32;
+        let half = 128u8;
+        let max_state = 255u8;
         let max_included = 2usize;
 
         // 2 literals already included (bits 0 and 1 at half=included threshold).
-        let mut ta = vec![0u32; n_literals];
+        let mut ta = vec![0u8; n_literals];
         ta[0] = half;
         ta[1] = half;
         let valid = vec![0b1111_1111u64];
@@ -1083,8 +1085,8 @@ mod tests {
         // "exclude absent" feedback completely unchanged.
         let n_literals = 1usize;
         let words = 1usize;
-        let half = 8u32;     // sb=4 → half=8
-        let max_state = 15u32; // (1<<4)-1
+        let half = 8u8;     // sb=4 → half=8
+        let max_state = 15u8; // (1<<4)-1
         // Literal 0 at max state (included); absent from x → violation → Ib path.
         let mut ta = vec![max_state];
         let mut inc = vec![1u64]; // bit 0 included
@@ -1115,8 +1117,8 @@ mod tests {
         // decremented by a single Ib round.
         let n_literals = 1usize;
         let words = 1usize;
-        let half = 8u32;
-        let max_state = 15u32;
+        let half = 8u8;
+        let max_state = 15u8;
         let below_max = max_state - 1; // 14, still included
         let mut ta = vec![below_max];
         let mut inc = vec![1u64]; // included
@@ -1147,10 +1149,10 @@ mod tests {
         // Type II "include absent excluded" feedback unchanged.
         let n_literals = 1usize;
         let words = 1usize;
-        let half = 8u32;
-        let max_state = 15u32;
+        let half = 8u8;
+        let max_state = 15u8;
         // All-zero: every literal at min state; empty clause fires (no violations).
-        let mut ta = vec![0u32];
+        let mut ta = vec![0u8];
         let mut inc = vec![0u64]; // excluded
         let lit = vec![0u64];     // literal 0 absent from x
         let valid = vec![1u64];
@@ -1178,8 +1180,8 @@ mod tests {
         // After enough rounds the clause should settle to exactly literal 0.
         let n_literals = 2usize;
         let words = 1usize;
-        let half = 8u32;
-        let max_state = 15u32;
+        let half = 8u8;
+        let max_state = 15u8;
         let mut ta = vec![max_state, half]; // literal 0 absorbing, literal 1 just included
         let mut inc = vec![0b11u64];         // both included
         let lit = vec![0u64];               // both absent → violations on both → Ib path
@@ -1199,5 +1201,124 @@ mod tests {
 
         assert_eq!((inc[0] >> 0) & 1, 1, "absorbing literal 0 must stay included");
         assert_eq!((inc[0] >> 1) & 1, 0, "non-absorbing literal 1 must be expelled");
+    }
+
+    // ---- state_bits boundary configs ----------------------------------------
+
+    #[test]
+    fn state_bits_2_tm_trains_without_panic() {
+        // state_bits=2 is the minimum allowed; max_state=3, half=2.
+        // This test verifies no panics, no overflows, and a valid accuracy value.
+        let (xtr, ytr) = make_xor(500, 0.0, 60);
+        let (xte, yte) = make_xor(200, 0.0, 61);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let bte = e.encode_batch(&as_slices(&xte));
+        let mut tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 2, true, 42);
+        for _ in 0..5 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+        let acc = tm.accuracy(&bte, &yte);
+        assert!((0.0..=1.0).contains(&acc), "state_bits=2 accuracy out of range: {acc}");
+    }
+
+    #[test]
+    fn state_bits_8_max_state_is_255() {
+        // state_bits=8 is the maximum; max_state must be 255 (computed via u16
+        // intermediate to avoid `1u8 << 8` overflow), half must be 128.
+        let tm = TsetlinMachine::with_config(2, 4, 2, 5, 2.0, 8, true, 1);
+        assert_eq!(tm.max_state, 255u8, "state_bits=8 → max_state must be 255");
+        assert_eq!(tm.half, 128u8, "state_bits=8 → half must be 128");
+    }
+
+    // ---- absorbed state fractions -------------------------------------------
+
+    #[test]
+    fn absorbed_fractions_start_at_zero() {
+        // Fresh TM: every counter is initialised to half-1 or half, never 0 or
+        // max_state, so both absorbing fractions must be exactly 0.
+        let tm = TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 8, true, 42);
+        assert_eq!(tm.absorbed_include_fraction(), 0.0,
+            "fresh TM must have no include-absorbed states");
+        assert_eq!(tm.absorbed_exclude_fraction(), 0.0,
+            "fresh TM must have no exclude-absorbed states");
+    }
+
+    #[test]
+    fn absorbed_fractions_increase_with_training() {
+        // After sufficient training the combined absorbing fraction should be
+        // strictly larger than at initialisation (which is 0.0).
+        // Use state_bits=4 (max_state=15, half=8) so absorbing states are reachable
+        // within a modest number of epochs — state_bits=8 would require 127 increments.
+        let (xtr, ytr) = make_xor(3000, 0.0, 62);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let mut tm = TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 4, true, 42);
+        let before = tm.absorbed_include_fraction() + tm.absorbed_exclude_fraction();
+        for _ in 0..50 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+        let after = tm.absorbed_include_fraction() + tm.absorbed_exclude_fraction();
+        assert!(
+            after > before,
+            "absorbing states must grow during training: before={before:.4}, after={after:.4}"
+        );
+    }
+
+    // ---- scores are clamped to ±threshold -----------------------------------
+
+    #[test]
+    fn scores_are_clamped_to_threshold() {
+        let threshold = 10i32;
+        let (xtr, ytr) = make_xor(500, 0.0, 63);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let mut tm = TsetlinMachine::with_config(2, 12, 8, threshold, 3.0, 8, true, 42);
+        for _ in 0..5 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+        let (xte, _) = make_xor(50, 0.0, 64);
+        for x in &xte {
+            let sample = e.encode_one(x);
+            let mut s = vec![0i32; 2];
+            tm.scores(&sample, &mut s);
+            for (c, &sc) in s.iter().enumerate() {
+                assert!(
+                    sc >= -threshold && sc <= threshold,
+                    "class {c} score {sc} is outside [-{threshold}, {threshold}]"
+                );
+            }
+        }
+    }
+
+    // ---- clause_rule consistent with include bitset -------------------------
+
+    #[test]
+    fn clause_rule_consistent_with_include_bitset() {
+        // clause_rule() must report exactly the same set of included literals
+        // as a direct popcount of the include bitset.
+        let (xtr, ytr) = make_xor(500, 0.0, 65);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let mut tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42);
+        tm.fit_epoch(&btr, &ytr);
+
+        let n_literals = 2 * tm.n_features();
+        let words = tm.words_per_sample();
+        for class in 0..tm.n_classes() {
+            for clause in 0..tm.clauses_per_class() {
+                let rule = tm.clause_rule(class, clause);
+                let cj = class * tm.clauses_per_class() + clause;
+                let inc = &tm.include[cj * words..(cj + 1) * words];
+                let bitset_count: usize = (0..n_literals)
+                    .filter(|&l| (inc[l / 64] >> (l % 64)) & 1 != 0)
+                    .count();
+                assert_eq!(
+                    rule.len(), bitset_count,
+                    "clause ({class},{clause}): rule has {} literals but bitset has {}",
+                    rule.len(), bitset_count
+                );
+            }
+        }
     }
 }
