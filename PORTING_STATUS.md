@@ -72,4 +72,3 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 ## Not yet planned
 
 - Imbalanced-class weighting (per-class clause weights)
-- Python bindings
