@@ -37,6 +37,7 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | Batch prediction | ✅ | `predict_batch_packed()` |
 | Raw class scores | ✅ | `scores_packed()` |
 | GPU / CUDA acceleration | ❌ Not planned | |
+| Imbalanced-class weighting | ❌ Not planned | Per-class clause weights |
 
 ---
 
@@ -67,8 +68,3 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | Coalesced demos | — | ❌ Not ported | Requires `TMCoalesced` |
 | *(extra)* `ndr_flows` | `ndr_flows` | ✅ Complete | Synthetic network-flow detection; not part of TMU |
 
----
-
-## Not yet planned
-
-- Imbalanced-class weighting (per-class clause weights)
