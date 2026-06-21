@@ -13,7 +13,7 @@ For a full breakdown of what has been ported and what is missing, see [PORTING_S
 - Bit-packed clause bank for cache-efficient inference and training
 - Weighted multiclass classification (`TMClassifier`)
 - Optional multi-threaded training via [Rayon](https://github.com/rayon-rs/rayon) (`--features parallel`)
-- AVX2 fast paths for clause update loops with runtime dispatch (scalar fallback on non-AVX2 targets)
+- AVX2 fast paths for clause update loops with runtime dispatch — u8 TA counters processed 32-wide (4× smaller working set vs u32; scalar fallback on non-AVX2 targets)
 - Type-safe `Encoder` for binary, numeric (quantile booleanization), and categorical inputs
 - Fast booleanizer for continuous-valued inputs
 - Ports of the core TMU classification demos
