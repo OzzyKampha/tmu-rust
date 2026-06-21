@@ -1,9 +1,24 @@
 //! Bit-level primitives shared by all Tsetlin Machine variants.
 //!
-//! Mirrors TMU's `clause_bank_dense.py` — stateless free functions that
-//! operate on raw slice views of TA state and literal bits.  Separating them
-//! here lets future variants (coalesced, sparse, convolutional) reuse the same
-//! building blocks without duplicating bit-manipulation logic.
+//! Mirrors TMU's `clause_bank_dense.py` — stateless free functions that operate
+//! on raw slice views of TA state and literal bits.  Separating them here lets
+//! future variants (coalesced, sparse, convolutional) reuse the same building
+//! blocks without duplicating bit-manipulation logic.
+//!
+//! ## SIMD dispatch pattern
+//!
+//! The three hot update functions ([`rebuild_include`], [`type_i_update_bytes`],
+//! [`type_ii_update_bytes`]) each follow the same structure:
+//!
+//! 1. A public `#[inline]` dispatcher checks `is_x86_feature_detected!("avx2")`
+//!    at runtime (constant `true` on `target-cpu=native` builds — zero overhead).
+//! 2. On AVX2 targets the `#[target_feature(enable = "avx2")]` unsafe inner
+//!    function is called; on other targets the branchless scalar fallback runs.
+//! 3. All unsafe pointers are read/write within slice bounds verified by the
+//!    surrounding loop guard — no alignment requirements (unaligned loads/stores).
+//!
+//! AVX2 requires no additional feature flags beyond `target-cpu=native`; the
+//! scalar fallbacks are correct and fast on any target.
 
 use crate::rng::Rng;
 
@@ -40,10 +55,11 @@ pub(crate) fn digits_of(p: f64, n: usize) -> Vec<u8> {
 
 /// Pack a raw feature vector into the bit-interleaved literal representation.
 ///
-/// Literal `i` (positive) is bit `i`; literal `n_features + i` (negated) is
-/// bit `n_features + i`.  The two halves of each feature are complementary.
-/// Branchless form: both positive and negated bits are always written (one is 0),
-/// avoiding a branch-per-feature misprediction and enabling LLVM to auto-vectorize.
+/// Bit layout: positive literal `i` → bit `i`; negated literal `i` → bit
+/// `n_features + i`.  Each feature's positive and negated bits are complementary.
+///
+/// The loop is branchless — both positive and negated bits are always written
+/// (one is zero) to avoid branch mispredictions and allow LLVM to auto-vectorize.
 #[inline]
 pub fn pack(x: &[u8], n_features: usize, out: &mut [u64]) {
     for w in out.iter_mut() {
@@ -57,10 +73,12 @@ pub fn pack(x: &[u8], n_features: usize, out: &mut [u64]) {
     }
 }
 
-/// Expand the first `n` bits of a packed bit-array into a byte-per-element Vec (0 or 1).
+/// Expand the first `n` bits of a packed bit-array into a `Vec<u8>` of 0/1 values.
 ///
-/// Called once per sample/class-update to produce SIMD-friendly byte arrays for the
-/// hot TA update loops, where bit extraction per iteration prevents auto-vectorization.
+/// Called once per sample/class-update to produce flat byte arrays for the hot AVX2
+/// update loops.  Loading from four separate byte arrays with `_mm256_cvtepu8_epi32`
+/// is faster than extracting bits inside the inner loop (variable shifts block
+/// auto-vectorization).
 #[inline]
 pub(crate) fn expand_bits_to_bytes(bits: &[u64], n: usize) -> Vec<u8> {
     (0..n)
@@ -68,10 +86,11 @@ pub(crate) fn expand_bits_to_bytes(bits: &[u64], n: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Evaluate whether a clause fires for inference.
+/// Returns `true` if a clause fires for inference (no included literal is violated).
 ///
-/// `inc` is the clause include bitset (one u64 word per 64 literals).
-/// Returns `false` for empty clauses (no included literals), matching TMU predict semantics.
+/// `inc` is the clause include bitset (`words` u64s, 1 bit per literal).
+/// Empty clauses (no included literals) return `false`, matching TMU predict semantics.
+/// Use [`clause_fire`] during training where empty clauses must return `true`.
 #[inline(always)]
 pub(crate) fn fire_predict(inc: &[u64], lit: &[u64], valid: &[u64], words: usize) -> bool {
     let mut violation = 0u64;
@@ -84,11 +103,12 @@ pub(crate) fn fire_predict(inc: &[u64], lit: &[u64], valid: &[u64], words: usize
     violation == 0 && included != 0
 }
 
-/// Fire check for training — returns `true` if no active included literal is violated.
+/// Returns `true` if a clause fires during training (no active included literal is violated).
 ///
-/// Unlike `fire_predict`, an empty clause (no active included literals) returns `true`,
-/// matching TMU's `cb_calculate_clause_output_feedback` semantics.
-/// Pass all-ones (`&[!0u64; words]`) when no literal dropout is in effect.
+/// Unlike [`fire_predict`], an empty clause returns `true` — matching TMU's
+/// `cb_calculate_clause_output_feedback` semantics so that clauses with no active
+/// included literals still receive Type Ib feedback.
+/// Pass `&[!0u64; words]` for `lit_active` when literal dropout is disabled.
 #[inline(always)]
 pub(crate) fn clause_fire(
     inc: &[u64],
@@ -104,11 +124,17 @@ pub(crate) fn clause_fire(
     violation == 0
 }
 
-/// Rebuild the clause include bitset from u32 TA counters: `ta[l] >= half` → included.
+/// Recompute the include bitset from TA counters after a clause update.
 ///
-/// Called after every clause update to keep `inc` in sync with `ta`.
-/// Dispatches to an AVX2 path (8 comparisons → 8 bits via `_mm256_movemask_ps`) when
-/// available; falls back to the branchless scalar loop otherwise.
+/// A literal `l` is included when `ta[l] >= half`.  The result is ANDed with `valid`
+/// so padding bits beyond `n_literals` are always zero.
+///
+/// **AVX2 path** (x86_64): processes 8 u32s per iteration.  Each lane is XOR-biased
+/// by `0x80000000` to convert unsigned `>=` to signed `>`, then `_mm256_cmpgt_epi32`
+/// produces a SIMD mask and `_mm256_movemask_ps` collapses 8 lanes → 8 bits in one
+/// instruction.  The scalar tail handles the remaining `n_literals % 8` values.
+///
+/// **Scalar fallback**: branchless `(ta[l] >= half) as u64 << bit` loop.
 #[inline]
 pub(crate) fn rebuild_include(
     ta: &[u32],
@@ -128,7 +154,7 @@ pub(crate) fn rebuild_include(
     rebuild_include_scalar(ta, inc, valid, words, n_literals, half);
 }
 
-/// Scalar branchless fallback for non-AVX2 targets.
+/// Branchless scalar fallback for [`rebuild_include`] on non-AVX2 targets.
 #[inline]
 fn rebuild_include_scalar(
     ta: &[u32],
@@ -149,11 +175,11 @@ fn rebuild_include_scalar(
     }
 }
 
-/// AVX2 fast path: processes 8 u32 comparisons per iteration using movemask.
+/// AVX2 implementation of [`rebuild_include`]: 8 comparisons → 8 bits per iteration.
 ///
-/// Strategy: XOR each element with 0x80000000 (flip sign bit) to convert unsigned
-/// `>=` to signed `>`, use `_mm256_cmpgt_epi32`, then `_mm256_movemask_ps` to
-/// extract 1 bit per lane → 8 bits in one instruction.
+/// # Safety
+/// Caller must verify AVX2 is available.  All pointer reads stay within the `ta`
+/// slice (loop guard: `bit + 8 <= limit <= n_literals - base`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn rebuild_include_avx2(
@@ -199,8 +225,10 @@ unsafe fn rebuild_include_avx2(
     }
 }
 
-/// Generate one 64-bit packed Bernoulli sample with probability encoded in
-/// `digits` (fixed-point binary expansion, length = MASK_BITS).
+/// Generate one 64-bit Bernoulli sample mask from a fixed-point probability.
+///
+/// `digits` holds the base-2 expansion of the probability `p` (length = `MASK_BITS`).
+/// Returns a u64 where each bit is 1 with probability `p`, independently.
 #[inline(always)]
 pub(crate) fn bmask_word(rng: &mut Rng, digits: &[u8]) -> u64 {
     let mut word = 0u64;
@@ -211,12 +239,30 @@ pub(crate) fn bmask_word(rng: &mut Rng, digits: &[u8]) -> u64 {
     word
 }
 
-/// Branchless Type Ia / Ib TA update using byte-expanded inputs.
+/// Apply Type I TA feedback to one clause (byte-array inputs).
 ///
-/// Dispatches to AVX2 (8 literals/iteration via `_mm256_cvtepu8_epi32` + `_mm256_min_epu32`)
-/// when available; falls back to the branchless scalar loop otherwise.
+/// All four input byte arrays have one element per literal (`n_literals` elements each),
+/// where 0 means "skip this literal" and 1 means "apply feedback":
 ///
-/// `fired_under`: true → Ia path (weight already incremented by caller); false → Ib path.
+/// - `lit_b`: 1 if the literal is present in the current sample, 0 if absent.
+/// - `inv_b`: Bernoulli feedback mask for the decrement (1/s probability).
+/// - `keep_b`: Bernoulli feedback mask for the increment boost (1 - 1/s probability).
+/// - `active_b`: combined valid × literal-dropout mask; 0 skips the literal entirely.
+///
+/// `fired_under = true` → **Type Ia** (clause fired and is under the include limit):
+/// present active literals are incremented (capped at `max_state`); absent active
+/// literals are decremented with probability `inv_b`, unless already at `max_state`.
+///
+/// `fired_under = false` → **Type Ib** (clause did not fire, or is at/over the limit):
+/// absent active literals are decremented; present literals are untouched.
+///
+/// Weight bookkeeping is the caller's responsibility; call this function after updating
+/// the weight.
+///
+/// **AVX2 path**: 8 literals/iteration using `_mm256_cvtepu8_epi32` + `_mm256_min_epu32`.
+/// Saturating subtract is emulated as `max(a, dec) - dec` (AVX2 has no `vpsubsd_u32`).
+///
+/// **Scalar fallback**: branchless per-literal arithmetic.
 #[inline(always)]
 pub(crate) fn type_i_update_bytes(
     ta: &mut [u32],
@@ -244,6 +290,7 @@ pub(crate) fn type_i_update_bytes(
     type_i_update_bytes_scalar(ta, n_literals, fired_under, boost, lit_b, inv_b, keep_b, active_b, max_state);
 }
 
+/// Branchless scalar fallback for [`type_i_update_bytes`] on non-AVX2 targets.
 #[inline]
 fn type_i_update_bytes_scalar(
     ta: &mut [u32],
@@ -278,10 +325,16 @@ fn type_i_update_bytes_scalar(
     }
 }
 
-/// AVX2 type I update: 8 literals per iteration.
+/// AVX2 implementation of [`type_i_update_bytes`]: 8 literals per iteration.
 ///
-/// Zero-extends byte inputs to u32 with `_mm256_cvtepu8_epi32`, then uses
-/// `_mm256_min_epu32` for clamping and `max(a,dec)-dec` for saturating subtract.
+/// Byte inputs are zero-extended to u32 with `_mm256_cvtepu8_epi32` (`vpmovsxbd`).
+/// Clamping uses `_mm256_min_epu32` (`vpminud`).  Saturating subtract is
+/// `max(a, dec) - dec` via `_mm256_max_epu32` + `_mm256_sub_epi32` — AVX2 has
+/// no unsigned 32-bit saturating subtract instruction.
+///
+/// # Safety
+/// Caller must verify AVX2 is available.  Pointer reads/writes stay within the
+/// `ta` slice (loop guard: `l + 8 <= n_literals`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn type_i_update_bytes_avx2(
@@ -377,9 +430,22 @@ unsafe fn type_i_update_bytes_avx2(
     }
 }
 
-/// Branchless Type II TA update using byte-expanded inputs.
+/// Apply Type II TA feedback to one clause (byte-array inputs).
 ///
-/// Dispatches to AVX2 when available; falls back to scalar otherwise.
+/// Type II feedback fires only when the clause fires on a negative-class sample.
+/// For each active literal that is **absent** in the sample and currently **excluded**
+/// (`ta[l] < half`) and **not at the absorbing exclude state** (`ta[l] > 0`), the
+/// TA counter is incremented by 1 (capped at `max_state`).  This pushes clauses
+/// toward requiring features that were absent, making them harder to fire on
+/// negative samples.
+///
+/// - `lit_b`: 1 if the literal is present in the current sample, 0 if absent.
+/// - `active_b`: combined valid × literal-dropout mask.
+///
+/// **AVX2 path**: 8 literals/iteration; unsigned comparisons use the `0x80000000`
+/// bias trick with `_mm256_cmpgt_epi32`.
+///
+/// **Scalar fallback**: branchless per-literal arithmetic.
 #[inline(always)]
 pub(crate) fn type_ii_update_bytes(
     ta: &mut [u32],
@@ -399,6 +465,7 @@ pub(crate) fn type_ii_update_bytes(
     type_ii_update_bytes_scalar(ta, n_literals, lit_b, active_b, half, max_state);
 }
 
+/// Branchless scalar fallback for [`type_ii_update_bytes`] on non-AVX2 targets.
 #[inline]
 fn type_ii_update_bytes_scalar(
     ta: &mut [u32],
@@ -419,9 +486,15 @@ fn type_ii_update_bytes_scalar(
     }
 }
 
-/// AVX2 type II update: 8 literals per iteration.
+/// AVX2 implementation of [`type_ii_update_bytes`]: 8 literals per iteration.
 ///
-/// Uses unsigned compare bias trick for `t < half` and `t > 0`.
+/// `t < half` and `t > 0` use the unsigned-compare bias trick: XOR both sides
+/// with `0x80000000` so unsigned `<` becomes signed `<` (`_mm256_cmpgt_epi32`
+/// with arguments swapped) and `> 0` becomes signed `> i32::MIN`.
+///
+/// # Safety
+/// Caller must verify AVX2 is available.  Pointer reads/writes stay within the
+/// `ta` slice (loop guard: `l + 8 <= n_literals`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn type_ii_update_bytes_avx2(
@@ -491,25 +564,26 @@ unsafe fn type_ii_update_bytes_avx2(
     }
 }
 
-/// Type Ia / Ib feedback for one clause — u32 per-TA encoding (matches TMU C extension).
-/// Used directly by unit tests; production code calls `type_i_update_bytes` with pre-expanded arrays.
+/// Type Ia / Ib feedback for one clause from packed bit inputs (test helper).
 ///
-/// * Ia path (fires && under literal limit): weight++, include active present literals,
-///   exclude active absent literals (with probability masks).
-/// * Ib path (doesn't fire, or at/over limit): exclude active absent literals.
+/// This is a convenience wrapper used by unit tests that expands packed bit arrays
+/// to bytes and delegates to [`type_i_update_bytes`] + [`rebuild_include`].
+/// Production code calls those functions directly with pre-expanded arrays amortised
+/// over all clauses per epoch.
 ///
-/// **Absorbing include state**: literals whose TA counter equals `max_state` are immune
-/// to decrement feedback on both paths.
+/// **Paths:**
+/// - Ia (`fired && under_limit`): weight++; increment present active literals toward
+///   inclusion, decrement absent active literals toward exclusion (probabilistic).
+/// - Ib (`!fired || over_limit`): decrement absent active literals only.
 ///
-/// `lit_active` is the per-sample literal dropout mask (Bernoulli(1-p) per bit).
+/// **Absorbing include state**: `ta[l] == max_state` is immune to decrement on both paths.
+///
+/// `lit_active`: per-sample literal dropout mask (Bernoulli(1-p) per bit).
 /// Pass all-ones when `literal_drop_p == 0`.
 ///
-/// Note: `max_included` counts **all** included literals (not just active ones),
-/// matching TMU's `cb_number_of_include_actions` check.
-///
-/// This function expands the packed bit inputs to bytes before calling
-/// `type_i_update_bytes`.  For the hot training path, call `type_i_update_bytes`
-/// directly with pre-expanded arrays (amortised over all clauses in an epoch).
+/// `max_included`: upper bound on included literal count (all valid literals, not just
+/// active ones) — matches TMU's `cb_number_of_include_actions` check.
+/// Pass `usize::MAX` to disable.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 #[inline(always)]
@@ -558,16 +632,16 @@ pub(crate) fn clause_type_i_bytes(
     rebuild_include(ta, inc, valid, words, n_literals, half);
 }
 
-/// Type II feedback for one clause — u32 per-TA encoding.
+/// Type II feedback for one clause from packed bit inputs (test helper).
 ///
-/// fires → weight--, include absent active excluded literals.
+/// Convenience wrapper used by unit tests that expands packed bit arrays to bytes
+/// and delegates to [`type_ii_update_bytes`] + [`rebuild_include`].
+/// Production code calls those functions directly with pre-expanded arrays.
 ///
-/// **Absorbing exclude state**: literals whose TA counter is 0 are immune to
-/// increment feedback.
+/// Only runs when the clause fires; returns early otherwise.
+/// On fire: weight--; increments each absent active excluded non-zero TA counter.
 ///
-/// This function expands the packed bit inputs to bytes before calling
-/// `type_ii_update_bytes`.  For the hot training path, call `type_ii_update_bytes`
-/// directly with pre-expanded arrays.
+/// **Absorbing exclude state**: `ta[l] == 0` is immune to increment feedback.
 #[allow(dead_code)]
 #[inline(always)]
 pub(crate) fn clause_type_ii_bytes(
