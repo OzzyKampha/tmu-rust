@@ -13,7 +13,7 @@ use crate::rng::Rng;
 
 /// A bit-packed weighted multiclass Tsetlin Machine.
 ///
-/// Bit-plane TA state, weighted clauses, and optional inter-class parallelism
+/// Bit-plane TA state, weighted clauses, and optional clause-level parallelism
 /// (`--features parallel`).
 #[derive(Clone, Debug)]
 pub struct TsetlinMachine {
@@ -44,7 +44,6 @@ pub struct TsetlinMachine {
     /// Per-clause RNG (enables lock-free parallel training).
     rngs: Vec<Rng>,
     /// Per-class RNG for drop/inv/keep mask generation.
-    /// One per class keeps class updates independent for rayon::join parallelism.
     class_rngs: Vec<Rng>,
     /// Per-word mask of real literal bits.
     valid: Vec<u64>,
@@ -53,6 +52,45 @@ pub struct TsetlinMachine {
 
     literals: Vec<u64>,
     rng: Rng, // for shuffling and negative-class selection only
+}
+
+/// Per-clause feedback kernel shared by the sequential and parallel training paths.
+///
+/// `j` is the clause index within the class (0..clauses_per_class); it determines
+/// clause polarity (even = positive) and is used to index `drop_mask`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn apply_one_clause(
+    j: usize,
+    chunk: &mut [u64],
+    w: &mut i32,
+    rng: &mut Rng,
+    target: u8,
+    p: f64,
+    drop_mask: &[bool],
+    lit: &[u64],
+    val: &[u64],
+    inv_mask: &[u64],
+    keep_mask: &[u64],
+    lit_active: &[u64],
+    words: usize,
+    sb: usize,
+    boost: bool,
+    wmax: i32,
+    max_inc: usize,
+) {
+    if !drop_mask.is_empty() && drop_mask[j] {
+        return;
+    }
+    if rng.next_f64() > p {
+        return;
+    }
+    let positive = j & 1 == 0;
+    if (target == 1) == positive {
+        clause_type_i(chunk, w, lit, val, words, sb, boost, inv_mask, keep_mask, wmax, max_inc, lit_active);
+    } else {
+        clause_type_ii(chunk, w, lit, val, words, sb, lit_active);
+    }
 }
 
 impl TsetlinMachine {
@@ -305,23 +343,6 @@ impl TsetlinMachine {
 
     // ---- training helpers ------------------------------------------------
 
-    /// Check whether clause `j` of class `c` fires against the current `self.literals` buffer (training variant, with dropout support).
-    #[allow(dead_code)]
-    #[inline(always)]
-    fn fire_train(&self, c: usize, j: usize) -> bool {
-        let cb = self.clause_base(c, j);
-        let bw = self.state_bits * self.words;
-        let all_active: Vec<u64> = vec![!0u64; self.words];
-        crate::clause_bank::dense::clause_fire(
-            &self.state[cb..cb + bw],
-            &self.literals,
-            &self.valid,
-            self.words,
-            self.state_bits,
-            &all_active,
-        )
-    }
-
     /// Compute the clamped weighted clause sum for class `c` using the current `self.literals` buffer.
     /// `lit_active` is the per-sample literal dropout mask for this training step.
     fn class_sum_train(&self, c: usize, lit_active: &[u64]) -> i32 {
@@ -353,7 +374,8 @@ impl TsetlinMachine {
     ///
     /// `target` is 1 for the true class and 0 for the sampled negative class.
     /// `sum` is the pre-computed clamped clause sum from `class_sum_train`.
-    #[cfg_attr(feature = "parallel", allow(dead_code))]
+    /// When `--features parallel` is active and `clauses_per_class >= PARALLEL_MIN`,
+    /// the per-clause loop runs in parallel via rayon.
     fn update_class(&mut self, c: usize, target: u8, sum: i32, lit_active: &[u64]) {
         let cps = self.clauses_per_class;
         let words = self.words;
@@ -392,88 +414,34 @@ impl TsetlinMachine {
         let class_w = &mut weights[c * cps..(c + 1) * cps];
         let class_rng = &mut rngs[c * cps..(c + 1) * cps];
 
-        for j in 0..cps {
-            if !drop_mask.is_empty() && drop_mask[j] {
-                continue;
-            }
-            if class_rng[j].next_f64() > p {
-                continue;
-            }
-            let chunk = &mut class_state[j * bw..(j + 1) * bw];
-            let w = &mut class_w[j];
-            let positive = j & 1 == 0;
-            if (target == 1) == positive {
-                clause_type_i(
-                    chunk, w, lit, val, words, sb, boost, &inv_mask, &keep_mask, wmax, max_inc,
-                    lit_active,
-                );
-            } else {
-                clause_type_ii(chunk, w, lit, val, words, sb, lit_active);
-            }
+        #[cfg(feature = "parallel")]
+        if cps >= PARALLEL_MIN {
+            use rayon::prelude::*;
+            class_state
+                .par_chunks_mut(bw)
+                .zip(class_w.par_iter_mut())
+                .zip(class_rng.par_iter_mut())
+                .enumerate()
+                .for_each(|(j, ((chunk, w), rng))| {
+                    apply_one_clause(
+                        j, chunk, w, rng, target, p, &drop_mask,
+                        lit, val, &inv_mask, &keep_mask, lit_active,
+                        words, sb, boost, wmax, max_inc,
+                    );
+                });
+            return;
         }
-    }
-
-    /// Standalone class-update kernel for the `parallel` feature — operates on explicit mutable
-    /// slices so it can be called from a `rayon::join` closure without a `&mut self` borrow.
-    #[cfg(feature = "parallel")]
-    #[allow(clippy::too_many_arguments)]
-    fn update_class_par(
-        sum: i32,
-        target: u8,
-        class_state: &mut [u64],
-        class_weights: &mut [i32],
-        clause_rngs: &mut [Rng],
-        class_rng: &mut Rng,
-        lit: &[u64],
-        valid: &[u64],
-        dig_inv: &[u8],
-        dig_keep: &[u8],
-        lit_active: &[u64],
-        cps: usize,
-        words: usize,
-        sb: usize,
-        boost: bool,
-        wmax: i32,
-        max_inc: usize,
-        drop_p: f64,
-    ) {
-        let bw = sb * words;
-        let t = wmax as f64;
-        let v = sum as f64;
-        let p = if target == 1 {
-            (t - v) / (2.0 * t)
-        } else {
-            (t + v) / (2.0 * t)
-        };
-
-        let drop_mask: Vec<bool> = if drop_p > 0.0 {
-            (0..cps).map(|_| class_rng.next_f64() < drop_p).collect()
-        } else {
-            vec![]
-        };
-        let inv_mask: Vec<u64> =
-            (0..words).map(|_| bmask_word(class_rng, dig_inv)).collect();
-        let keep_mask: Vec<u64> =
-            (0..words).map(|_| bmask_word(class_rng, dig_keep)).collect();
 
         for j in 0..cps {
-            if !drop_mask.is_empty() && drop_mask[j] {
-                continue;
-            }
-            if clause_rngs[j].next_f64() > p {
-                continue;
-            }
-            let chunk = &mut class_state[j * bw..(j + 1) * bw];
-            let w = &mut class_weights[j];
-            let positive = j & 1 == 0;
-            if (target == 1) == positive {
-                clause_type_i(
-                    chunk, w, lit, valid, words, sb, boost, &inv_mask, &keep_mask, wmax, max_inc,
-                    lit_active,
-                );
-            } else {
-                clause_type_ii(chunk, w, lit, valid, words, sb, lit_active);
-            }
+            apply_one_clause(
+                j,
+                &mut class_state[j * bw..(j + 1) * bw],
+                &mut class_w[j],
+                &mut class_rng[j],
+                target, p, &drop_mask,
+                lit, val, &inv_mask, &keep_mask, lit_active,
+                words, sb, boost, wmax, max_inc,
+            );
         }
     }
 
@@ -498,82 +466,10 @@ impl TsetlinMachine {
             vec![!0u64; words]
         };
 
-        #[cfg(feature = "parallel")]
-        {
-            // Compute both class sums concurrently (read-only).
-            let (sum_y, sum_neg) = rayon::join(
-                || self.class_sum_train(y, &lit_active),
-                || self.class_sum_train(neg, &lit_active),
-            );
-
-            // Extract disjoint per-class slices for y and neg, then run both
-            // class updates in parallel — each class owns exclusive state/weight/rng slices.
-            let cps = self.clauses_per_class;
-            let bw = self.state_bits * self.words;
-            let sb = self.state_bits;
-            let boost = self.boost_true_positive;
-            let wmax = self.threshold;
-            let max_inc = self.max_included_literals;
-            let drop_p = self.clause_drop_p;
-
-            let Self {
-                state, weights, rngs, class_rngs, valid, dig_inv, dig_keep, literals, ..
-            } = self;
-            let lit_sl = literals.as_slice();
-            let val = valid.as_slice();
-
-            // Split two disjoint mutable chunks from a slice by class index.
-            macro_rules! split2 {
-                ($v:expr, $a:expr, $b:expr, $s:expr) => {{
-                    if $a < $b {
-                        let (l, r) = $v.split_at_mut($b * $s);
-                        (&mut l[$a * $s..($a + 1) * $s], &mut r[0..$s])
-                    } else {
-                        let (l, r) = $v.split_at_mut($a * $s);
-                        (&mut r[0..$s], &mut l[$b * $s..($b + 1) * $s])
-                    }
-                }};
-            }
-            macro_rules! split2_one {
-                ($v:expr, $a:expr, $b:expr) => {{
-                    if $a < $b {
-                        let (l, r) = $v.split_at_mut($b);
-                        (&mut l[$a], &mut r[0])
-                    } else {
-                        let (l, r) = $v.split_at_mut($a);
-                        (&mut r[0], &mut l[$b])
-                    }
-                }};
-            }
-
-            let (cs_y, cs_neg) = split2!(state, y, neg, cps * bw);
-            let (cw_y, cw_neg) = split2!(weights, y, neg, cps);
-            let (cr_y, cr_neg) = split2!(rngs, y, neg, cps);
-            let (crng_y, crng_neg) = split2_one!(class_rngs, y, neg);
-
-            rayon::join(
-                || {
-                    Self::update_class_par(
-                        sum_y, 1, cs_y, cw_y, cr_y, crng_y, lit_sl, val, dig_inv, dig_keep,
-                        &lit_active, cps, words, sb, boost, wmax, max_inc, drop_p,
-                    )
-                },
-                || {
-                    Self::update_class_par(
-                        sum_neg, 0, cs_neg, cw_neg, cr_neg, crng_neg, lit_sl, val, dig_inv,
-                        dig_keep, &lit_active, cps, words, sb, boost, wmax, max_inc, drop_p,
-                    )
-                },
-            );
-        }
-
-        #[cfg(not(feature = "parallel"))]
-        {
-            let sum_y = self.class_sum_train(y, &lit_active);
-            let sum_neg = self.class_sum_train(neg, &lit_active);
-            self.update_class(y, 1, sum_y, &lit_active);
-            self.update_class(neg, 0, sum_neg, &lit_active);
-        }
+        let sum_y   = self.class_sum_train(y,   &lit_active);
+        let sum_neg = self.class_sum_train(neg, &lit_active);
+        self.update_class(y,   1, sum_y,   &lit_active);
+        self.update_class(neg, 0, sum_neg, &lit_active);
     }
 
     /// Train on a single encoded sample with true label `y`.
