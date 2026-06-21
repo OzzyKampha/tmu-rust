@@ -107,11 +107,30 @@ pub(crate) fn clause_fire(
 /// Rebuild the clause include bitset from u32 TA counters: `ta[l] >= half` → included.
 ///
 /// Called after every clause update to keep `inc` in sync with `ta`.
-/// Branchless: cast-to-u64 + shift avoids branch-per-TA and gives LLVM the best
-/// chance to emit packed compare instructions.  Further vectorisation (movemask) would
-/// require an unsafe `_mm256_movemask_ps` intrinsic — out of scope for now.
+/// Dispatches to an AVX2 path (8 comparisons → 8 bits via `_mm256_movemask_ps`) when
+/// available; falls back to the branchless scalar loop otherwise.
 #[inline]
 pub(crate) fn rebuild_include(
+    ta: &[u32],
+    inc: &mut [u64],
+    valid: &[u64],
+    words: usize,
+    n_literals: usize,
+    half: u32,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 presence verified by the runtime check above.
+            return unsafe { rebuild_include_avx2(ta, inc, valid, words, n_literals, half) };
+        }
+    }
+    rebuild_include_scalar(ta, inc, valid, words, n_literals, half);
+}
+
+/// Scalar branchless fallback for non-AVX2 targets.
+#[inline]
+fn rebuild_include_scalar(
     ta: &[u32],
     inc: &mut [u64],
     valid: &[u64],
@@ -126,6 +145,56 @@ pub(crate) fn rebuild_include(
         for bit in 0..limit {
             word |= ((ta[base + bit] >= half) as u64) << bit;
         }
+        inc[k] = word & valid[k];
+    }
+}
+
+/// AVX2 fast path: processes 8 u32 comparisons per iteration using movemask.
+///
+/// Strategy: XOR each element with 0x80000000 (flip sign bit) to convert unsigned
+/// `>=` to signed `>`, use `_mm256_cmpgt_epi32`, then `_mm256_movemask_ps` to
+/// extract 1 bit per lane → 8 bits in one instruction.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn rebuild_include_avx2(
+    ta: &[u32],
+    inc: &mut [u64],
+    valid: &[u64],
+    words: usize,
+    n_literals: usize,
+    half: u32,
+) {
+    use std::arch::x86_64::*;
+
+    // Bias both sides by 0x80000000 to convert unsigned >= to signed >.
+    // ta >= half  ↔  (ta ^ 0x80000000) > ((half-1) ^ 0x80000000)  [signed]
+    let bias = _mm256_set1_epi32(i32::MIN);
+    let threshold = _mm256_set1_epi32((half.wrapping_sub(1) ^ 0x8000_0000u32) as i32);
+
+    for k in 0..words {
+        let base = k * WORD_BITS;
+        let limit = (n_literals - base).min(WORD_BITS);
+        let mut word = 0u64;
+        let mut bit = 0usize;
+
+        // 8 literals per AVX2 iteration.
+        while bit + 8 <= limit {
+            // SAFETY: `bit + 8 <= limit <= n_literals - base`, so `base + bit + 8 <= n_literals`
+            // which is within the `ta` slice. `_mm256_loadu_si256` is an unaligned load.
+            let ptr = ta.as_ptr().add(base + bit) as *const __m256i;
+            let chunk = _mm256_loadu_si256(ptr);
+            let biased = _mm256_xor_si256(chunk, bias);
+            let cmp = _mm256_cmpgt_epi32(biased, threshold);
+            let bits8 = _mm256_movemask_ps(_mm256_castsi256_ps(cmp)) as u64;
+            word |= bits8 << bit;
+            bit += 8;
+        }
+        // Scalar tail for remaining < 8 literals.
+        while bit < limit {
+            word |= ((ta[base + bit] >= half) as u64) << bit;
+            bit += 1;
+        }
+
         inc[k] = word & valid[k];
     }
 }
