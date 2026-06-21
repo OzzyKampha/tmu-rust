@@ -11,9 +11,9 @@ use crate::clause_bank::dense::PARALLEL_MIN;
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
 
-/// A weighted multiclass Tsetlin Machine with u32 per-TA counters (matches TMU C extension).
+/// A weighted multiclass Tsetlin Machine with u8 per-TA counters (matches TMU's 8-bit states).
 ///
-/// Each TA counter is a `u32` in `[0, max_state]`; the include bitset is maintained
+/// Each TA counter is a `u8` in `[0, max_state]`; the include bitset is maintained
 /// as a separate `Vec<u64>` for O(words) fire checks.  Optional clause-level parallelism
 /// via `--features parallel`.
 #[derive(Clone, Debug)]
@@ -35,16 +35,16 @@ pub struct TsetlinMachine {
     /// Precomputed binary digits for Bernoulli(1 - literal_drop_p) mask generation.
     dig_lit_active: Vec<u8>,
 
-    /// u32 TA counters.  Clause `cj = c*CPC + j` occupies
+    /// u8 TA counters (matches TMU's 8-bit states).  Clause `cj = c*CPC + j` occupies
     /// `ta[cj * n_literals .. (cj+1) * n_literals]`.
-    ta: Vec<u32>,
+    ta: Vec<u8>,
     /// Include bitset.  Clause `cj` occupies `include[cj * words .. (cj+1) * words]`.
     /// Rebuilt after every clause update; kept in sync with `ta`.
     include: Vec<u64>,
     /// TA threshold for inclusion: `ta[l] >= half` → literal l is included.
-    half: u32,
+    half: u8,
     /// Maximum TA counter value: `(1 << state_bits) - 1`.
-    max_state: u32,
+    max_state: u8,
 
     /// Per-clause integer weights (>= 1), indexed `c*CPC + j`.
     weights: Vec<i32>,
@@ -73,7 +73,7 @@ pub struct TsetlinMachine {
 #[inline]
 fn apply_one_clause(
     j: usize,
-    ta: &mut [u32],
+    ta: &mut [u8],
     inc: &mut [u64],
     w: &mut i32,
     rng: &mut Rng,
@@ -94,8 +94,8 @@ fn apply_one_clause(
     boost: bool,
     wmax: i32,
     max_inc: usize,
-    half: u32,
-    max_state: u32,
+    half: u8,
+    max_state: u8,
 ) {
     if !drop_mask.is_empty() && drop_mask[j] {
         return;
@@ -141,8 +141,9 @@ impl TsetlinMachine {
 
     /// Create a TsetlinMachine with full configuration.
     ///
-    /// * `state_bits` — TA counter precision in bits (2–16); higher values slow convergence but
-    ///   allow absorbing states to provide stronger regularisation.
+    /// * `state_bits` — TA counter precision in bits (2–8); higher values slow convergence but
+    ///   allow absorbing states to provide stronger regularisation.  Counters are stored as
+    ///   `u8`, so the maximum is 8 bits (matching TMU's default 8-bit states).
     /// * `boost_true_positive` — if `true`, Type Ia feedback always includes present literals
     ///   (skips the stochastic keep mask), matching TMU's `boost_true_positive_feedback`.
     /// * `seed` — master RNG seed; fully deterministic for a given seed.
@@ -162,7 +163,7 @@ impl TsetlinMachine {
         assert!(clauses_per_class >= 2);
         assert!(threshold >= 1);
         assert!(s > 1.0);
-        assert!((2..=16).contains(&state_bits), "state_bits must be in 2..=16");
+        assert!((2..=8).contains(&state_bits), "state_bits must be in 2..=8");
 
         let state_bits = state_bits as usize;
         let n_literals = 2 * n_features;
@@ -175,10 +176,11 @@ impl TsetlinMachine {
             valid[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
         }
 
-        let half = 1u32 << (state_bits - 1);
-        let max_state = (1u32 << state_bits) - 1;
+        let half = 1u8 << (state_bits - 1);
+        // Use a u16 intermediate so state_bits == 8 (max_state 255) doesn't overflow `1u8 << 8`.
+        let max_state = ((1u16 << state_bits) - 1) as u8;
 
-        let mut ta = vec![0u32; n_clauses * n_literals];
+        let mut ta = vec![0u8; n_clauses * n_literals];
         let mut include = vec![0u64; n_clauses * words];
         for cj in 0..n_clauses {
             let tb = cj * n_literals;
@@ -691,13 +693,13 @@ mod tests {
         let max_state = tm.max_state;
 
         // Saturating increment: adding 1 to max_state stays at max_state.
-        assert_eq!((max_state + 1).min(max_state), max_state);
+        assert_eq!(max_state.saturating_add(1).min(max_state), max_state);
         // Saturating decrement: subtracting 1 from 0 stays at 0.
-        assert_eq!(0u32.saturating_sub(1), 0);
+        assert_eq!(0u8.saturating_sub(1), 0);
 
         // Check the full range for a representative value.
-        let mut v = 0u32;
-        for _ in 0..1000 { v = (v + 1).min(max_state); }
+        let mut v = 0u8;
+        for _ in 0..1000 { v = v.saturating_add(1).min(max_state); }
         assert_eq!(v, max_state);
         for _ in 0..1000 { v = v.saturating_sub(1); }
         assert_eq!(v, 0);
@@ -862,12 +864,12 @@ mod tests {
     fn clause_type_i_stops_including_at_limit() {
         let n_literals = 8usize;
         let words = 1usize;
-        let half = 128u32;
-        let max_state = 255u32;
+        let half = 128u8;
+        let max_state = 255u8;
         let max_included = 2usize;
 
         // 2 literals already included (bits 0 and 1 at half=included threshold).
-        let mut ta = vec![0u32; n_literals];
+        let mut ta = vec![0u8; n_literals];
         ta[0] = half;
         ta[1] = half;
         let valid = vec![0b1111_1111u64];
@@ -1083,8 +1085,8 @@ mod tests {
         // "exclude absent" feedback completely unchanged.
         let n_literals = 1usize;
         let words = 1usize;
-        let half = 8u32;     // sb=4 → half=8
-        let max_state = 15u32; // (1<<4)-1
+        let half = 8u8;     // sb=4 → half=8
+        let max_state = 15u8; // (1<<4)-1
         // Literal 0 at max state (included); absent from x → violation → Ib path.
         let mut ta = vec![max_state];
         let mut inc = vec![1u64]; // bit 0 included
@@ -1115,8 +1117,8 @@ mod tests {
         // decremented by a single Ib round.
         let n_literals = 1usize;
         let words = 1usize;
-        let half = 8u32;
-        let max_state = 15u32;
+        let half = 8u8;
+        let max_state = 15u8;
         let below_max = max_state - 1; // 14, still included
         let mut ta = vec![below_max];
         let mut inc = vec![1u64]; // included
@@ -1147,10 +1149,10 @@ mod tests {
         // Type II "include absent excluded" feedback unchanged.
         let n_literals = 1usize;
         let words = 1usize;
-        let half = 8u32;
-        let max_state = 15u32;
+        let half = 8u8;
+        let max_state = 15u8;
         // All-zero: every literal at min state; empty clause fires (no violations).
-        let mut ta = vec![0u32];
+        let mut ta = vec![0u8];
         let mut inc = vec![0u64]; // excluded
         let lit = vec![0u64];     // literal 0 absent from x
         let valid = vec![1u64];
@@ -1178,8 +1180,8 @@ mod tests {
         // After enough rounds the clause should settle to exactly literal 0.
         let n_literals = 2usize;
         let words = 1usize;
-        let half = 8u32;
-        let max_state = 15u32;
+        let half = 8u8;
+        let max_state = 15u8;
         let mut ta = vec![max_state, half]; // literal 0 absorbing, literal 1 just included
         let mut inc = vec![0b11u64];         // both included
         let lit = vec![0u64];               // both absent → violations on both → Ib path
