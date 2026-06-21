@@ -1,43 +1,124 @@
-# Examples — ports of the TMU classification demos
+# tmu-rs
 
-These reproduce the [`cair/tmu`](https://github.com/cair/tmu) demos that use the
-plain multiclass `TMClassifier` (the model this crate ports). TMU's
-convolutional, coalesced, regression, autoencoder, and composite demos use
-different machine types and are **not** included.
+A Rust port of the [cair/tmu](https://github.com/cair/tmu) Tsetlin Machine library.
 
-| TMU demo                       | this crate            | data needed | run |
-|--------------------------------|-----------------------|-------------|-----|
-| `XORDemo`                      | `xor`                 | none        | `cargo run --release --example xor` |
-| `NoisyXORDemo`                 | `noisy_xor`           | none        | `cargo run --release --example noisy_xor` |
-| `InterpretabilityDemo`         | `interpretability`    | none        | `cargo run --release --example interpretability` |
-| `BreastCancerDemo`             | `breast_cancer`       | sklearn     | `python scripts/prepare_breast_cancer.py` then `cargo run --release --example breast_cancer` |
-| `MNISTDemo` / `…WeightedClauses` | `mnist`             | MNIST       | `python scripts/prepare_mnist.py` then `cargo run --release --features parallel --example mnist` |
-| `IMDbTextCategorizationDemo`   | `imdb`                | Keras IMDb  | `python scripts/prepare_imdb.py` then `cargo run --release --features parallel --example imdb` |
+Implements a bit-packed, weighted multiclass Tsetlin Machine with bit-parallel and multi-threaded training, a fast booleanizer, and ports of the TMU classification demos.
 
-Plus `ndr_flows` (not a TMU demo): a synthetic network-flow detection example
-showing the booleanizer + interpretable rules.
+---
 
-## Data prep
+## Features
 
-The three dataset-backed demos read files produced by the Python scripts in
-`scripts/`. They run on your machine
+- Bit-packed clause bank for cache-efficient inference and training
+- Weighted multiclass classification (`TMClassifier`)
+- Optional multi-threaded training via [Rayon](https://github.com/rayon-rs/rayon) (`--features parallel`)
+- Fast booleanizer for continuous-valued inputs
+- Ports of the core TMU classification demos
 
-* `prepare_breast_cancer.py` — uses the dataset bundled with scikit-learn
-  (`pip install scikit-learn`), no download. Writes `data/breast_cancer.csv`.
-* `prepare_mnist.py` — Keras (`tensorflow`) if present, else scikit-learn's
-  OpenML fetch (one-time download). Writes binarized `data/mnist_*_bin.csv`
-  (pixel > 75 → 1, i.e. ~0.3·255, matching the classic TM binarization).
-* `prepare_imdb.py` — Keras IMDb (`tensorflow`). Writes sparse bag-of-words
-  `data/imdb_*.txt`; `N_FEATURES` there must match `examples/imdb.rs` (5000).
+---
 
-## Validation status
+## Getting started
 
-* `xor`, `noisy_xor`, `interpretability` and the **breast_cancer** pipeline were
-  validated on real/generated data via the Python mirror (breast cancer reaches
-  ~99–100% test accuracy). The multiclass binary pipeline used by `mnist`/`imdb`
-  was validated on scikit-learn's 8×8 digits (~93% with few clauses).
-* Hyperparameters mirror the spirit of the TMU demos (e.g. MNIST: 2000 clauses,
-  T=50, s=10.0; IMDb: 2000 clauses, T=80, s=10.0). Lower the clause counts for
-  faster runs. These large configs benefit a lot from `--features parallel`.
-* As with the rest of the crate, the Rust here has **not** been compiled in the
-  authoring environment — run `cargo build --examples` first.
+```sh
+git clone --recurse-submodules https://github.com/OzzyKampha/tmu-rust.git
+cd tmu-rust
+cargo build --release
+```
+
+Run a self-contained example:
+
+```sh
+cargo run --release --example noisy_xor
+```
+
+For multi-threaded training:
+
+```sh
+cargo run --release --features parallel --example mnist
+```
+
+For maximum performance, compile with native CPU optimizations:
+
+```sh
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+```
+
+---
+
+## Examples
+
+The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) multiclass `TMClassifier` demos. Convolutional, coalesced, regression, autoencoder, and composite variants are not included as they rely on machine types not yet ported.
+
+| TMU demo | Example | Data required | Command |
+|---|---|---|---|
+| `XORDemo` | `xor` | — | `cargo run --release --example xor` |
+| `NoisyXORDemo` | `noisy_xor` | — | `cargo run --release --example noisy_xor` |
+| `InterpretabilityDemo` | `interpretability` | — | `cargo run --release --example interpretability` |
+| `BreastCancerDemo` | `breast_cancer` | scikit-learn | see [Data preparation](#data-preparation) |
+| `MNISTDemo` / `MNISTDemoWeightedClauses` | `mnist` | MNIST | see [Data preparation](#data-preparation) |
+| `IMDbTextCategorizationDemo` | `imdb` | Keras IMDb | see [Data preparation](#data-preparation) |
+| *(extra)* | `ndr_flows` | — | `cargo run --release --example ndr_flows` |
+
+`ndr_flows` is not part of TMU — it is a synthetic network-flow detection example demonstrating the booleanizer and interpretable rule extraction.
+
+---
+
+## Data preparation
+
+Three examples require datasets generated by the Python scripts in `scripts/`. Generated files are written to `data/` and are not tracked by git.
+
+**Breast Cancer** (requires `scikit-learn`):
+```sh
+pip install scikit-learn
+python scripts/prepare_breast_cancer.py
+cargo run --release --example breast_cancer
+```
+
+**MNIST** (requires `tensorflow` or `scikit-learn`):
+```sh
+python scripts/prepare_mnist.py
+cargo run --release --features parallel --example mnist
+```
+
+**IMDb** (requires `tensorflow`):
+```sh
+python scripts/prepare_imdb.py
+cargo run --release --features parallel --example imdb
+```
+
+---
+
+## Validation
+
+| Example | Status | Notes |
+|---|---|---|
+| `xor` | Validated | |
+| `noisy_xor` | Validated | |
+| `interpretability` | Validated | |
+| `breast_cancer` | Validated | ~99–100% test accuracy |
+| `mnist` | Validated | ~93% on digits dataset (few clauses) |
+| `imdb` | Validated | |
+
+Hyperparameters mirror the TMU demos (e.g. MNIST: 2000 clauses, T=50, s=10.0; IMDb: 2000 clauses, T=80, s=10.0). Reduce clause counts for faster iteration. Large configs benefit significantly from `--features parallel`.
+
+---
+
+## Project structure
+
+```
+src/
+  booleanizer.rs       # Continuous-to-binary encoder
+  clause_bank/         # Bit-packed clause storage and update logic
+  models/              # TMClassifier and supporting types
+  rng.rs               # Fast RNG
+examples/              # Demo programs (ports of TMU + extras)
+scripts/               # Python data preparation scripts
+data/tmu/              # cair/tmu submodule (reference implementation)
+```
+
+---
+
+## License
+
+MIT
+
+Original TMU library: [cair/tmu](https://github.com/cair/tmu) (MIT).
