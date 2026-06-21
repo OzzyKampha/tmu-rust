@@ -118,6 +118,8 @@ workload exercises the hot SIMD loops and the Rayon parallel path at realistic s
 
 ## Sample output (4-core cloud VM, `compare.sh --parallel --native`)
 
+Results after the u8 TA counter optimisation (PR #7/#8 — 32-wide AVX2, 4× smaller array):
+
 ```
 ══════════════════════════════════════════════════════════════════════
   COMPARISON SUMMARY
@@ -125,20 +127,20 @@ workload exercises the hot SIMD loops and the Rayon parallel path at realistic s
 ══════════════════════════════════════════════════════════════════════
   Runner                               Median ms     Mclause-ups/s
   ────────────────────────────────────────────────────────────────────
-  Rust (sequential)                    5899.2 ms               6.8
-  Rust (parallel, Rayon)               3985.2 ms              10.0
-  Python TMU (C extension)            20884.4 ms               1.9
+  Rust (sequential)                    4163.7 ms               9.6
+  Rust (parallel, Rayon)               2902.1 ms              13.8
+  Python TMU (C extension)            28677.2 ms               1.4
 ══════════════════════════════════════════════════════════════════════
-  Rust sequential speedup over Python: 3.5x
-  Rust parallel  speedup over Python: 5.2x
+  Rust sequential speedup over Python: 6.9x
+  Rust parallel  speedup over Python: 9.9x
 ```
 
 **Notes on these numbers:**
 
-- The Rayon gain is modest (1.5×) on a 4-core VM; expect proportionally larger
+- The Rayon gain is modest (1.4×) on a 4-core VM; expect proportionally larger
   gains on many-core hardware.
 - Per-epoch time decreases sharply as clauses absorb — for Rust sequential the
-  range is 12 357 ms (epoch 0) → 3 911 ms (epoch 7). The median captures the
+  range is 6 652 ms (epoch 0) → 3 035 ms (epoch 7). The median captures the
   mid-training cost, not the steady-state cost.
 - Python TMU uses a CFFI C extension (`tmu.tmulib`). Its slowness relative to the
   "150–400 ms" reference in bench\_training.rs is expected: that reference was for
