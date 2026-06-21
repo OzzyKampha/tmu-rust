@@ -48,7 +48,7 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 
 ## Examples
 
-The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) multiclass `TMClassifier` demos. Convolutional, coalesced, regression, autoencoder, and composite variants are not included as they rely on machine types not yet ported. See [PORTING_STATUS.md](PORTING_STATUS.md) for the full status.
+The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) multiclass `TMClassifier` demos with matching hyperparameters (e.g. MNIST: 2000 clauses, T=50, s=10.0; IMDb: 2000 clauses, T=80, s=10.0). Convolutional, coalesced, regression, autoencoder, and composite variants are not included as they rely on machine types not yet ported. See [PORTING_STATUS.md](PORTING_STATUS.md) for the full status.
 
 | TMU demo | Example | Data required | Command |
 |---|---|---|---|
@@ -86,21 +86,6 @@ cargo run --release --features parallel --example mnist
 python scripts/prepare_imdb.py
 cargo run --release --features parallel --example imdb
 ```
-
----
-
-## Validation
-
-| Example | Status | Notes |
-|---|---|---|
-| `xor` | Validated | |
-| `noisy_xor` | Validated | |
-| `interpretability` | Validated | |
-| `breast_cancer` | Validated | ~99–100% test accuracy |
-| `mnist` | Validated | ~93% on digits dataset (few clauses) |
-| `imdb` | Validated | |
-
-Hyperparameters mirror the TMU demos (e.g. MNIST: 2000 clauses, T=50, s=10.0; IMDb: 2000 clauses, T=80, s=10.0). Reduce clause counts for faster iteration. Large configs benefit significantly from `--features parallel`.
 
 ---
 
