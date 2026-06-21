@@ -68,22 +68,9 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 
 ---
 
-## Supporting components
+## Not yet planned
 
-| Component | Status | Notes |
-|---|---|---|
-| Fast PRNG (`SplitMix64`) | ✅ | Independent streams per clause/class/dropout |
-| Numeric CSV loader | ✅ | `read_numeric_csv()` |
-| Binary CSV loader | ✅ | `read_binary_csv()` |
-| Sparse binary loader | ✅ | `read_sparse_binary()` (bag-of-words format) |
-| Python data prep scripts | ✅ | Breast cancer, MNIST, IMDb |
-| Criterion benchmarks | ✅ | `fit_epoch` throughput variants |
-
----
-
-## Not implemented (out of scope)
-
-The following are not planned unless upstream needs change:
+The following have not been started and there are no current plans to add them:
 
 - Convolutional, coalesced, regression, autoencoder, and composite machine types
 - Imbalanced-class weighting (per-class clause weights)
