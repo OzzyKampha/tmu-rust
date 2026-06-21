@@ -1,9 +1,24 @@
 //! Bit-level primitives shared by all Tsetlin Machine variants.
 //!
-//! Mirrors TMU's `clause_bank_dense.py` — stateless free functions that
-//! operate on raw slice views of TA state and literal bits.  Separating them
-//! here lets future variants (coalesced, sparse, convolutional) reuse the same
-//! building blocks without duplicating bit-manipulation logic.
+//! Mirrors TMU's `clause_bank_dense.py` — stateless free functions that operate
+//! on raw slice views of TA state and literal bits.  Separating them here lets
+//! future variants (coalesced, sparse, convolutional) reuse the same building
+//! blocks without duplicating bit-manipulation logic.
+//!
+//! ## SIMD dispatch pattern
+//!
+//! The three hot update functions ([`rebuild_include`], [`type_i_update_bytes`],
+//! [`type_ii_update_bytes`]) each follow the same structure:
+//!
+//! 1. A public `#[inline]` dispatcher checks `is_x86_feature_detected!("avx2")`
+//!    at runtime (constant `true` on `target-cpu=native` builds — zero overhead).
+//! 2. On AVX2 targets the `#[target_feature(enable = "avx2")]` unsafe inner
+//!    function is called; on other targets the branchless scalar fallback runs.
+//! 3. All unsafe pointers are read/write within slice bounds verified by the
+//!    surrounding loop guard — no alignment requirements (unaligned loads/stores).
+//!
+//! AVX2 requires no additional feature flags beyond `target-cpu=native`; the
+//! scalar fallbacks are correct and fast on any target.
 
 use crate::rng::Rng;
 
@@ -40,10 +55,11 @@ pub(crate) fn digits_of(p: f64, n: usize) -> Vec<u8> {
 
 /// Pack a raw feature vector into the bit-interleaved literal representation.
 ///
-/// Literal `i` (positive) is bit `i`; literal `n_features + i` (negated) is
-/// bit `n_features + i`.  The two halves of each feature are complementary.
-/// Branchless form: both positive and negated bits are always written (one is 0),
-/// avoiding a branch-per-feature misprediction and enabling LLVM to auto-vectorize.
+/// Bit layout: positive literal `i` → bit `i`; negated literal `i` → bit
+/// `n_features + i`.  Each feature's positive and negated bits are complementary.
+///
+/// The loop is branchless — both positive and negated bits are always written
+/// (one is zero) to avoid branch mispredictions and allow LLVM to auto-vectorize.
 #[inline]
 pub fn pack(x: &[u8], n_features: usize, out: &mut [u64]) {
     for w in out.iter_mut() {
@@ -57,10 +73,12 @@ pub fn pack(x: &[u8], n_features: usize, out: &mut [u64]) {
     }
 }
 
-/// Expand the first `n` bits of a packed bit-array into a byte-per-element Vec (0 or 1).
+/// Expand the first `n` bits of a packed bit-array into a `Vec<u8>` of 0/1 values.
 ///
-/// Called once per sample/class-update to produce SIMD-friendly byte arrays for the
-/// hot TA update loops, where bit extraction per iteration prevents auto-vectorization.
+/// Called once per sample/class-update to produce flat byte arrays for the hot AVX2
+/// update loops.  Loading from four separate byte arrays with `_mm256_cvtepu8_epi32`
+/// is faster than extracting bits inside the inner loop (variable shifts block
+/// auto-vectorization).
 #[inline]
 pub(crate) fn expand_bits_to_bytes(bits: &[u64], n: usize) -> Vec<u8> {
     (0..n)
@@ -68,10 +86,11 @@ pub(crate) fn expand_bits_to_bytes(bits: &[u64], n: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Evaluate whether a clause fires for inference.
+/// Returns `true` if a clause fires for inference (no included literal is violated).
 ///
-/// `inc` is the clause include bitset (one u64 word per 64 literals).
-/// Returns `false` for empty clauses (no included literals), matching TMU predict semantics.
+/// `inc` is the clause include bitset (`words` u64s, 1 bit per literal).
+/// Empty clauses (no included literals) return `false`, matching TMU predict semantics.
+/// Use [`clause_fire`] during training where empty clauses must return `true`.
 #[inline(always)]
 pub(crate) fn fire_predict(inc: &[u64], lit: &[u64], valid: &[u64], words: usize) -> bool {
     let mut violation = 0u64;
@@ -84,11 +103,12 @@ pub(crate) fn fire_predict(inc: &[u64], lit: &[u64], valid: &[u64], words: usize
     violation == 0 && included != 0
 }
 
-/// Fire check for training — returns `true` if no active included literal is violated.
+/// Returns `true` if a clause fires during training (no active included literal is violated).
 ///
-/// Unlike `fire_predict`, an empty clause (no active included literals) returns `true`,
-/// matching TMU's `cb_calculate_clause_output_feedback` semantics.
-/// Pass all-ones (`&[!0u64; words]`) when no literal dropout is in effect.
+/// Unlike [`fire_predict`], an empty clause returns `true` — matching TMU's
+/// `cb_calculate_clause_output_feedback` semantics so that clauses with no active
+/// included literals still receive Type Ib feedback.
+/// Pass `&[!0u64; words]` for `lit_active` when literal dropout is disabled.
 #[inline(always)]
 pub(crate) fn clause_fire(
     inc: &[u64],
@@ -104,14 +124,39 @@ pub(crate) fn clause_fire(
     violation == 0
 }
 
-/// Rebuild the clause include bitset from u32 TA counters: `ta[l] >= half` → included.
+/// Recompute the include bitset from TA counters after a clause update.
 ///
-/// Called after every clause update to keep `inc` in sync with `ta`.
-/// Branchless: cast-to-u64 + shift avoids branch-per-TA and gives LLVM the best
-/// chance to emit packed compare instructions.  Further vectorisation (movemask) would
-/// require an unsafe `_mm256_movemask_ps` intrinsic — out of scope for now.
+/// A literal `l` is included when `ta[l] >= half`.  The result is ANDed with `valid`
+/// so padding bits beyond `n_literals` are always zero.
+///
+/// **AVX2 path** (x86_64): processes 8 u32s per iteration.  Each lane is XOR-biased
+/// by `0x80000000` to convert unsigned `>=` to signed `>`, then `_mm256_cmpgt_epi32`
+/// produces a SIMD mask and `_mm256_movemask_ps` collapses 8 lanes → 8 bits in one
+/// instruction.  The scalar tail handles the remaining `n_literals % 8` values.
+///
+/// **Scalar fallback**: branchless `(ta[l] >= half) as u64 << bit` loop.
 #[inline]
 pub(crate) fn rebuild_include(
+    ta: &[u32],
+    inc: &mut [u64],
+    valid: &[u64],
+    words: usize,
+    n_literals: usize,
+    half: u32,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 presence verified by the runtime check above.
+            return unsafe { rebuild_include_avx2(ta, inc, valid, words, n_literals, half) };
+        }
+    }
+    rebuild_include_scalar(ta, inc, valid, words, n_literals, half);
+}
+
+/// Branchless scalar fallback for [`rebuild_include`] on non-AVX2 targets.
+#[inline]
+fn rebuild_include_scalar(
     ta: &[u32],
     inc: &mut [u64],
     valid: &[u64],
@@ -130,8 +175,60 @@ pub(crate) fn rebuild_include(
     }
 }
 
-/// Generate one 64-bit packed Bernoulli sample with probability encoded in
-/// `digits` (fixed-point binary expansion, length = MASK_BITS).
+/// AVX2 implementation of [`rebuild_include`]: 8 comparisons → 8 bits per iteration.
+///
+/// # Safety
+/// Caller must verify AVX2 is available.  All pointer reads stay within the `ta`
+/// slice (loop guard: `bit + 8 <= limit <= n_literals - base`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn rebuild_include_avx2(
+    ta: &[u32],
+    inc: &mut [u64],
+    valid: &[u64],
+    words: usize,
+    n_literals: usize,
+    half: u32,
+) {
+    use std::arch::x86_64::*;
+
+    // Bias both sides by 0x80000000 to convert unsigned >= to signed >.
+    // ta >= half  ↔  (ta ^ 0x80000000) > ((half-1) ^ 0x80000000)  [signed]
+    let bias = _mm256_set1_epi32(i32::MIN);
+    let threshold = _mm256_set1_epi32((half.wrapping_sub(1) ^ 0x8000_0000u32) as i32);
+
+    for k in 0..words {
+        let base = k * WORD_BITS;
+        let limit = (n_literals - base).min(WORD_BITS);
+        let mut word = 0u64;
+        let mut bit = 0usize;
+
+        // 8 literals per AVX2 iteration.
+        while bit + 8 <= limit {
+            // SAFETY: `bit + 8 <= limit <= n_literals - base`, so `base + bit + 8 <= n_literals`
+            // which is within the `ta` slice. `_mm256_loadu_si256` is an unaligned load.
+            let ptr = ta.as_ptr().add(base + bit) as *const __m256i;
+            let chunk = _mm256_loadu_si256(ptr);
+            let biased = _mm256_xor_si256(chunk, bias);
+            let cmp = _mm256_cmpgt_epi32(biased, threshold);
+            let bits8 = _mm256_movemask_ps(_mm256_castsi256_ps(cmp)) as u64;
+            word |= bits8 << bit;
+            bit += 8;
+        }
+        // Scalar tail for remaining < 8 literals.
+        while bit < limit {
+            word |= ((ta[base + bit] >= half) as u64) << bit;
+            bit += 1;
+        }
+
+        inc[k] = word & valid[k];
+    }
+}
+
+/// Generate one 64-bit Bernoulli sample mask from a fixed-point probability.
+///
+/// `digits` holds the base-2 expansion of the probability `p` (length = `MASK_BITS`).
+/// Returns a u64 where each bit is 1 with probability `p`, independently.
 #[inline(always)]
 pub(crate) fn bmask_word(rng: &mut Rng, digits: &[u8]) -> u64 {
     let mut word = 0u64;
@@ -142,16 +239,30 @@ pub(crate) fn bmask_word(rng: &mut Rng, digits: &[u8]) -> u64 {
     word
 }
 
-/// Branchless Type Ia / Ib TA update using byte-expanded inputs.
+/// Apply Type I TA feedback to one clause (byte-array inputs).
 ///
-/// `active_b[l]` encodes valid & lit_active for literal `l` (0 = skip, 1 = update).
-/// `lit_b[l]` is 1 if literal `l` is present in the current sample, 0 if absent.
-/// `inv_b[l]` / `keep_b[l]` are Bernoulli feedback masks (0 or 1 per literal).
+/// All four input byte arrays have one element per literal (`n_literals` elements each),
+/// where 0 means "skip this literal" and 1 means "apply feedback":
 ///
-/// This loop is fully branchless — LLVM auto-vectorizes it with AVX2 `vpminud` /
-/// `vpsubd` when `target-cpu=native` is set.
+/// - `lit_b`: 1 if the literal is present in the current sample, 0 if absent.
+/// - `inv_b`: Bernoulli feedback mask for the decrement (1/s probability).
+/// - `keep_b`: Bernoulli feedback mask for the increment boost (1 - 1/s probability).
+/// - `active_b`: combined valid × literal-dropout mask; 0 skips the literal entirely.
 ///
-/// `fired_under`: true → Ia path (weight already incremented by caller); false → Ib path.
+/// `fired_under = true` → **Type Ia** (clause fired and is under the include limit):
+/// present active literals are incremented (capped at `max_state`); absent active
+/// literals are decremented with probability `inv_b`, unless already at `max_state`.
+///
+/// `fired_under = false` → **Type Ib** (clause did not fire, or is at/over the limit):
+/// absent active literals are decremented; present literals are untouched.
+///
+/// Weight bookkeeping is the caller's responsibility; call this function after updating
+/// the weight.
+///
+/// **AVX2 path**: 8 literals/iteration using `_mm256_cvtepu8_epi32` + `_mm256_min_epu32`.
+/// Saturating subtract is emulated as `max(a, dec) - dec` (AVX2 has no `vpsubsd_u32`).
+///
+/// **Scalar fallback**: branchless per-literal arithmetic.
 #[inline(always)]
 pub(crate) fn type_i_update_bytes(
     ta: &mut [u32],
@@ -164,9 +275,36 @@ pub(crate) fn type_i_update_bytes(
     active_b: &[u8],
     max_state: u32,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 presence verified by the runtime check above.
+            return unsafe {
+                type_i_update_bytes_avx2(
+                    ta, n_literals, fired_under, boost, lit_b, inv_b, keep_b, active_b,
+                    max_state,
+                )
+            };
+        }
+    }
+    type_i_update_bytes_scalar(ta, n_literals, fired_under, boost, lit_b, inv_b, keep_b, active_b, max_state);
+}
+
+/// Branchless scalar fallback for [`type_i_update_bytes`] on non-AVX2 targets.
+#[inline]
+fn type_i_update_bytes_scalar(
+    ta: &mut [u32],
+    n_literals: usize,
+    fired_under: bool,
+    boost: bool,
+    lit_b: &[u8],
+    inv_b: &[u8],
+    keep_b: &[u8],
+    active_b: &[u8],
+    max_state: u32,
+) {
     let boost_u32 = boost as u32;
     if fired_under {
-        // Ia: present literals → try increment; absent literals → try decrement.
         for l in 0..n_literals {
             let la = active_b[l] as u32;
             let t = ta[l];
@@ -177,7 +315,6 @@ pub(crate) fn type_i_update_bytes(
             ta[l] = (t + inc).min(max_state).saturating_sub(dec);
         }
     } else {
-        // Ib: all literals → try decrement (push toward exclusion).
         for l in 0..n_literals {
             let la = active_b[l] as u32;
             let t = ta[l];
@@ -188,13 +325,149 @@ pub(crate) fn type_i_update_bytes(
     }
 }
 
-/// Branchless Type II TA update using byte-expanded inputs.
+/// AVX2 implementation of [`type_i_update_bytes`]: 8 literals per iteration.
 ///
-/// Increments excluded absent non-absorbing active literals — pushes the clause
-/// toward including features that weren't present (making it harder to fire on
-/// negative-class samples).
+/// Byte inputs are zero-extended to u32 with `_mm256_cvtepu8_epi32` (`vpmovsxbd`).
+/// Clamping uses `_mm256_min_epu32` (`vpminud`).  Saturating subtract is
+/// `max(a, dec) - dec` via `_mm256_max_epu32` + `_mm256_sub_epi32` — AVX2 has
+/// no unsigned 32-bit saturating subtract instruction.
+///
+/// # Safety
+/// Caller must verify AVX2 is available.  Pointer reads/writes stay within the
+/// `ta` slice (loop guard: `l + 8 <= n_literals`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn type_i_update_bytes_avx2(
+    ta: &mut [u32],
+    n_literals: usize,
+    fired_under: bool,
+    boost: bool,
+    lit_b: &[u8],
+    inv_b: &[u8],
+    keep_b: &[u8],
+    active_b: &[u8],
+    max_state: u32,
+) {
+    use std::arch::x86_64::*;
+
+    let max_state_v = _mm256_set1_epi32(max_state as i32);
+    let ones = _mm256_set1_epi32(1);
+    let boost_v = _mm256_set1_epi32(boost as i32);
+
+    // Load 8 bytes from a u8 slice pointer and zero-extend to 8 × i32.
+    // SAFETY: caller ensures at least 8 bytes remain at ptr (checked by loop bound).
+    macro_rules! load8 {
+        ($slice:expr, $off:expr) => {{
+            let ptr = $slice.as_ptr().add($off) as *const _;
+            _mm256_cvtepu8_epi32(_mm_loadl_epi64(ptr))
+        }};
+    }
+
+    let mut l = 0usize;
+
+    if fired_under {
+        while l + 8 <= n_literals {
+            // SAFETY: l + 8 <= n_literals, so all reads are in-bounds.
+            let ta_ptr = ta.as_ptr().add(l) as *const __m256i;
+            let t = _mm256_loadu_si256(ta_ptr);
+            let present = load8!(lit_b, l);
+            let keep_v = load8!(keep_b, l);
+            let inv_v = load8!(inv_b, l);
+            let la = load8!(active_b, l);
+
+            // inc = present & (boost | keep) & la  (all values 0 or 1)
+            let inc = _mm256_and_si256(_mm256_and_si256(present, _mm256_or_si256(boost_v, keep_v)), la);
+            // t_clamped = min(t + inc, max_state)
+            let t_clamped = _mm256_min_epu32(_mm256_add_epi32(t, inc), max_state_v);
+
+            // absent = 1 - present
+            let absent = _mm256_sub_epi32(ones, present);
+            // not_at_max: 0xFFFFFFFF where t < max_state, 0 where t == max_state
+            let not_at_max = _mm256_andnot_si256(_mm256_cmpeq_epi32(t, max_state_v), _mm256_set1_epi32(-1));
+            // dec_01 = absent & inv & la (0 or 1); zeroed out where t == max_state
+            let dec = _mm256_and_si256(_mm256_and_si256(_mm256_and_si256(absent, inv_v), la), not_at_max);
+
+            // saturating_sub(t_clamped, dec): max(t_clamped, dec) - dec
+            let result = _mm256_sub_epi32(_mm256_max_epu32(t_clamped, dec), dec);
+            _mm256_storeu_si256(ta.as_mut_ptr().add(l) as *mut __m256i, result);
+            l += 8;
+        }
+        // Scalar tail.
+        let boost_u32 = boost as u32;
+        while l < n_literals {
+            let t = ta[l];
+            let present = lit_b[l] as u32;
+            let la = active_b[l] as u32;
+            let inc = present & (boost_u32 | keep_b[l] as u32) & la;
+            let not_at_max = (t < max_state) as u32;
+            let dec = (1 - present) & inv_b[l] as u32 & not_at_max & la;
+            ta[l] = (t + inc).min(max_state).saturating_sub(dec);
+            l += 1;
+        }
+    } else {
+        while l + 8 <= n_literals {
+            // SAFETY: l + 8 <= n_literals, so all reads are in-bounds.
+            let ta_ptr = ta.as_ptr().add(l) as *const __m256i;
+            let t = _mm256_loadu_si256(ta_ptr);
+            let inv_v = load8!(inv_b, l);
+            let la = load8!(active_b, l);
+
+            let not_at_max = _mm256_andnot_si256(_mm256_cmpeq_epi32(t, max_state_v), _mm256_set1_epi32(-1));
+            let dec = _mm256_and_si256(_mm256_and_si256(inv_v, la), not_at_max);
+
+            // saturating_sub: max(t, dec) - dec
+            let result = _mm256_sub_epi32(_mm256_max_epu32(t, dec), dec);
+            _mm256_storeu_si256(ta.as_mut_ptr().add(l) as *mut __m256i, result);
+            l += 8;
+        }
+        while l < n_literals {
+            let t = ta[l];
+            let not_at_max = (t < max_state) as u32;
+            let dec = inv_b[l] as u32 & not_at_max & active_b[l] as u32;
+            ta[l] = t.saturating_sub(dec);
+            l += 1;
+        }
+    }
+}
+
+/// Apply Type II TA feedback to one clause (byte-array inputs).
+///
+/// Type II feedback fires only when the clause fires on a negative-class sample.
+/// For each active literal that is **absent** in the sample and currently **excluded**
+/// (`ta[l] < half`) and **not at the absorbing exclude state** (`ta[l] > 0`), the
+/// TA counter is incremented by 1 (capped at `max_state`).  This pushes clauses
+/// toward requiring features that were absent, making them harder to fire on
+/// negative samples.
+///
+/// - `lit_b`: 1 if the literal is present in the current sample, 0 if absent.
+/// - `active_b`: combined valid × literal-dropout mask.
+///
+/// **AVX2 path**: 8 literals/iteration; unsigned comparisons use the `0x80000000`
+/// bias trick with `_mm256_cmpgt_epi32`.
+///
+/// **Scalar fallback**: branchless per-literal arithmetic.
 #[inline(always)]
 pub(crate) fn type_ii_update_bytes(
+    ta: &mut [u32],
+    n_literals: usize,
+    lit_b: &[u8],
+    active_b: &[u8],
+    half: u32,
+    max_state: u32,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 presence verified by the runtime check above.
+            return unsafe { type_ii_update_bytes_avx2(ta, n_literals, lit_b, active_b, half, max_state) };
+        }
+    }
+    type_ii_update_bytes_scalar(ta, n_literals, lit_b, active_b, half, max_state);
+}
+
+/// Branchless scalar fallback for [`type_ii_update_bytes`] on non-AVX2 targets.
+#[inline]
+fn type_ii_update_bytes_scalar(
     ta: &mut [u32],
     n_literals: usize,
     lit_b: &[u8],
@@ -205,33 +478,112 @@ pub(crate) fn type_ii_update_bytes(
     for l in 0..n_literals {
         let la = active_b[l] as u32;
         let t = ta[l];
-        let absent = 1 - lit_b[l] as u32;    // 1 if feature absent, 0 if present
-        let excluded = (t < half) as u32;     // 1 if TA is below include threshold
-        let not_zero = (t > 0) as u32;        // 0 at absorbing exclude state
+        let absent = 1 - lit_b[l] as u32;
+        let excluded = (t < half) as u32;
+        let not_zero = (t > 0) as u32;
         let inc = absent & excluded & not_zero & la;
         ta[l] = (t + inc).min(max_state);
     }
 }
 
-/// Type Ia / Ib feedback for one clause — u32 per-TA encoding (matches TMU C extension).
-/// Used directly by unit tests; production code calls `type_i_update_bytes` with pre-expanded arrays.
+/// AVX2 implementation of [`type_ii_update_bytes`]: 8 literals per iteration.
 ///
-/// * Ia path (fires && under literal limit): weight++, include active present literals,
-///   exclude active absent literals (with probability masks).
-/// * Ib path (doesn't fire, or at/over limit): exclude active absent literals.
+/// `t < half` and `t > 0` use the unsigned-compare bias trick: XOR both sides
+/// with `0x80000000` so unsigned `<` becomes signed `<` (`_mm256_cmpgt_epi32`
+/// with arguments swapped) and `> 0` becomes signed `> i32::MIN`.
 ///
-/// **Absorbing include state**: literals whose TA counter equals `max_state` are immune
-/// to decrement feedback on both paths.
+/// # Safety
+/// Caller must verify AVX2 is available.  Pointer reads/writes stay within the
+/// `ta` slice (loop guard: `l + 8 <= n_literals`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn type_ii_update_bytes_avx2(
+    ta: &mut [u32],
+    n_literals: usize,
+    lit_b: &[u8],
+    active_b: &[u8],
+    half: u32,
+    max_state: u32,
+) {
+    use std::arch::x86_64::*;
+
+    let max_state_v = _mm256_set1_epi32(max_state as i32);
+    let ones = _mm256_set1_epi32(1);
+    let bias = _mm256_set1_epi32(i32::MIN);
+    // t < half  ↔  (t ^ 0x80000000) < (half ^ 0x80000000)  [signed <]
+    //           ↔  (half ^ 0x80000000) > (t ^ 0x80000000)
+    let half_biased = _mm256_set1_epi32((half ^ 0x8000_0000u32) as i32);
+    // t > 0  ↔  (t ^ 0x80000000) > (0 ^ 0x80000000) = 0x80000000 [signed]
+    let zero_biased = bias; // 0 ^ 0x80000000 = 0x80000000 = i32::MIN
+
+    macro_rules! load8 {
+        ($slice:expr, $off:expr) => {{
+            let ptr = $slice.as_ptr().add($off) as *const _;
+            _mm256_cvtepu8_epi32(_mm_loadl_epi64(ptr))
+        }};
+    }
+
+    let mut l = 0usize;
+    while l + 8 <= n_literals {
+        // SAFETY: l + 8 <= n_literals, all reads in-bounds.
+        let ta_ptr = ta.as_ptr().add(l) as *const __m256i;
+        let t = _mm256_loadu_si256(ta_ptr);
+        let lit_v = load8!(lit_b, l);
+        let la = load8!(active_b, l);
+
+        let absent = _mm256_sub_epi32(ones, lit_v); // 1 - lit (0 or 1)
+        let t_biased = _mm256_xor_si256(t, bias);
+        // excluded: 0xFFFFFFFF where t < half, 0 elsewhere
+        let excluded = _mm256_cmpgt_epi32(half_biased, t_biased);
+        // not_zero: 0xFFFFFFFF where t > 0, 0 where t == 0
+        let not_zero = _mm256_cmpgt_epi32(t_biased, zero_biased);
+
+        // inc = absent & excluded & not_zero & la
+        // absent and la are 0 or 1; excluded and not_zero are SIMD masks (0x00 or 0xFF)
+        // AND them all — result is 0 or 1 (from absent/la) masked by excluded/not_zero
+        let inc = _mm256_and_si256(
+            _mm256_and_si256(absent, la),
+            _mm256_and_si256(excluded, not_zero),
+        );
+
+        // t + inc, clamped to max_state
+        let result = _mm256_min_epu32(_mm256_add_epi32(t, inc), max_state_v);
+        _mm256_storeu_si256(ta.as_mut_ptr().add(l) as *mut __m256i, result);
+        l += 8;
+    }
+    // Scalar tail.
+    while l < n_literals {
+        let t = ta[l];
+        let la = active_b[l] as u32;
+        let absent = 1 - lit_b[l] as u32;
+        let excluded = (t < half) as u32;
+        let not_zero = (t > 0) as u32;
+        let inc = absent & excluded & not_zero & la;
+        ta[l] = (t + inc).min(max_state);
+        l += 1;
+    }
+}
+
+/// Type Ia / Ib feedback for one clause from packed bit inputs (test helper).
 ///
-/// `lit_active` is the per-sample literal dropout mask (Bernoulli(1-p) per bit).
+/// This is a convenience wrapper used by unit tests that expands packed bit arrays
+/// to bytes and delegates to [`type_i_update_bytes`] + [`rebuild_include`].
+/// Production code calls those functions directly with pre-expanded arrays amortised
+/// over all clauses per epoch.
+///
+/// **Paths:**
+/// - Ia (`fired && under_limit`): weight++; increment present active literals toward
+///   inclusion, decrement absent active literals toward exclusion (probabilistic).
+/// - Ib (`!fired || over_limit`): decrement absent active literals only.
+///
+/// **Absorbing include state**: `ta[l] == max_state` is immune to decrement on both paths.
+///
+/// `lit_active`: per-sample literal dropout mask (Bernoulli(1-p) per bit).
 /// Pass all-ones when `literal_drop_p == 0`.
 ///
-/// Note: `max_included` counts **all** included literals (not just active ones),
-/// matching TMU's `cb_number_of_include_actions` check.
-///
-/// This function expands the packed bit inputs to bytes before calling
-/// `type_i_update_bytes`.  For the hot training path, call `type_i_update_bytes`
-/// directly with pre-expanded arrays (amortised over all clauses in an epoch).
+/// `max_included`: upper bound on included literal count (all valid literals, not just
+/// active ones) — matches TMU's `cb_number_of_include_actions` check.
+/// Pass `usize::MAX` to disable.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 #[inline(always)]
@@ -280,16 +632,16 @@ pub(crate) fn clause_type_i_bytes(
     rebuild_include(ta, inc, valid, words, n_literals, half);
 }
 
-/// Type II feedback for one clause — u32 per-TA encoding.
+/// Type II feedback for one clause from packed bit inputs (test helper).
 ///
-/// fires → weight--, include absent active excluded literals.
+/// Convenience wrapper used by unit tests that expands packed bit arrays to bytes
+/// and delegates to [`type_ii_update_bytes`] + [`rebuild_include`].
+/// Production code calls those functions directly with pre-expanded arrays.
 ///
-/// **Absorbing exclude state**: literals whose TA counter is 0 are immune to
-/// increment feedback.
+/// Only runs when the clause fires; returns early otherwise.
+/// On fire: weight--; increments each absent active excluded non-zero TA counter.
 ///
-/// This function expands the packed bit inputs to bytes before calling
-/// `type_ii_update_bytes`.  For the hot training path, call `type_ii_update_bytes`
-/// directly with pre-expanded arrays.
+/// **Absorbing exclude state**: `ta[l] == 0` is immune to increment feedback.
 #[allow(dead_code)]
 #[inline(always)]
 pub(crate) fn clause_type_ii_bytes(
