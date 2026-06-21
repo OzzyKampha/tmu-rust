@@ -35,6 +35,7 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | Booleanizer | ✅ | Quantile-based continuous-to-binary encoder |
 | `Encoder` type | ✅ | Type-safe input encoding: binary, numeric (booleanizer), categorical |
 | Multi-threaded training | ✅ | `--features parallel` (Rayon) |
+| AVX2 SIMD acceleration | ✅ | Runtime-dispatched AVX2 fast paths for clause update loops; scalar fallback retained |
 | Pre-packed dataset API | ✅ | `pack_dataset()` + `fit_epoch_packed()` |
 | Batch prediction | ✅ | `predict_batch_packed()` |
 | Raw class scores | ✅ | `scores_packed()` |

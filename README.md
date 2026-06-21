@@ -13,6 +13,7 @@ For a full breakdown of what has been ported and what is missing, see [PORTING_S
 - Bit-packed clause bank for cache-efficient inference and training
 - Weighted multiclass classification (`TMClassifier`)
 - Optional multi-threaded training via [Rayon](https://github.com/rayon-rs/rayon) (`--features parallel`)
+- AVX2 fast paths for clause update loops with runtime dispatch (scalar fallback on non-AVX2 targets)
 - Type-safe `Encoder` for binary, numeric (quantile booleanization), and categorical inputs
 - Fast booleanizer for continuous-valued inputs
 - Ports of the core TMU classification demos
@@ -39,11 +40,13 @@ For multi-threaded training:
 cargo run --release --features parallel --example mnist
 ```
 
-For maximum performance, compile with native CPU optimizations:
+For maximum performance, compile with native CPU optimizations (enables AVX2 and other extensions at compile time):
 
 ```sh
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
+
+AVX2 fast paths are also activated at runtime automatically when the CPU supports it, even without `target-cpu=native`.
 
 ---
 
