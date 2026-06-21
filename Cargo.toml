@@ -57,6 +57,10 @@ path = "examples/ndr_flows.rs"
 name = "absorb_timing"
 path = "examples/absorb_timing.rs"
 
+[[example]]
+name = "bench_training"
+path = "examples/bench_training.rs"
+
 [[bench]]
 name = "throughput"
 path = "benches/throughput.rs"
