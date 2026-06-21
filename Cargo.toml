@@ -53,6 +53,10 @@ path = "examples/imdb.rs"
 name = "ndr_flows"         # extra: network-flow detection (not in TMU)
 path = "examples/ndr_flows.rs"
 
+[[example]]
+name = "absorb_timing"
+path = "examples/absorb_timing.rs"
+
 [[bench]]
 name = "throughput"
 path = "benches/throughput.rs"

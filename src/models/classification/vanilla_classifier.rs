@@ -632,6 +632,49 @@ impl TsetlinMachine {
         self.accuracy_packed(&packed, xs.len(), ys)
     }
 
+    // ---- absorbing state introspection ------------------------------------
+
+    /// Fraction of (clause, literal) pairs whose TA is at the **absorbing include**
+    /// state (all `state_bits` planes set = max counter value).
+    /// Grows toward 1.0 as training converges; used to measure absorbing progress.
+    pub fn absorbed_include_fraction(&self) -> f64 {
+        let n_clauses = self.n_classes * self.clauses_per_class;
+        let bw = self.state_bits * self.words;
+        let mut total = 0u64;
+        let mut at_max = 0u64;
+        for cj in 0..n_clauses {
+            let cb = cj * bw;
+            for k in 0..self.words {
+                let mask = (0..self.state_bits)
+                    .fold(!0u64, |acc, b| acc & self.state[cb + b * self.words + k]);
+                let valid = self.valid[k];
+                at_max += (mask & valid).count_ones() as u64;
+                total  += valid.count_ones() as u64;
+            }
+        }
+        if total == 0 { 0.0 } else { at_max as f64 / total as f64 }
+    }
+
+    /// Fraction of (clause, literal) pairs whose TA is at the **absorbing exclude**
+    /// state (all `state_bits` planes clear = counter 0).
+    pub fn absorbed_exclude_fraction(&self) -> f64 {
+        let n_clauses = self.n_classes * self.clauses_per_class;
+        let bw = self.state_bits * self.words;
+        let mut total = 0u64;
+        let mut at_min = 0u64;
+        for cj in 0..n_clauses {
+            let cb = cj * bw;
+            for k in 0..self.words {
+                let not_min = (0..self.state_bits)
+                    .fold(0u64, |acc, b| acc | self.state[cb + b * self.words + k]);
+                let valid = self.valid[k];
+                at_min += (!not_min & valid).count_ones() as u64;
+                total  += valid.count_ones() as u64;
+            }
+        }
+        if total == 0 { 0.0 } else { at_min as f64 / total as f64 }
+    }
+
     // ---- interpretability ------------------------------------------------
 
     pub fn clause_rule(&self, class: usize, clause: usize) -> Vec<(usize, bool)> {
@@ -658,7 +701,7 @@ impl TsetlinMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clause_bank::dense::{clause_dec, clause_inc, clause_type_i, fire_predict};
+    use crate::clause_bank::dense::{clause_dec, clause_inc, clause_type_i, clause_type_ii, fire_predict};
 
     // ---- helpers -------------------------------------------------------------
 
@@ -1102,5 +1145,143 @@ mod tests {
         }
         let acc = tm.accuracy(&as_slices(&xte), &yte);
         assert!(acc > 0.90, "literal_drop_p=0 should still converge, got {acc}");
+    }
+
+    // ---- absorbing states -------------------------------------------------------
+
+    // Helper: build a one-word chunk with `sb` state planes.
+    // `states[l]` is the integer TA state for literal bit `l`.
+    fn make_chunk(sb: usize, states: &[(usize, u64)]) -> Vec<u64> {
+        let words = 1usize;
+        let mut chunk = vec![0u64; sb * words];
+        for &(l, v) in states {
+            for b in 0..sb {
+                if (v >> b) & 1 == 1 {
+                    chunk[b] |= 1u64 << l;
+                }
+            }
+        }
+        chunk
+    }
+
+    // Read back TA state for literal bit `l` from a one-word chunk.
+    fn read_state(chunk: &[u64], sb: usize, l: usize) -> u64 {
+        (0..sb).fold(0u64, |acc, b| acc | (((chunk[b] >> l) & 1) << b))
+    }
+
+    #[test]
+    fn absorbing_include_at_max_resists_ib() {
+        // A literal at the maximum TA state (all sb planes set) must survive
+        // 1 000 rounds of Type Ib "exclude absent" feedback completely unchanged.
+        let words = 1usize;
+        let sb = 4usize;
+        let max_state = (1u64 << sb) - 1; // 0b1111
+        // Literal 0 at max state; literal 0 absent from x → violation → Ib path.
+        let mut chunk = make_chunk(sb, &[(0, max_state)]);
+
+        let lit = vec![0u64];
+        let valid = vec![1u64];
+        let inv_mask = vec![!0u64];
+        let keep_mask = vec![!0u64];
+        let all_active = vec![!0u64; words];
+        let mut weight = 1i32;
+
+        for _ in 0..1_000 {
+            clause_type_i(
+                &mut chunk, &mut weight, &lit, &valid,
+                words, sb, false, &inv_mask, &keep_mask, 100, usize::MAX, &all_active,
+            );
+        }
+
+        assert_eq!(
+            read_state(&chunk, sb, 0), max_state,
+            "absorbing max-state literal must resist all Ib decrement pressure"
+        );
+    }
+
+    #[test]
+    fn non_max_include_is_decremented_by_ib() {
+        // A literal one step below max (plane 0 missing) is NOT at the absorbing
+        // state and must be decremented by a single Ib round.
+        let words = 1usize;
+        let sb = 4usize;
+        let below_max = ((1u64 << sb) - 1) & !1u64; // 0b1110 — top plane still set → included
+        let mut chunk = make_chunk(sb, &[(0, below_max)]);
+        let before = read_state(&chunk, sb, 0);
+
+        let lit = vec![0u64]; // absent → violation on included literal → Ib path
+        let valid = vec![1u64];
+        let inv_mask = vec![!0u64];
+        let keep_mask = vec![!0u64];
+        let all_active = vec![!0u64; words];
+        let mut weight = 1i32;
+
+        clause_type_i(
+            &mut chunk, &mut weight, &lit, &valid,
+            words, sb, false, &inv_mask, &keep_mask, 100, usize::MAX, &all_active,
+        );
+
+        assert_ne!(
+            read_state(&chunk, sb, 0), before,
+            "non-max literal must be decremented by Ib feedback"
+        );
+    }
+
+    #[test]
+    fn absorbing_exclude_at_min_resists_type_ii() {
+        // A literal at the minimum TA state (all sb planes clear) must survive
+        // 1 000 rounds of Type II "include absent excluded" feedback unchanged.
+        let words = 1usize;
+        let sb = 4usize;
+        // All-zero chunk: every literal at min state; empty clause fires (no violations).
+        let mut chunk = vec![0u64; sb * words];
+
+        let lit = vec![0u64]; // literal 0 absent from x
+        let valid = vec![1u64];
+        let all_active = vec![!0u64; words];
+        let mut weight = 5i32;
+
+        for _ in 0..1_000 {
+            clause_type_ii(
+                &mut chunk, &mut weight, &lit, &valid,
+                words, sb, &all_active,
+            );
+        }
+
+        assert_eq!(
+            read_state(&chunk, sb, 0), 0,
+            "absorbing min-state literal must resist all Type II increment pressure"
+        );
+    }
+
+    #[test]
+    fn absorbing_stabilizes_clause_at_literal_limit() {
+        // Two included literals, max_included_literals = 1 (over the limit → always Ib).
+        //   literal 0: max state (absorbing) — should survive
+        //   literal 1: only top-plane set (just in include action, not absorbing) — should be expelled
+        // After enough rounds the clause should settle to exactly literal 0.
+        let words = 1usize;
+        let sb = 4usize;
+        let max_state = (1u64 << sb) - 1;
+        let top_only = 1u64 << (sb - 1); // only top plane = 0b1000 for sb=4
+        let mut chunk = make_chunk(sb, &[(0, max_state), (1, top_only)]);
+
+        let lit = vec![0u64]; // both absent → violations on both → Ib path
+        let valid = vec![0b11u64];
+        let inv_mask = vec![!0u64];
+        let keep_mask = vec![!0u64];
+        let all_active = vec![!0u64; words];
+        let mut weight = 1i32;
+
+        for _ in 0..500 {
+            clause_type_i(
+                &mut chunk, &mut weight, &lit, &valid,
+                words, sb, false, &inv_mask, &keep_mask, 5, 1, &all_active,
+            );
+        }
+
+        let top = sb - 1;
+        assert_eq!((chunk[top] >> 0) & 1, 1, "absorbing literal 0 must stay included");
+        assert_eq!((chunk[top] >> 1) & 1, 0, "non-absorbing literal 1 must be expelled");
     }
 }

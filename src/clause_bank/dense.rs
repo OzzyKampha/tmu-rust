@@ -167,13 +167,22 @@ pub(crate) fn bmask_word(rng: &mut Rng, digits: &[u8]) -> u64 {
 ///   present, exclude active literals absent (with probability masks).
 /// * Ib path (doesn't fire, or at/over limit): exclude active literals absent.
 ///
+/// **Absorbing include state**: literals whose TA counter is at the maximum value
+/// (all `sb` state-plane bits set) are immune to decrement feedback on both paths.
+/// Mirrors TMU's `ClauseBank.c` absorbing mask.
+///
+/// The absorbing mask for word `k` is computed inline immediately before
+/// `clause_inc`/`clause_dec` touch word `k`, so the state planes are
+/// already in L1 cache — the same "nearly free as a side-effect of the
+/// state read" property as TMU's C implementation.
+///
 /// `lit_active` is the per-sample literal dropout mask (Bernoulli(1-p) per bit).
-/// Pass all-ones when `literal_drop_p == 0`.  Mirrors TMU's `cb_type_i_feedback`
-/// use of `literal_active`.
+/// Pass all-ones when `literal_drop_p == 0`.
 ///
 /// Note: `max_included` counts **all** included literals (not just active ones),
 /// matching TMU's `cb_number_of_include_actions` check.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub(crate) fn clause_type_i(
     chunk: &mut [u64],
     weight: &mut i32,
@@ -200,25 +209,34 @@ pub(crate) fn clause_type_i(
         for k in 0..words {
             let litw = lit[k];
             let la = lit_active[k];
+            // AND all planes for word k — cache-hot from clause_fire above.
+            let at_max_k = (0..sb).fold(!0u64, |acc, b| acc & chunk[b * words + k]);
             let inc_mask = if boost {
                 litw & valid[k] & la
             } else {
                 litw & keep_mask[k] & valid[k] & la
             };
             clause_inc(chunk, words, sb, k, inc_mask);
-            clause_dec(chunk, words, sb, k, !litw & inv_mask[k] & valid[k] & la);
+            clause_dec(chunk, words, sb, k, !litw & inv_mask[k] & valid[k] & la & !at_max_k);
         }
     } else {
         for k in 0..words {
-            clause_dec(chunk, words, sb, k, inv_mask[k] & valid[k] & lit_active[k]);
+            let at_max_k = (0..sb).fold(!0u64, |acc, b| acc & chunk[b * words + k]);
+            clause_dec(chunk, words, sb, k, inv_mask[k] & valid[k] & lit_active[k] & !at_max_k);
         }
     }
 }
 
 /// Type II feedback for one clause: fires → weight--, include absent active literals.
 ///
-/// `lit_active` is the per-sample literal dropout mask.  Mirrors TMU's
-/// `cb_type_ii_feedback` use of `literal_active`.
+/// **Absorbing exclude state**: literals whose TA counter is at the minimum value
+/// (all `sb` state-plane bits clear) are immune to increment feedback.
+///
+/// `not_at_min_k` is OR-reduced inline over all planes, cache-hot from the
+/// preceding `clause_fire` call — same "nearly free" property as TMU.
+///
+/// `lit_active` is the per-sample literal dropout mask.
+#[inline(always)]
 pub(crate) fn clause_type_ii(
     chunk: &mut [u64],
     weight: &mut i32,
@@ -232,10 +250,13 @@ pub(crate) fn clause_type_ii(
         return;
     }
     *weight = (*weight - 1).max(1);
+
     let tb = (sb - 1) * words;
     for k in 0..words {
+        // OR all planes — zero only where every plane is 0 (= absorbing exclude state).
+        let not_at_min_k = (0..sb).fold(0u64, |acc, b| acc | chunk[b * words + k]);
         let excluded = !chunk[tb + k];
-        let inc_mask = !lit[k] & excluded & valid[k] & lit_active[k];
+        let inc_mask = !lit[k] & excluded & valid[k] & lit_active[k] & not_at_min_k;
         clause_inc(chunk, words, sb, k, inc_mask);
     }
 }
