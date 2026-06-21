@@ -42,18 +42,18 @@ pub(crate) fn digits_of(p: f64, n: usize) -> Vec<u8> {
 ///
 /// Literal `i` (positive) is bit `i`; literal `n_features + i` (negated) is
 /// bit `n_features + i`.  The two halves of each feature are complementary.
+/// Branchless form: both positive and negated bits are always written (one is 0),
+/// avoiding a branch-per-feature misprediction and enabling LLVM to auto-vectorize.
 #[inline]
 pub fn pack(x: &[u8], n_features: usize, out: &mut [u64]) {
     for w in out.iter_mut() {
         *w = 0;
     }
     for i in 0..n_features {
-        if x[i] != 0 {
-            out[i / WORD_BITS] |= 1u64 << (i % WORD_BITS);
-        } else {
-            let j = n_features + i;
-            out[j / WORD_BITS] |= 1u64 << (j % WORD_BITS);
-        }
+        let pos = (x[i] != 0) as u64;
+        out[i / WORD_BITS] |= pos << (i % WORD_BITS);
+        let j = n_features + i;
+        out[j / WORD_BITS] |= (1 - pos) << (j % WORD_BITS);
     }
 }
 
@@ -107,6 +107,9 @@ pub(crate) fn clause_fire(
 /// Rebuild the clause include bitset from u32 TA counters: `ta[l] >= half` → included.
 ///
 /// Called after every clause update to keep `inc` in sync with `ta`.
+/// Branchless: cast-to-u64 + shift avoids branch-per-TA and gives LLVM the best
+/// chance to emit packed compare instructions.  Further vectorisation (movemask) would
+/// require an unsafe `_mm256_movemask_ps` intrinsic — out of scope for now.
 #[inline]
 pub(crate) fn rebuild_include(
     ta: &[u32],
@@ -121,9 +124,7 @@ pub(crate) fn rebuild_include(
         let limit = (n_literals - base).min(WORD_BITS);
         let mut word = 0u64;
         for bit in 0..limit {
-            if ta[base + bit] >= half {
-                word |= 1u64 << bit;
-            }
+            word |= ((ta[base + bit] >= half) as u64) << bit;
         }
         inc[k] = word & valid[k];
     }
