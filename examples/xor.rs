@@ -5,7 +5,7 @@
 //!
 //! `cargo run --release --example xor`
 
-use tmu_rs::{Rng, TsetlinMachine};
+use tmu_rs::{Encoder, Rng, TsetlinMachine};
 
 /// Generate `n` noise-free 2-bit XOR samples.
 fn make(n: usize, seed: u64) -> (Vec<Vec<u8>>, Vec<usize>) {
@@ -26,17 +26,18 @@ fn main() {
     let (xtr, ytr) = make(1000, 1);
     let (xte, yte) = make(1000, 2);
 
-    let mut tm = TsetlinMachine::with_config(2, 2, 4, 10, 10.0, 8, true, 42)
+    let encoder = Encoder::for_binary(2);
+    let mut tm = TsetlinMachine::with_config(2, encoder.n_features(), 4, 10, 10.0, 8, true, 42)
         .max_included_literals(32);
 
     let xtr_r: Vec<&[u8]> = xtr.iter().map(|v| v.as_slice()).collect();
     let xte_r: Vec<&[u8]> = xte.iter().map(|v| v.as_slice()).collect();
-    let packed_tr = tm.pack_dataset(&xtr_r);
-    let packed_te = tm.pack_dataset(&xte_r);
+    let packed_tr = encoder.encode_batch(&xtr_r);
+    let packed_te = encoder.encode_batch(&xte_r);
 
     for epoch in 1..=60 {
-        tm.fit_epoch_packed(&packed_tr, xtr.len(), &ytr);
-        let acc = tm.accuracy_packed(&packed_te, xte.len(), &yte);
+        tm.fit_epoch(&packed_tr, &ytr);
+        let acc = tm.accuracy(&packed_te, &yte);
         println!("Epoch: {epoch:>2}, Accuracy: {:.2}", acc * 100.0);
     }
 }

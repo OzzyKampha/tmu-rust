@@ -13,7 +13,7 @@
 //! Optional arg: number of epochs (default 40).
 
 use std::time::Instant;
-use tmu_rs::{data, TsetlinMachine};
+use tmu_rs::{data, Encoder, TsetlinMachine};
 
 const N_FEATURES: usize = 5000; // must match scripts/prepare_imdb.py
 
@@ -31,20 +31,21 @@ fn main() {
     let (xte, yte) = load("data/imdb_test.txt");
     println!("train={} test={} vocab(features)={N_FEATURES}", xtr.len(), xte.len());
 
-    let mut tm = TsetlinMachine::with_config(2, N_FEATURES, 10000, 8000, 2.0, 8, true, 42)
+    let encoder = Encoder::for_binary(N_FEATURES);
+    let mut tm = TsetlinMachine::with_config(2, encoder.n_features(), 10000, 8000, 2.0, 8, true, 42)
         .clause_drop_p(0.75);
 
     let xtr_r: Vec<&[u8]> = xtr.iter().map(|v| v.as_slice()).collect();
     let xte_r: Vec<&[u8]> = xte.iter().map(|v| v.as_slice()).collect();
-    let packed_tr = tm.pack_dataset(&xtr_r);
-    let packed_te = tm.pack_dataset(&xte_r);
+    let packed_tr = encoder.encode_batch(&xtr_r);
+    let packed_te = encoder.encode_batch(&xte_r);
 
     for epoch in 1..=epochs {
         let t = Instant::now();
-        tm.fit_epoch_packed(&packed_tr, xtr.len(), &ytr);
+        tm.fit_epoch(&packed_tr, &ytr);
         let train_secs = t.elapsed().as_secs_f64();
         let t = Instant::now();
-        let acc = tm.accuracy_packed(&packed_te, xte.len(), &yte);
+        let acc = tm.accuracy(&packed_te, &yte);
         let test_secs = t.elapsed().as_secs_f64();
         println!(
             "Epoch: {epoch:>2}, Accuracy: {:.2}, Training Time: {train_secs:.2}s, Testing Time: {test_secs:.2}s",
