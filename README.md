@@ -4,6 +4,8 @@ A Rust port of the [cair/tmu](https://github.com/cair/tmu) Tsetlin Machine libra
 
 Implements a bit-packed, weighted multiclass Tsetlin Machine with bit-parallel and multi-threaded training, a fast booleanizer, and ports of the TMU classification demos.
 
+For a full breakdown of what has been ported and what is missing, see [PORTING_STATUS.md](PORTING_STATUS.md).
+
 ---
 
 ## Features
@@ -46,7 +48,7 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 
 ## Examples
 
-The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) multiclass `TMClassifier` demos. Convolutional, coalesced, regression, autoencoder, and composite variants are not included as they rely on machine types not yet ported.
+The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) multiclass `TMClassifier` demos. Convolutional, coalesced, regression, autoencoder, and composite variants are not included as they rely on machine types not yet ported. See [PORTING_STATUS.md](PORTING_STATUS.md) for the full status.
 
 | TMU demo | Example | Data required | Command |
 |---|---|---|---|
