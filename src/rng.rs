@@ -4,11 +4,13 @@
 pub struct Rng(u64);
 
 impl Rng {
+    /// Create a new RNG from `seed`, mixing in the golden ratio constant to avoid state 0.
     pub fn new(seed: u64) -> Self {
         // Avoid degenerate state 0 by mixing in the golden constant.
         Rng(seed.wrapping_add(0x9E3779B97F4A7C15))
     }
 
+    /// Advance the state and return the next pseudorandom 64-bit value.
     #[inline(always)]
     pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);

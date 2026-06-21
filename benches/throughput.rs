@@ -3,6 +3,7 @@ use tmu_rs::TsetlinMachine;
 
 // ---- dataset helpers -------------------------------------------------------
 
+/// Generate `n` XOR samples with 12 features; label = feature0 XOR feature1.
 fn xor_dataset(n: usize) -> (Vec<Vec<u8>>, Vec<usize>) {
     let xs: Vec<Vec<u8>> = (0..n)
         .map(|i| (0..12u8).map(|j| ((i + j as usize) & 1) as u8).collect())
@@ -11,6 +12,7 @@ fn xor_dataset(n: usize) -> (Vec<Vec<u8>>, Vec<usize>) {
     (xs, ys)
 }
 
+/// Generate `n` synthetic multiclass samples with `n_features` binary features and `n_classes` classes.
 fn multiclass_dataset(n: usize, n_features: usize, n_classes: usize) -> (Vec<Vec<u8>>, Vec<usize>) {
     let xs: Vec<Vec<u8>> = (0..n)
         .map(|i| (0..n_features).map(|j| ((i + j) & 1) as u8).collect())
@@ -19,12 +21,14 @@ fn multiclass_dataset(n: usize, n_features: usize, n_classes: usize) -> (Vec<Vec
     (xs, ys)
 }
 
+/// Convert owned vectors to byte slices for API calls.
 fn as_slices(xs: &[Vec<u8>]) -> Vec<&[u8]> {
     xs.iter().map(|v| v.as_slice()).collect()
 }
 
 // ---- training benchmarks ---------------------------------------------------
 
+/// Benchmark `fit_epoch` (pack + train) across varying clause counts and multiclass configurations.
 fn bench_fit_epoch(c: &mut Criterion) {
     let mut g = c.benchmark_group("fit_epoch");
 
@@ -59,6 +63,7 @@ fn bench_fit_epoch(c: &mut Criterion) {
 
 // ---- packed training benchmarks (pre-pack once, reuse across epochs) -------
 
+/// Benchmark `fit_epoch_packed` (pre-packed data) to isolate training throughput from packing cost.
 fn bench_fit_epoch_packed(c: &mut Criterion) {
     let mut g = c.benchmark_group("fit_epoch_packed");
 
@@ -109,6 +114,7 @@ fn bench_fit_epoch_packed(c: &mut Criterion) {
 
 // ---- inference benchmarks --------------------------------------------------
 
+/// Benchmark single-sample and batch inference latency/throughput.
 fn bench_predict(c: &mut Criterion) {
     let mut g = c.benchmark_group("predict");
 
@@ -155,6 +161,7 @@ fn bench_predict(c: &mut Criterion) {
 
 // ---- packing benchmark -----------------------------------------------------
 
+/// Benchmark the `pack` function across varying feature counts.
 fn bench_pack(c: &mut Criterion) {
     let mut g = c.benchmark_group("pack");
 

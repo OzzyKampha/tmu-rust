@@ -17,21 +17,26 @@ const FEATURES: [&str; 8] = [
     "duration", "src_bytes", "dst_bytes", "src_pkts", "dst_pkts", "dport", "iat_var", "syn_ratio",
 ];
 
+/// Sample a uniform random value in `[lo, hi)`.
 fn uniform(r: &mut Rng, lo: f64, hi: f64) -> f64 {
     lo + (hi - lo) * r.next_f64()
 }
+/// Sample from an exponential distribution with the given `mean`.
 fn exponential(r: &mut Rng, mean: f64) -> f64 {
     -mean * (1.0 - r.next_f64()).ln()
 }
+/// Sample from a standard normal distribution using the Box–Muller transform.
 fn normal(r: &mut Rng) -> f64 {
     let u1 = (1.0 - r.next_f64()).max(1e-12);
     let u2 = r.next_f64();
     (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
 }
+/// Sample from a log-normal distribution with log-space mean `mu` and std-dev `sigma`.
 fn lognormal(r: &mut Rng, mu: f64, sigma: f64) -> f64 {
     (mu + sigma * normal(r)).exp()
 }
 
+/// Generate `n` synthetic network-flow records; `mal_frac` controls the fraction of malicious flows.
 fn gen(n: usize, mal_frac: f64, seed: u64) -> (Vec<Vec<f64>>, Vec<usize>) {
     let mut r = Rng::new(seed);
     let mut xs = Vec::with_capacity(n);
@@ -69,6 +74,7 @@ fn gen(n: usize, mal_frac: f64, seed: u64) -> (Vec<Vec<f64>>, Vec<usize>) {
     (xs, ys)
 }
 
+/// Run the full NDR pipeline: generate synthetic flows, booleanize, train TM, report metrics and rules.
 fn main() {
     let (xtr, ytr) = gen(4000, 0.3, 1);
     let (xte, yte) = gen(1500, 0.3, 2);

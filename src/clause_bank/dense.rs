@@ -15,11 +15,14 @@ pub(crate) const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
 #[cfg(feature = "parallel")]
 pub(crate) const PARALLEL_MIN: usize = 128;
 
+/// Return the minimum number of 64-bit words needed to hold `bits` bits.
 #[inline(always)]
 pub(crate) fn words_for(bits: usize) -> usize {
     bits.div_ceil(WORD_BITS)
 }
 
+/// Encode probability `p` as the first `n` bits of its binary (base-2) expansion.
+/// Used to build Bernoulli sampling masks with precision MASK_BITS.
 pub(crate) fn digits_of(p: f64, n: usize) -> Vec<u8> {
     let mut d = Vec::with_capacity(n);
     let mut x = p;
@@ -54,9 +57,10 @@ pub fn pack(x: &[u8], n_features: usize, out: &mut [u64]) {
     }
 }
 
-// Branchless inner loop — no early exit so the compiler can auto-vectorize
-// (AVX2: 4 u64/cycle for MNIST's 25 words ≈ 4× over scalar).
-// Empty clauses (included == 0) return false, matching TMU predict semantics.
+/// Evaluate whether clause `j` fires for inference — branchless so the compiler can auto-vectorize.
+///
+/// Scans all `words` words of the include bitset at `state[tb..]` against `lit`.
+/// Returns `false` for empty clauses (no included literals), matching TMU predict semantics.
 #[inline(always)]
 pub(crate) fn fire_predict(
     state: &[u64],
