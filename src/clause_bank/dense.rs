@@ -120,9 +120,6 @@ pub(crate) fn clause_inc(chunk: &mut [u64], words: usize, sb: usize, k: usize, m
         let next = chunk[idx] & carry;
         chunk[idx] ^= carry;
         carry = next;
-        if carry == 0 {
-            return;
-        }
     }
     // Overflow: saturate to all-ones for the overflowed bits.
     for b in 0..sb {
@@ -142,9 +139,6 @@ pub(crate) fn clause_dec(chunk: &mut [u64], words: usize, sb: usize, k: usize, m
         let next = !chunk[idx] & borrow;
         chunk[idx] ^= borrow;
         borrow = next;
-        if borrow == 0 {
-            return;
-        }
     }
     // Underflow: saturate to all-zeros for the underflowed bits.
     let clear = !borrow;
@@ -208,12 +202,13 @@ pub(crate) fn clause_type_i(
         let n: u32 = (0..words).map(|k| (chunk[tb + k] & valid[k]).count_ones()).sum();
         (n as usize) < max_included
     };
+
     if out && under_limit {
         *weight = (*weight + 1).min(wmax);
         for k in 0..words {
             let litw = lit[k];
             let la = lit_active[k];
-            // AND all planes for word k — cache-hot from clause_fire above.
+            // AND all planes — state is cache-hot from clause_fire above.
             let at_max_k = (0..sb).fold(!0u64, |acc, b| acc & chunk[b * words + k]);
             let inc_mask = if boost {
                 litw & valid[k] & la
@@ -257,7 +252,7 @@ pub(crate) fn clause_type_ii(
 
     let tb = (sb - 1) * words;
     for k in 0..words {
-        // OR all planes — zero only where every plane is 0 (= absorbing exclude state).
+        // OR all planes — state is cache-hot from clause_fire above.
         let not_at_min_k = (0..sb).fold(0u64, |acc, b| acc | chunk[b * words + k]);
         let excluded = !chunk[tb + k];
         let inc_mask = !lit[k] & excluded & valid[k] & lit_active[k] & not_at_min_k;
