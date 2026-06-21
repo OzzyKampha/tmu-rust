@@ -674,3 +674,184 @@ pub(crate) fn clause_type_ii_bytes(
     type_ii_update_bytes(ta, n_literals, &lit_b, &active_b, half, max_state);
     rebuild_include(ta, inc, valid, words, n_literals, half);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- clause_fire vs fire_predict on an empty clause ----------------------
+
+    #[test]
+    fn clause_fire_empty_returns_true() {
+        // An empty clause (no included literals) must fire during training so that
+        // Type Ib feedback still reaches it and can push excluded TAs toward 0.
+        let words = 2usize;
+        let inc = vec![0u64; words];
+        let lit = vec![0u64; words];
+        let valid = vec![!0u64; words];
+        let lit_active = vec![!0u64; words];
+        assert!(clause_fire(&inc, &lit, &valid, words, &lit_active));
+    }
+
+    #[test]
+    fn fire_predict_and_clause_fire_differ_on_empty() {
+        // The same all-zero include bitset must return different values for the
+        // inference path (fire_predict → false) vs the training path (clause_fire → true).
+        let words = 1usize;
+        let inc = vec![0u64];
+        let lit = vec![!0u64]; // all features present
+        let valid = vec![!0u64];
+        let lit_active = vec![!0u64];
+        assert!(!fire_predict(&inc, &lit, &valid, words), "inference: empty clause must not vote");
+        assert!(clause_fire(&inc, &lit, &valid, words, &lit_active), "training: empty clause must fire");
+    }
+
+    // ---- expand_bits_to_bytes round-trip ------------------------------------
+
+    #[test]
+    fn expand_bits_to_bytes_round_trips_pack() {
+        // pack() followed by expand_bits_to_bytes() must reproduce the original
+        // feature vector as 0/1 bytes for both positive and negated literals.
+        let n_features = 6usize;
+        let x: Vec<u8> = vec![1, 0, 1, 1, 0, 0];
+        let n_literals = 2 * n_features;
+        let words = words_for(n_literals);
+        let mut lit = vec![0u64; words];
+        pack(&x, n_features, &mut lit);
+
+        let bytes = expand_bits_to_bytes(&lit, n_literals);
+        assert_eq!(bytes.len(), n_literals);
+        for i in 0..n_features {
+            assert_eq!(bytes[i], x[i], "positive literal {i}");
+            assert_eq!(bytes[n_features + i], 1 - x[i], "negated literal {i}");
+        }
+    }
+
+    // ---- rebuild_include correctness -----------------------------------------
+
+    #[test]
+    fn rebuild_include_boundary_at_half() {
+        // ta[l] = half-1 must produce excluded (0); ta[l] = half must produce included (1).
+        let half = 128u8;
+        let n_literals = 2usize;
+        let words = 1usize;
+        let ta = vec![half - 1, half];
+        let valid = vec![0b11u64];
+        let mut inc = vec![0u64];
+        rebuild_include(&ta, &mut inc, &valid, words, n_literals, half);
+        assert_eq!(inc[0] & 1, 0, "ta = half-1 must be excluded");
+        assert_eq!((inc[0] >> 1) & 1, 1, "ta = half must be included");
+    }
+
+    #[test]
+    fn rebuild_include_all_excluded() {
+        // When every ta value is below half the entire include bitset must be zero.
+        let half = 4u8;
+        let n_literals = 8usize;
+        let words = 1usize;
+        let ta = vec![0u8, 1, 2, 3, 0, 1, 2, 3]; // all < 4
+        let valid = vec![0xFFu64];
+        let mut inc = vec![!0u64]; // start with all bits set to verify they get cleared
+        rebuild_include(&ta, &mut inc, &valid, words, n_literals, half);
+        assert_eq!(inc[0], 0, "all ta < half must produce an empty include bitset");
+    }
+
+    #[test]
+    fn rebuild_include_non_multiple_of_32() {
+        // n_literals not divisible by 32 exercises the scalar tail in both the AVX2
+        // and scalar paths.  Four sizes cover all tail lengths:
+        //   31 → 0 full AVX2 chunks + 31-element tail
+        //   33 → 1 chunk + 1-element tail
+        //   63 → 1 chunk + 31-element tail
+        //   65 → 2 full words; within the second word: 0 chunks + 1-element tail
+        for &n in &[31usize, 33, 63, 65] {
+            let half = 128u8;
+            let words = words_for(n);
+            // Even-indexed literals → included (ta=half); odd → excluded (ta=half-1).
+            let ta: Vec<u8> = (0..n).map(|l| if l % 2 == 0 { half } else { half - 1 }).collect();
+            let mut valid = vec![0u64; words];
+            for l in 0..n {
+                valid[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
+            }
+            let mut inc = vec![0u64; words];
+            rebuild_include(&ta, &mut inc, &valid, words, n, half);
+
+            for l in 0..n {
+                let got: u64 = (inc[l / WORD_BITS] >> (l % WORD_BITS)) & 1;
+                let expected: u64 = if l % 2 == 0 { 1 } else { 0 };
+                assert_eq!(got, expected, "n={n} literal {l}: expected {expected} got {got}");
+            }
+        }
+    }
+
+    // ---- state_bits boundary arithmetic -------------------------------------
+
+    #[test]
+    fn state_bits_2_min_constants() {
+        // state_bits=2 → half=2, max_state=3; verify saturation behaves correctly.
+        let state_bits: usize = 2;
+        let half = 1u8 << (state_bits - 1);
+        let max_state = ((1u16 << state_bits) - 1) as u8;
+        assert_eq!(half, 2u8);
+        assert_eq!(max_state, 3u8);
+        assert_eq!(3u8.saturating_add(1).min(max_state), 3u8, "saturate at 3");
+        assert_eq!(0u8.saturating_sub(1), 0u8, "saturate at 0");
+    }
+
+    #[test]
+    fn state_bits_8_max_no_overflow() {
+        // state_bits=8 → half=128, max_state=255.  Computing max_state via a u16
+        // intermediate avoids the `1u8 << 8` overflow that would occur with a direct u8 shift.
+        let state_bits: usize = 8;
+        let half = 1u8 << (state_bits - 1); // 1 << 7 = 128; no overflow
+        let max_state = ((1u16 << state_bits) - 1) as u8; // 255 via u16
+        assert_eq!(half, 128u8);
+        assert_eq!(max_state, 255u8);
+        assert_eq!(255u8.saturating_add(1).min(max_state), 255u8);
+    }
+
+    // ---- type_i_update_bytes Ib path ----------------------------------------
+
+    #[test]
+    fn type_i_ib_decrements_absent_non_max() {
+        // Ib path (fired_under=false): absent active literals are decremented
+        // unless they are at max_state (absorbing include state).
+        let n_literals = 4usize;
+        let max_state = 15u8;
+        let mut ta = vec![5u8, 1, 0, max_state];
+        let lit_b    = vec![0u8; 4]; // all absent
+        let inv_b    = vec![1u8; 4]; // always trigger decrement
+        let keep_b   = vec![0u8; 4];
+        let active_b = vec![1u8; 4];
+        type_i_update_bytes(&mut ta, n_literals, false, false, &lit_b, &inv_b, &keep_b, &active_b, max_state);
+        assert_eq!(ta[0], 4,         "5 - 1 = 4");
+        assert_eq!(ta[1], 0,         "1 - 1 = 0");
+        assert_eq!(ta[2], 0,         "0 - 1 saturates at 0");
+        assert_eq!(ta[3], max_state, "max_state is immune to Ib decrement");
+    }
+
+    // ---- type_ii_update_bytes logic ------------------------------------------
+
+    #[test]
+    fn type_ii_increments_absent_excluded_nonzero() {
+        // Type II increments only absent, excluded (ta < half), non-zero literals.
+        // Each of the five literals tests exactly one guard condition.
+        let half = 8u8;
+        let max_state = 15u8;
+        let n_literals = 5usize;
+        // lit 0: absent, excluded, non-zero  → incremented 3→4
+        // lit 1: present, excluded, non-zero → skipped (present guard)
+        // lit 2: absent, included (ta≥half)  → skipped (excluded guard)
+        // lit 3: absent, excluded, zero      → skipped (absorbing-exclude guard)
+        // lit 4: absent, excluded, non-zero  → incremented to the half boundary
+        let mut ta   = vec![3u8, 3, half, 0, half - 1];
+        let lit_b    = vec![0u8, 1, 0, 0, 0];
+        let active_b = vec![1u8; 5];
+        type_ii_update_bytes(&mut ta, n_literals, &lit_b, &active_b, half, max_state);
+        assert_eq!(ta[0], 4,    "absent excluded non-zero → incremented");
+        assert_eq!(ta[1], 3,    "present → unchanged");
+        assert_eq!(ta[2], half, "included (ta≥half) → unchanged");
+        assert_eq!(ta[3], 0,    "ta=0 (absorbing exclude) → stays at 0");
+        assert_eq!(ta[4], half, "absent excluded non-zero incremented to half");
+    }
+}

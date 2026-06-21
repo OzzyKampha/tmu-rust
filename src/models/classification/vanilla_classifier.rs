@@ -1202,4 +1202,123 @@ mod tests {
         assert_eq!((inc[0] >> 0) & 1, 1, "absorbing literal 0 must stay included");
         assert_eq!((inc[0] >> 1) & 1, 0, "non-absorbing literal 1 must be expelled");
     }
+
+    // ---- state_bits boundary configs ----------------------------------------
+
+    #[test]
+    fn state_bits_2_tm_trains_without_panic() {
+        // state_bits=2 is the minimum allowed; max_state=3, half=2.
+        // This test verifies no panics, no overflows, and a valid accuracy value.
+        let (xtr, ytr) = make_xor(500, 0.0, 60);
+        let (xte, yte) = make_xor(200, 0.0, 61);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let bte = e.encode_batch(&as_slices(&xte));
+        let mut tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 2, true, 42);
+        for _ in 0..5 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+        let acc = tm.accuracy(&bte, &yte);
+        assert!((0.0..=1.0).contains(&acc), "state_bits=2 accuracy out of range: {acc}");
+    }
+
+    #[test]
+    fn state_bits_8_max_state_is_255() {
+        // state_bits=8 is the maximum; max_state must be 255 (computed via u16
+        // intermediate to avoid `1u8 << 8` overflow), half must be 128.
+        let tm = TsetlinMachine::with_config(2, 4, 2, 5, 2.0, 8, true, 1);
+        assert_eq!(tm.max_state, 255u8, "state_bits=8 → max_state must be 255");
+        assert_eq!(tm.half, 128u8, "state_bits=8 → half must be 128");
+    }
+
+    // ---- absorbed state fractions -------------------------------------------
+
+    #[test]
+    fn absorbed_fractions_start_at_zero() {
+        // Fresh TM: every counter is initialised to half-1 or half, never 0 or
+        // max_state, so both absorbing fractions must be exactly 0.
+        let tm = TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 8, true, 42);
+        assert_eq!(tm.absorbed_include_fraction(), 0.0,
+            "fresh TM must have no include-absorbed states");
+        assert_eq!(tm.absorbed_exclude_fraction(), 0.0,
+            "fresh TM must have no exclude-absorbed states");
+    }
+
+    #[test]
+    fn absorbed_fractions_increase_with_training() {
+        // After sufficient training the combined absorbing fraction should be
+        // strictly larger than at initialisation (which is 0.0).
+        // Use state_bits=4 (max_state=15, half=8) so absorbing states are reachable
+        // within a modest number of epochs — state_bits=8 would require 127 increments.
+        let (xtr, ytr) = make_xor(3000, 0.0, 62);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let mut tm = TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 4, true, 42);
+        let before = tm.absorbed_include_fraction() + tm.absorbed_exclude_fraction();
+        for _ in 0..50 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+        let after = tm.absorbed_include_fraction() + tm.absorbed_exclude_fraction();
+        assert!(
+            after > before,
+            "absorbing states must grow during training: before={before:.4}, after={after:.4}"
+        );
+    }
+
+    // ---- scores are clamped to ±threshold -----------------------------------
+
+    #[test]
+    fn scores_are_clamped_to_threshold() {
+        let threshold = 10i32;
+        let (xtr, ytr) = make_xor(500, 0.0, 63);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let mut tm = TsetlinMachine::with_config(2, 12, 8, threshold, 3.0, 8, true, 42);
+        for _ in 0..5 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+        let (xte, _) = make_xor(50, 0.0, 64);
+        for x in &xte {
+            let sample = e.encode_one(x);
+            let mut s = vec![0i32; 2];
+            tm.scores(&sample, &mut s);
+            for (c, &sc) in s.iter().enumerate() {
+                assert!(
+                    sc >= -threshold && sc <= threshold,
+                    "class {c} score {sc} is outside [-{threshold}, {threshold}]"
+                );
+            }
+        }
+    }
+
+    // ---- clause_rule consistent with include bitset -------------------------
+
+    #[test]
+    fn clause_rule_consistent_with_include_bitset() {
+        // clause_rule() must report exactly the same set of included literals
+        // as a direct popcount of the include bitset.
+        let (xtr, ytr) = make_xor(500, 0.0, 65);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let mut tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42);
+        tm.fit_epoch(&btr, &ytr);
+
+        let n_literals = 2 * tm.n_features();
+        let words = tm.words_per_sample();
+        for class in 0..tm.n_classes() {
+            for clause in 0..tm.clauses_per_class() {
+                let rule = tm.clause_rule(class, clause);
+                let cj = class * tm.clauses_per_class() + clause;
+                let inc = &tm.include[cj * words..(cj + 1) * words];
+                let bitset_count: usize = (0..n_literals)
+                    .filter(|&l| (inc[l / 64] >> (l % 64)) & 1 != 0)
+                    .count();
+                assert_eq!(
+                    rule.len(), bitset_count,
+                    "clause ({class},{clause}): rule has {} literals but bitset has {}",
+                    rule.len(), bitset_count
+                );
+            }
+        }
+    }
 }
