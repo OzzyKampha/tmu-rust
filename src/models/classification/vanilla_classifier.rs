@@ -3,18 +3,19 @@
 //! Mirrors TMU's `vanilla_classifier.py` / `TMClassifier`.
 
 use crate::clause_bank::dense::{
-    bmask_word, clause_type_i, clause_type_ii, digits_of, fire_predict, words_for, GOLDEN,
-    MASK_BITS, WORD_BITS,
+    bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, rebuild_include,
+    type_i_update_bytes, type_ii_update_bytes, words_for, GOLDEN, MASK_BITS, WORD_BITS,
 };
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::PARALLEL_MIN;
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
 
-/// A bit-packed weighted multiclass Tsetlin Machine.
+/// A weighted multiclass Tsetlin Machine with u32 per-TA counters (matches TMU C extension).
 ///
-/// Bit-plane TA state, weighted clauses, and optional inter-class parallelism
-/// (`--features parallel`).
+/// Each TA counter is a `u32` in `[0, max_state]`; the include bitset is maintained
+/// as a separate `Vec<u64>` for O(words) fire checks.  Optional clause-level parallelism
+/// via `--features parallel`.
 #[derive(Clone, Debug)]
 pub struct TsetlinMachine {
     n_classes: usize,
@@ -24,7 +25,6 @@ pub struct TsetlinMachine {
     clauses_per_class: usize,
     threshold: i32,
     s: f64,
-    state_bits: usize,
     boost_true_positive: bool,
     max_included_literals: usize,
     clause_drop_p: f64,
@@ -35,16 +35,22 @@ pub struct TsetlinMachine {
     /// Precomputed binary digits for Bernoulli(1 - literal_drop_p) mask generation.
     dig_lit_active: Vec<u8>,
 
-    /// Bit-plane TA counters. Clause `cj = c*CPC + j` occupies
-    /// `state[cj*state_bits*words .. (cj+1)*state_bits*words]`; within that
-    /// chunk plane `b` word `w` is at `b*words + w`. Top plane = include bitset.
-    state: Vec<u64>,
+    /// u32 TA counters.  Clause `cj = c*CPC + j` occupies
+    /// `ta[cj * n_literals .. (cj+1) * n_literals]`.
+    ta: Vec<u32>,
+    /// Include bitset.  Clause `cj` occupies `include[cj * words .. (cj+1) * words]`.
+    /// Rebuilt after every clause update; kept in sync with `ta`.
+    include: Vec<u64>,
+    /// TA threshold for inclusion: `ta[l] >= half` → literal l is included.
+    half: u32,
+    /// Maximum TA counter value: `(1 << state_bits) - 1`.
+    max_state: u32,
+
     /// Per-clause integer weights (>= 1), indexed `c*CPC + j`.
     weights: Vec<i32>,
     /// Per-clause RNG (enables lock-free parallel training).
     rngs: Vec<Rng>,
     /// Per-class RNG for drop/inv/keep mask generation.
-    /// One per class keeps class updates independent for rayon::join parallelism.
     class_rngs: Vec<Rng>,
     /// Per-word mask of real literal bits.
     valid: Vec<u64>,
@@ -53,6 +59,72 @@ pub struct TsetlinMachine {
 
     literals: Vec<u64>,
     rng: Rng, // for shuffling and negative-class selection only
+}
+
+/// Per-clause feedback kernel shared by the sequential and parallel training paths.
+///
+/// `j` is the clause index within the class (0..clauses_per_class); it determines
+/// clause polarity (even = positive) and is used to index `drop_mask`.
+///
+/// `lit_b`, `inv_b`, `keep_b`, `active_b` are byte-expanded versions of the packed
+/// bit arrays, precomputed once per sample/class-update to enable SIMD auto-vectorisation
+/// of the inner TA update loops (avoids per-literal bit extraction).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn apply_one_clause(
+    j: usize,
+    ta: &mut [u32],
+    inc: &mut [u64],
+    w: &mut i32,
+    rng: &mut Rng,
+    target: u8,
+    p: f64,
+    drop_mask: &[bool],
+    // Packed bit arrays (for O(words) fire check):
+    lit: &[u64],
+    val: &[u64],
+    lit_active: &[u64],
+    words: usize,
+    // Byte-expanded arrays (for SIMD TA update):
+    lit_b: &[u8],
+    inv_b: &[u8],
+    keep_b: &[u8],
+    active_b: &[u8],
+    n_literals: usize,
+    boost: bool,
+    wmax: i32,
+    max_inc: usize,
+    half: u32,
+    max_state: u32,
+) {
+    if !drop_mask.is_empty() && drop_mask[j] {
+        return;
+    }
+    if rng.next_f64() > p {
+        return;
+    }
+    let positive = j & 1 == 0;
+    if (target == 1) == positive {
+        // Type I: fire check (O(words)), then SIMD TA update (O(n_literals)).
+        let fired = clause_fire(inc, lit, val, words, lit_active);
+        let under_limit = max_inc == usize::MAX || {
+            let n: u32 = (0..words).map(|k| (inc[k] & val[k]).count_ones()).sum();
+            (n as usize) < max_inc
+        };
+        let fired_under = fired && under_limit;
+        if fired_under {
+            *w = (*w + 1).min(wmax);
+        }
+        type_i_update_bytes(ta, n_literals, fired_under, boost, lit_b, inv_b, keep_b, active_b, max_state);
+    } else {
+        // Type II: fire check, then SIMD TA update.
+        if !clause_fire(inc, lit, val, words, lit_active) {
+            return;
+        }
+        *w = (*w - 1).max(1);
+        type_ii_update_bytes(ta, n_literals, lit_b, active_b, half, max_state);
+    }
+    rebuild_include(ta, inc, val, words, n_literals, half);
 }
 
 impl TsetlinMachine {
@@ -103,20 +175,21 @@ impl TsetlinMachine {
             valid[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
         }
 
-        let half: u64 = 1u64 << (state_bits - 1);
-        let mut state = vec![0u64; n_clauses * state_bits * words];
+        let half = 1u32 << (state_bits - 1);
+        let max_state = (1u32 << state_bits) - 1;
+
+        let mut ta = vec![0u32; n_clauses * n_literals];
+        let mut include = vec![0u64; n_clauses * words];
         for cj in 0..n_clauses {
-            let cb = cj * state_bits * words;
+            let tb = cj * n_literals;
             for l in 0..n_literals {
-                let v = if rng.next_u64() & 1 == 0 { half - 1 } else { half };
-                let w = l / WORD_BITS;
-                let bit = 1u64 << (l % WORD_BITS);
-                for b in 0..state_bits {
-                    if (v >> b) & 1 == 1 {
-                        state[cb + b * words + w] |= bit;
-                    }
-                }
+                ta[tb + l] = if rng.next_u64() & 1 == 0 { half - 1 } else { half };
             }
+            rebuild_include(
+                &ta[tb..tb + n_literals],
+                &mut include[cj * words..(cj + 1) * words],
+                &valid, words, n_literals, half,
+            );
         }
 
         let rngs = (0..n_clauses)
@@ -138,14 +211,16 @@ impl TsetlinMachine {
             clauses_per_class,
             threshold,
             s,
-            state_bits,
             boost_true_positive,
             max_included_literals: usize::MAX,
             clause_drop_p: 0.0,
             literal_drop_p: 0.0,
             literal_rng,
             dig_lit_active: digits_of(1.0, MASK_BITS),
-            state,
+            ta,
+            include,
+            half,
+            max_state,
             weights: vec![1i32; n_clauses],
             rngs,
             class_rngs,
@@ -211,20 +286,6 @@ impl TsetlinMachine {
         self.weights[class * self.clauses_per_class + clause]
     }
 
-    // ---- internal indexing -----------------------------------------------
-
-    /// Return the flat index into `state` for the first word of clause `j` in class `c`.
-    #[inline(always)]
-    fn clause_base(&self, c: usize, j: usize) -> usize {
-        (c * self.clauses_per_class + j) * self.state_bits * self.words
-    }
-
-    /// Return the flat index into `state` for the top (include) bit-plane of clause `j` in class `c`.
-    #[inline(always)]
-    fn top_base(&self, c: usize, j: usize) -> usize {
-        self.clause_base(c, j) + (self.state_bits - 1) * self.words
-    }
-
     // ---- inference -------------------------------------------------------
 
     /// Internal: predict from a raw literal slice without allocation.
@@ -232,19 +293,17 @@ impl TsetlinMachine {
     fn predict_lit(&self, lit: &[u64]) -> usize {
         debug_assert_eq!(lit.len(), self.words);
         let cps = self.clauses_per_class;
-        let bw = self.state_bits * self.words;
-        let tb_off = (self.state_bits - 1) * self.words;
         let words = self.words;
-        let state = self.state.as_slice();
+        let include = self.include.as_slice();
         let valid = self.valid.as_slice();
         let mut best = 0usize;
         let mut best_score = i32::MIN;
         for c in 0..self.n_classes {
-            let cb = c * cps * bw + tb_off;
             let cw = &self.weights[c * cps..(c + 1) * cps];
             let mut sum = 0i32;
             for (j, &w) in cw.iter().enumerate() {
-                if fire_predict(state, cb + j * bw, lit, valid, words) {
+                let cj = c * cps + j;
+                if fire_predict(&include[cj * words..(cj + 1) * words], lit, valid, words) {
                     if j & 1 == 0 { sum += w; } else { sum -= w; }
                 }
             }
@@ -268,17 +327,15 @@ impl TsetlinMachine {
         let lit = &sample.0;
         debug_assert_eq!(out.len(), self.n_classes);
         let cps = self.clauses_per_class;
-        let bw = self.state_bits * self.words;
-        let tb_off = (self.state_bits - 1) * self.words;
         let words = self.words;
-        let state = self.state.as_slice();
+        let include = self.include.as_slice();
         let valid = self.valid.as_slice();
         for (c, out_c) in out.iter_mut().enumerate() {
-            let cb = c * cps * bw + tb_off;
             let cw = &self.weights[c * cps..(c + 1) * cps];
             let mut sum = 0i32;
             for (j, &w) in cw.iter().enumerate() {
-                if fire_predict(state, cb + j * bw, lit, valid, words) {
+                let cj = c * cps + j;
+                if fire_predict(&include[cj * words..(cj + 1) * words], lit, valid, words) {
                     if j & 1 == 0 { sum += w; } else { sum -= w; }
                 }
             }
@@ -305,43 +362,18 @@ impl TsetlinMachine {
 
     // ---- training helpers ------------------------------------------------
 
-    /// Check whether clause `j` of class `c` fires against the current `self.literals` buffer (training variant, with dropout support).
-    #[allow(dead_code)]
-    #[inline(always)]
-    fn fire_train(&self, c: usize, j: usize) -> bool {
-        let cb = self.clause_base(c, j);
-        let bw = self.state_bits * self.words;
-        let all_active: Vec<u64> = vec![!0u64; self.words];
-        crate::clause_bank::dense::clause_fire(
-            &self.state[cb..cb + bw],
-            &self.literals,
-            &self.valid,
-            self.words,
-            self.state_bits,
-            &all_active,
-        )
-    }
-
     /// Compute the clamped weighted clause sum for class `c` using the current `self.literals` buffer.
     /// `lit_active` is the per-sample literal dropout mask for this training step.
     fn class_sum_train(&self, c: usize, lit_active: &[u64]) -> i32 {
         let cps = self.clauses_per_class;
         let words = self.words;
-        let sb = self.state_bits;
-        let bw = sb * words;
-        let tb_offset = (sb - 1) * words;
-        let base = c * cps * bw;
+        let include = self.include.as_slice();
+        let valid = self.valid.as_slice();
+        let lit = self.literals.as_slice();
         let mut sum: i32 = 0;
         for j in 0..cps {
-            let jbase = base + j * bw + tb_offset;
-            let mut fired = true;
-            for (k, &la) in lit_active.iter().enumerate() {
-                if self.state[jbase + k] & self.valid[k] & la & !self.literals[k] != 0 {
-                    fired = false;
-                    break;
-                }
-            }
-            if fired {
+            let cj = c * cps + j;
+            if clause_fire(&include[cj * words..(cj + 1) * words], lit, valid, words, lit_active) {
                 let w = self.weights[c * cps + j];
                 if j & 1 == 0 { sum += w; } else { sum -= w; }
             }
@@ -353,18 +385,29 @@ impl TsetlinMachine {
     ///
     /// `target` is 1 for the true class and 0 for the sampled negative class.
     /// `sum` is the pre-computed clamped clause sum from `class_sum_train`.
-    #[cfg_attr(feature = "parallel", allow(dead_code))]
-    fn update_class(&mut self, c: usize, target: u8, sum: i32, lit_active: &[u64]) {
+    /// `lit_b` / `active_b` are byte-expanded per-sample arrays (precomputed in `fit_one_lit`).
+    /// When `--features parallel` is active and `clauses_per_class >= PARALLEL_MIN`,
+    /// the per-clause loop runs in parallel via rayon.
+    fn update_class(
+        &mut self,
+        c: usize,
+        target: u8,
+        sum: i32,
+        lit_active: &[u64],
+        lit_b: &[u8],
+        active_b: &[u8],
+    ) {
         let cps = self.clauses_per_class;
         let words = self.words;
-        let sb = self.state_bits;
-        let bw = sb * words;
+        let n_literals = self.n_literals;
         let boost = self.boost_true_positive;
         let wmax = self.threshold;
         let max_inc = self.max_included_literals;
         let drop_p = self.clause_drop_p;
+        let half = self.half;
+        let max_state = self.max_state;
 
-        let Self { state, weights, rngs, class_rngs, literals, valid, dig_inv, dig_keep, .. } =
+        let Self { ta, include, weights, rngs, class_rngs, literals, valid, dig_inv, dig_keep, .. } =
             self;
         let lit = literals.as_slice();
         let val = valid.as_slice();
@@ -383,97 +426,50 @@ impl TsetlinMachine {
         } else {
             vec![]
         };
-        let inv_mask: Vec<u64> =
-            (0..words).map(|_| bmask_word(crng, dig_inv)).collect();
-        let keep_mask: Vec<u64> =
-            (0..words).map(|_| bmask_word(crng, dig_keep)).collect();
 
-        let class_state = &mut state[c * cps * bw..(c + 1) * cps * bw];
+        // Generate class-specific Bernoulli masks and byte-expand once for all clauses.
+        let inv_mask: Vec<u64> = (0..words).map(|_| bmask_word(crng, dig_inv)).collect();
+        let keep_mask: Vec<u64> = (0..words).map(|_| bmask_word(crng, dig_keep)).collect();
+        let inv_b = expand_bits_to_bytes(&inv_mask, n_literals);
+        let keep_b = expand_bits_to_bytes(&keep_mask, n_literals);
+
+        let class_ta = &mut ta[c * cps * n_literals..(c + 1) * cps * n_literals];
+        let class_inc = &mut include[c * cps * words..(c + 1) * cps * words];
         let class_w = &mut weights[c * cps..(c + 1) * cps];
         let class_rng = &mut rngs[c * cps..(c + 1) * cps];
 
-        for j in 0..cps {
-            if !drop_mask.is_empty() && drop_mask[j] {
-                continue;
-            }
-            if class_rng[j].next_f64() > p {
-                continue;
-            }
-            let chunk = &mut class_state[j * bw..(j + 1) * bw];
-            let w = &mut class_w[j];
-            let positive = j & 1 == 0;
-            if (target == 1) == positive {
-                clause_type_i(
-                    chunk, w, lit, val, words, sb, boost, &inv_mask, &keep_mask, wmax, max_inc,
-                    lit_active,
-                );
-            } else {
-                clause_type_ii(chunk, w, lit, val, words, sb, lit_active);
-            }
+        #[cfg(feature = "parallel")]
+        if cps >= PARALLEL_MIN {
+            use rayon::prelude::*;
+            class_ta
+                .par_chunks_mut(n_literals)
+                .zip(class_inc.par_chunks_mut(words))
+                .zip(class_w.par_iter_mut())
+                .zip(class_rng.par_iter_mut())
+                .enumerate()
+                .for_each(|(j, (((ta_c, inc_c), w), rng))| {
+                    apply_one_clause(
+                        j, ta_c, inc_c, w, rng, target, p, &drop_mask,
+                        lit, val, lit_active, words,
+                        lit_b, &inv_b, &keep_b, active_b,
+                        n_literals, boost, wmax, max_inc, half, max_state,
+                    );
+                });
+            return;
         }
-    }
-
-    /// Standalone class-update kernel for the `parallel` feature — operates on explicit mutable
-    /// slices so it can be called from a `rayon::join` closure without a `&mut self` borrow.
-    #[cfg(feature = "parallel")]
-    #[allow(clippy::too_many_arguments)]
-    fn update_class_par(
-        sum: i32,
-        target: u8,
-        class_state: &mut [u64],
-        class_weights: &mut [i32],
-        clause_rngs: &mut [Rng],
-        class_rng: &mut Rng,
-        lit: &[u64],
-        valid: &[u64],
-        dig_inv: &[u8],
-        dig_keep: &[u8],
-        lit_active: &[u64],
-        cps: usize,
-        words: usize,
-        sb: usize,
-        boost: bool,
-        wmax: i32,
-        max_inc: usize,
-        drop_p: f64,
-    ) {
-        let bw = sb * words;
-        let t = wmax as f64;
-        let v = sum as f64;
-        let p = if target == 1 {
-            (t - v) / (2.0 * t)
-        } else {
-            (t + v) / (2.0 * t)
-        };
-
-        let drop_mask: Vec<bool> = if drop_p > 0.0 {
-            (0..cps).map(|_| class_rng.next_f64() < drop_p).collect()
-        } else {
-            vec![]
-        };
-        let inv_mask: Vec<u64> =
-            (0..words).map(|_| bmask_word(class_rng, dig_inv)).collect();
-        let keep_mask: Vec<u64> =
-            (0..words).map(|_| bmask_word(class_rng, dig_keep)).collect();
 
         for j in 0..cps {
-            if !drop_mask.is_empty() && drop_mask[j] {
-                continue;
-            }
-            if clause_rngs[j].next_f64() > p {
-                continue;
-            }
-            let chunk = &mut class_state[j * bw..(j + 1) * bw];
-            let w = &mut class_weights[j];
-            let positive = j & 1 == 0;
-            if (target == 1) == positive {
-                clause_type_i(
-                    chunk, w, lit, valid, words, sb, boost, &inv_mask, &keep_mask, wmax, max_inc,
-                    lit_active,
-                );
-            } else {
-                clause_type_ii(chunk, w, lit, valid, words, sb, lit_active);
-            }
+            apply_one_clause(
+                j,
+                &mut class_ta[j * n_literals..(j + 1) * n_literals],
+                &mut class_inc[j * words..(j + 1) * words],
+                &mut class_w[j],
+                &mut class_rng[j],
+                target, p, &drop_mask,
+                lit, val, lit_active, words,
+                lit_b, &inv_b, &keep_b, active_b,
+                n_literals, boost, wmax, max_inc, half, max_state,
+            );
         }
     }
 
@@ -488,8 +484,13 @@ impl TsetlinMachine {
             neg = self.rng.below(self.n_classes);
         }
 
-        // Generate per-sample literal-active mask once; shared by both class updates.
+        let n_literals = self.n_literals;
         let words = self.words;
+
+        // Byte-expand the sample literals once; reused for all clause updates this step.
+        let lit_b = expand_bits_to_bytes(lit, n_literals);
+
+        // Generate per-sample literal-active mask once; shared by both class updates.
         let lit_active: Vec<u64> = if self.literal_drop_p > 0.0 {
             let rng = &mut self.literal_rng;
             let dig = &self.dig_lit_active;
@@ -498,82 +499,14 @@ impl TsetlinMachine {
             vec![!0u64; words]
         };
 
-        #[cfg(feature = "parallel")]
-        {
-            // Compute both class sums concurrently (read-only).
-            let (sum_y, sum_neg) = rayon::join(
-                || self.class_sum_train(y, &lit_active),
-                || self.class_sum_train(neg, &lit_active),
-            );
+        // Byte-expand active mask (valid & lit_active). Since valid_b is all-1s for
+        // l < n_literals, this is equivalent to expand_bits_to_bytes(&lit_active, …).
+        let active_b = expand_bits_to_bytes(&lit_active, n_literals);
 
-            // Extract disjoint per-class slices for y and neg, then run both
-            // class updates in parallel — each class owns exclusive state/weight/rng slices.
-            let cps = self.clauses_per_class;
-            let bw = self.state_bits * self.words;
-            let sb = self.state_bits;
-            let boost = self.boost_true_positive;
-            let wmax = self.threshold;
-            let max_inc = self.max_included_literals;
-            let drop_p = self.clause_drop_p;
-
-            let Self {
-                state, weights, rngs, class_rngs, valid, dig_inv, dig_keep, literals, ..
-            } = self;
-            let lit_sl = literals.as_slice();
-            let val = valid.as_slice();
-
-            // Split two disjoint mutable chunks from a slice by class index.
-            macro_rules! split2 {
-                ($v:expr, $a:expr, $b:expr, $s:expr) => {{
-                    if $a < $b {
-                        let (l, r) = $v.split_at_mut($b * $s);
-                        (&mut l[$a * $s..($a + 1) * $s], &mut r[0..$s])
-                    } else {
-                        let (l, r) = $v.split_at_mut($a * $s);
-                        (&mut r[0..$s], &mut l[$b * $s..($b + 1) * $s])
-                    }
-                }};
-            }
-            macro_rules! split2_one {
-                ($v:expr, $a:expr, $b:expr) => {{
-                    if $a < $b {
-                        let (l, r) = $v.split_at_mut($b);
-                        (&mut l[$a], &mut r[0])
-                    } else {
-                        let (l, r) = $v.split_at_mut($a);
-                        (&mut r[0], &mut l[$b])
-                    }
-                }};
-            }
-
-            let (cs_y, cs_neg) = split2!(state, y, neg, cps * bw);
-            let (cw_y, cw_neg) = split2!(weights, y, neg, cps);
-            let (cr_y, cr_neg) = split2!(rngs, y, neg, cps);
-            let (crng_y, crng_neg) = split2_one!(class_rngs, y, neg);
-
-            rayon::join(
-                || {
-                    Self::update_class_par(
-                        sum_y, 1, cs_y, cw_y, cr_y, crng_y, lit_sl, val, dig_inv, dig_keep,
-                        &lit_active, cps, words, sb, boost, wmax, max_inc, drop_p,
-                    )
-                },
-                || {
-                    Self::update_class_par(
-                        sum_neg, 0, cs_neg, cw_neg, cr_neg, crng_neg, lit_sl, val, dig_inv,
-                        dig_keep, &lit_active, cps, words, sb, boost, wmax, max_inc, drop_p,
-                    )
-                },
-            );
-        }
-
-        #[cfg(not(feature = "parallel"))]
-        {
-            let sum_y = self.class_sum_train(y, &lit_active);
-            let sum_neg = self.class_sum_train(neg, &lit_active);
-            self.update_class(y, 1, sum_y, &lit_active);
-            self.update_class(neg, 0, sum_neg, &lit_active);
-        }
+        let sum_y   = self.class_sum_train(y,   &lit_active);
+        let sum_neg = self.class_sum_train(neg, &lit_active);
+        self.update_class(y,   1, sum_y,   &lit_active, &lit_b, &active_b);
+        self.update_class(neg, 0, sum_neg, &lit_active, &lit_b, &active_b);
     }
 
     /// Train on a single encoded sample with true label `y`.
@@ -625,41 +558,45 @@ impl TsetlinMachine {
     // ---- absorbing state introspection ------------------------------------
 
     /// Fraction of (clause, literal) pairs whose TA is at the **absorbing include**
-    /// state (all `state_bits` planes set = max counter value).
+    /// state (counter == max_state).
     /// Grows toward 1.0 as training converges; used to measure absorbing progress.
     pub fn absorbed_include_fraction(&self) -> f64 {
         let n_clauses = self.n_classes * self.clauses_per_class;
-        let bw = self.state_bits * self.words;
         let mut total = 0u64;
         let mut at_max = 0u64;
         for cj in 0..n_clauses {
-            let cb = cj * bw;
-            for k in 0..self.words {
-                let mask = (0..self.state_bits)
-                    .fold(!0u64, |acc, b| acc & self.state[cb + b * self.words + k]);
-                let valid = self.valid[k];
-                at_max += (mask & valid).count_ones() as u64;
-                total  += valid.count_ones() as u64;
+            let base = cj * self.n_literals;
+            for l in 0..self.n_literals {
+                let k = l / WORD_BITS;
+                let bit = 1u64 << (l % WORD_BITS);
+                if self.valid[k] & bit != 0 {
+                    total += 1;
+                    if self.ta[base + l] == self.max_state {
+                        at_max += 1;
+                    }
+                }
             }
         }
         if total == 0 { 0.0 } else { at_max as f64 / total as f64 }
     }
 
     /// Fraction of (clause, literal) pairs whose TA is at the **absorbing exclude**
-    /// state (all `state_bits` planes clear = counter 0).
+    /// state (counter == 0).
     pub fn absorbed_exclude_fraction(&self) -> f64 {
         let n_clauses = self.n_classes * self.clauses_per_class;
-        let bw = self.state_bits * self.words;
         let mut total = 0u64;
         let mut at_min = 0u64;
         for cj in 0..n_clauses {
-            let cb = cj * bw;
-            for k in 0..self.words {
-                let not_min = (0..self.state_bits)
-                    .fold(0u64, |acc, b| acc | self.state[cb + b * self.words + k]);
-                let valid = self.valid[k];
-                at_min += (!not_min & valid).count_ones() as u64;
-                total  += valid.count_ones() as u64;
+            let base = cj * self.n_literals;
+            for l in 0..self.n_literals {
+                let k = l / WORD_BITS;
+                let bit = 1u64 << (l % WORD_BITS);
+                if self.valid[k] & bit != 0 {
+                    total += 1;
+                    if self.ta[base + l] == 0 {
+                        at_min += 1;
+                    }
+                }
             }
         }
         if total == 0 { 0.0 } else { at_min as f64 / total as f64 }
@@ -670,9 +607,10 @@ impl TsetlinMachine {
     /// Return the included literals for clause `clause` of `class` as `(feature_index, is_negated)` pairs.
     pub fn clause_rule(&self, class: usize, clause: usize) -> Vec<(usize, bool)> {
         let mut rule = Vec::new();
-        let tb = self.top_base(class, clause);
+        let cj = class * self.clauses_per_class + clause;
+        let inc = &self.include[cj * self.words..(cj + 1) * self.words];
         for l in 0..self.n_literals {
-            let included = (self.state[tb + l / WORD_BITS] >> (l % WORD_BITS)) & 1 != 0;
+            let included = (inc[l / WORD_BITS] >> (l % WORD_BITS)) & 1 != 0;
             if included {
                 if l < self.n_features {
                     rule.push((l, false));
@@ -693,7 +631,7 @@ impl TsetlinMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clause_bank::dense::{clause_dec, clause_inc, clause_type_i, clause_type_ii, fire_predict};
+    use crate::clause_bank::dense::{clause_type_i_bytes, clause_type_ii_bytes, fire_predict};
     use crate::encoder::Encoder;
 
     // ---- helpers -------------------------------------------------------------
@@ -749,24 +687,20 @@ mod tests {
 
     #[test]
     fn inc_dec_saturate() {
-        let mut tm = TsetlinMachine::with_config(2, 1, 2, 5, 3.0, 8, true, 1);
-        let cb = tm.clause_base(0, 0);
-        let valid0 = tm.valid[0];
-        let words = tm.words;
-        let sb = tm.state_bits;
-        let chunk = &mut tm.state[cb..cb + sb * words];
-        for _ in 0..1000 {
-            clause_inc(chunk, words, sb, 0, valid0);
-        }
-        for b in 0..sb {
-            assert_eq!(chunk[b * words] & valid0, valid0);
-        }
-        for _ in 0..1000 {
-            clause_dec(chunk, words, sb, 0, valid0);
-        }
-        for b in 0..sb {
-            assert_eq!(chunk[b * words] & valid0, 0);
-        }
+        let tm = TsetlinMachine::with_config(2, 1, 2, 5, 3.0, 8, true, 1);
+        let max_state = tm.max_state;
+
+        // Saturating increment: adding 1 to max_state stays at max_state.
+        assert_eq!((max_state + 1).min(max_state), max_state);
+        // Saturating decrement: subtracting 1 from 0 stays at 0.
+        assert_eq!(0u32.saturating_sub(1), 0);
+
+        // Check the full range for a representative value.
+        let mut v = 0u32;
+        for _ in 0..1000 { v = (v + 1).min(max_state); }
+        assert_eq!(v, max_state);
+        for _ in 0..1000 { v = v.saturating_sub(1); }
+        assert_eq!(v, 0);
     }
 
     // ---- encode / predict API consistency ------------------------------------
@@ -896,13 +830,13 @@ mod tests {
         let btr = enc(12).encode_batch(&as_slices(&xtr));
         let mut tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42)
             .clause_drop_p(0.9999);
-        let state_before = tm.state.clone();
+        let ta_before = tm.ta.clone();
         tm.fit_epoch(&btr, &ytr);
-        let state_changed = tm.state.iter().zip(&state_before).filter(|(a, b)| a != b).count();
-        let total = tm.state.len();
+        let ta_changed = tm.ta.iter().zip(&ta_before).filter(|(a, b)| a != b).count();
+        let total = tm.ta.len();
         assert!(
-            state_changed < total / 100,
-            "drop_p≈1 should leave >99% of state unchanged, but {state_changed}/{total} changed"
+            ta_changed < total / 100,
+            "drop_p≈1 should leave >99% of state unchanged, but {ta_changed}/{total} changed"
         );
     }
 
@@ -926,28 +860,31 @@ mod tests {
 
     #[test]
     fn clause_type_i_stops_including_at_limit() {
+        let n_literals = 8usize;
         let words = 1usize;
-        let sb = 8usize;
-        let bw = sb * words;
-        let mut chunk = vec![0u64; bw];
-        let top = (sb - 1) * words;
-
+        let half = 128u32;
+        let max_state = 255u32;
         let max_included = 2usize;
-        chunk[top] = 0b11; // 2 bits already included
 
-        let lit = vec![0b1111_1111u64];
+        // 2 literals already included (bits 0 and 1 at half=included threshold).
+        let mut ta = vec![0u32; n_literals];
+        ta[0] = half;
+        ta[1] = half;
         let valid = vec![0b1111_1111u64];
+        let mut inc = vec![0b11u64]; // bits 0 and 1 set
+        let lit = vec![0b1111_1111u64]; // all present
         let inv_mask = vec![!0u64];
         let keep_mask = vec![!0u64];
-        let all_active = vec![!0u64; words];
+        let all_active = vec![!0u64];
         let mut weight = 5i32;
 
-        clause_type_i(
-            &mut chunk, &mut weight, &lit, &valid,
-            words, sb, false, &inv_mask, &keep_mask, 10, max_included, &all_active,
+        clause_type_i_bytes(
+            &mut ta, &mut inc, &mut weight, &lit, &valid,
+            words, n_literals, false, &inv_mask, &keep_mask, 10, max_included, &all_active,
+            half, max_state,
         );
 
-        let n_after = (chunk[top] & valid[0]).count_ones() as usize;
+        let n_after = (inc[0] & valid[0]).count_ones() as usize;
         assert!(
             n_after <= max_included,
             "Type Ia added literals beyond limit: {n_after} > {max_included}"
@@ -1080,28 +1017,28 @@ mod tests {
     #[test]
     fn fire_predict_empty_clause_returns_false() {
         let words = 2usize;
-        let state = vec![0u64; words];
+        let inc = vec![0u64; words];
         let lit = vec![0u64; words];
         let valid = vec![!0u64; words];
-        assert!(!fire_predict(&state, 0, &lit, &valid, words));
+        assert!(!fire_predict(&inc, &lit, &valid, words));
     }
 
     #[test]
     fn fire_predict_satisfied_clause_returns_true() {
         let words = 1usize;
-        let state = vec![1u64];
-        let lit = vec![1u64];
+        let inc = vec![1u64]; // bit 0 included
+        let lit = vec![1u64]; // bit 0 present
         let valid = vec![1u64];
-        assert!(fire_predict(&state, 0, &lit, &valid, words));
+        assert!(fire_predict(&inc, &lit, &valid, words));
     }
 
     #[test]
     fn fire_predict_violated_clause_returns_false() {
         let words = 1usize;
-        let state = vec![1u64];
-        let lit = vec![0u64];
+        let inc = vec![1u64]; // bit 0 included
+        let lit = vec![0u64]; // bit 0 absent → violation
         let valid = vec![1u64];
-        assert!(!fire_predict(&state, 0, &lit, &valid, words));
+        assert!(!fire_predict(&inc, &lit, &valid, words));
     }
 
     // ---- literal_drop_p -------------------------------------------------------
@@ -1112,13 +1049,13 @@ mod tests {
         let btr = enc(12).encode_batch(&as_slices(&xtr));
         let mut tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42)
             .literal_drop_p(0.9999);
-        let state_before = tm.state.clone();
+        let ta_before = tm.ta.clone();
         tm.fit_epoch(&btr, &ytr);
-        let state_changed = tm.state.iter().zip(&state_before).filter(|(a, b)| a != b).count();
-        let total = tm.state.len();
+        let ta_changed = tm.ta.iter().zip(&ta_before).filter(|(a, b)| a != b).count();
+        let total = tm.ta.len();
         assert!(
-            state_changed < total / 100,
-            "literal_drop_p≈1 should leave >99% of state unchanged, but {state_changed}/{total} changed"
+            ta_changed < total / 100,
+            "literal_drop_p≈1 should leave >99% of state unchanged, but {ta_changed}/{total} changed"
         );
     }
 
@@ -1140,106 +1077,95 @@ mod tests {
 
     // ---- absorbing states -------------------------------------------------------
 
-    /// Build a one-word chunk with `sb` state planes; `states[l]` is the integer TA state for literal bit `l`.
-    fn make_chunk(sb: usize, states: &[(usize, u64)]) -> Vec<u64> {
-        let words = 1usize;
-        let mut chunk = vec![0u64; sb * words];
-        for &(l, v) in states {
-            for b in 0..sb {
-                if (v >> b) & 1 == 1 {
-                    chunk[b] |= 1u64 << l;
-                }
-            }
-        }
-        chunk
-    }
-
-    /// Read back the integer TA state for literal bit `l` from a one-word chunk.
-    fn read_state(chunk: &[u64], sb: usize, l: usize) -> u64 {
-        (0..sb).fold(0u64, |acc, b| acc | (((chunk[b] >> l) & 1) << b))
-    }
-
     #[test]
     fn absorbing_include_at_max_resists_ib() {
-        // A literal at the maximum TA state (all sb planes set) must survive
-        // 1 000 rounds of Type Ib "exclude absent" feedback completely unchanged.
+        // A literal at the maximum TA state must survive 1 000 rounds of Type Ib
+        // "exclude absent" feedback completely unchanged.
+        let n_literals = 1usize;
         let words = 1usize;
-        let sb = 4usize;
-        let max_state = (1u64 << sb) - 1; // 0b1111
-        // Literal 0 at max state; literal 0 absent from x → violation → Ib path.
-        let mut chunk = make_chunk(sb, &[(0, max_state)]);
-
-        let lit = vec![0u64];
+        let half = 8u32;     // sb=4 → half=8
+        let max_state = 15u32; // (1<<4)-1
+        // Literal 0 at max state (included); absent from x → violation → Ib path.
+        let mut ta = vec![max_state];
+        let mut inc = vec![1u64]; // bit 0 included
+        let lit = vec![0u64];     // absent
         let valid = vec![1u64];
         let inv_mask = vec![!0u64];
         let keep_mask = vec![!0u64];
-        let all_active = vec![!0u64; words];
+        let all_active = vec![!0u64];
         let mut weight = 1i32;
 
         for _ in 0..1_000 {
-            clause_type_i(
-                &mut chunk, &mut weight, &lit, &valid,
-                words, sb, false, &inv_mask, &keep_mask, 100, usize::MAX, &all_active,
+            clause_type_i_bytes(
+                &mut ta, &mut inc, &mut weight, &lit, &valid,
+                words, n_literals, false, &inv_mask, &keep_mask, 100, usize::MAX, &all_active,
+                half, max_state,
             );
         }
 
         assert_eq!(
-            read_state(&chunk, sb, 0), max_state,
+            ta[0], max_state,
             "absorbing max-state literal must resist all Ib decrement pressure"
         );
     }
 
     #[test]
     fn non_max_include_is_decremented_by_ib() {
-        // A literal one step below max (plane 0 missing) is NOT at the absorbing
-        // state and must be decremented by a single Ib round.
+        // A literal one step below max (still included: 14 >= half=8) must be
+        // decremented by a single Ib round.
+        let n_literals = 1usize;
         let words = 1usize;
-        let sb = 4usize;
-        let below_max = ((1u64 << sb) - 1) & !1u64; // 0b1110 — top plane still set → included
-        let mut chunk = make_chunk(sb, &[(0, below_max)]);
-        let before = read_state(&chunk, sb, 0);
+        let half = 8u32;
+        let max_state = 15u32;
+        let below_max = max_state - 1; // 14, still included
+        let mut ta = vec![below_max];
+        let mut inc = vec![1u64]; // included
+        let before = ta[0];
 
         let lit = vec![0u64]; // absent → violation on included literal → Ib path
         let valid = vec![1u64];
         let inv_mask = vec![!0u64];
         let keep_mask = vec![!0u64];
-        let all_active = vec![!0u64; words];
+        let all_active = vec![!0u64];
         let mut weight = 1i32;
 
-        clause_type_i(
-            &mut chunk, &mut weight, &lit, &valid,
-            words, sb, false, &inv_mask, &keep_mask, 100, usize::MAX, &all_active,
+        clause_type_i_bytes(
+            &mut ta, &mut inc, &mut weight, &lit, &valid,
+            words, n_literals, false, &inv_mask, &keep_mask, 100, usize::MAX, &all_active,
+            half, max_state,
         );
 
         assert_ne!(
-            read_state(&chunk, sb, 0), before,
+            ta[0], before,
             "non-max literal must be decremented by Ib feedback"
         );
     }
 
     #[test]
     fn absorbing_exclude_at_min_resists_type_ii() {
-        // A literal at the minimum TA state (all sb planes clear) must survive
-        // 1 000 rounds of Type II "include absent excluded" feedback unchanged.
+        // A literal at state 0 (absorbing exclude) must survive 1 000 rounds of
+        // Type II "include absent excluded" feedback unchanged.
+        let n_literals = 1usize;
         let words = 1usize;
-        let sb = 4usize;
-        // All-zero chunk: every literal at min state; empty clause fires (no violations).
-        let mut chunk = vec![0u64; sb * words];
-
-        let lit = vec![0u64]; // literal 0 absent from x
+        let half = 8u32;
+        let max_state = 15u32;
+        // All-zero: every literal at min state; empty clause fires (no violations).
+        let mut ta = vec![0u32];
+        let mut inc = vec![0u64]; // excluded
+        let lit = vec![0u64];     // literal 0 absent from x
         let valid = vec![1u64];
-        let all_active = vec![!0u64; words];
+        let all_active = vec![!0u64];
         let mut weight = 5i32;
 
         for _ in 0..1_000 {
-            clause_type_ii(
-                &mut chunk, &mut weight, &lit, &valid,
-                words, sb, &all_active,
+            clause_type_ii_bytes(
+                &mut ta, &mut inc, &mut weight, &lit, &valid,
+                words, n_literals, &all_active, half, max_state,
             );
         }
 
         assert_eq!(
-            read_state(&chunk, sb, 0), 0,
+            ta[0], 0,
             "absorbing min-state literal must resist all Type II increment pressure"
         );
     }
@@ -1248,30 +1174,30 @@ mod tests {
     fn absorbing_stabilizes_clause_at_literal_limit() {
         // Two included literals, max_included_literals = 1 (over the limit → always Ib).
         //   literal 0: max state (absorbing) — should survive
-        //   literal 1: only top-plane set (just in include action, not absorbing) — should be expelled
+        //   literal 1: half (just included, not absorbing) — should be expelled
         // After enough rounds the clause should settle to exactly literal 0.
+        let n_literals = 2usize;
         let words = 1usize;
-        let sb = 4usize;
-        let max_state = (1u64 << sb) - 1;
-        let top_only = 1u64 << (sb - 1); // only top plane = 0b1000 for sb=4
-        let mut chunk = make_chunk(sb, &[(0, max_state), (1, top_only)]);
-
-        let lit = vec![0u64]; // both absent → violations on both → Ib path
+        let half = 8u32;
+        let max_state = 15u32;
+        let mut ta = vec![max_state, half]; // literal 0 absorbing, literal 1 just included
+        let mut inc = vec![0b11u64];         // both included
+        let lit = vec![0u64];               // both absent → violations on both → Ib path
         let valid = vec![0b11u64];
         let inv_mask = vec![!0u64];
         let keep_mask = vec![!0u64];
-        let all_active = vec![!0u64; words];
+        let all_active = vec![!0u64];
         let mut weight = 1i32;
 
         for _ in 0..500 {
-            clause_type_i(
-                &mut chunk, &mut weight, &lit, &valid,
-                words, sb, false, &inv_mask, &keep_mask, 5, 1, &all_active,
+            clause_type_i_bytes(
+                &mut ta, &mut inc, &mut weight, &lit, &valid,
+                words, n_literals, false, &inv_mask, &keep_mask, 5, 1, &all_active,
+                half, max_state,
             );
         }
 
-        let top = sb - 1;
-        assert_eq!((chunk[top] >> 0) & 1, 1, "absorbing literal 0 must stay included");
-        assert_eq!((chunk[top] >> 1) & 1, 0, "non-absorbing literal 1 must be expelled");
+        assert_eq!((inc[0] >> 0) & 1, 1, "absorbing literal 0 must stay included");
+        assert_eq!((inc[0] >> 1) & 1, 0, "non-absorbing literal 1 must be expelled");
     }
 }
