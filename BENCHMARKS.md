@@ -86,6 +86,9 @@ bash scripts/compare.sh --parallel --native
 
 # Accuracy check (small config, Python only; Rust always runs large)
 bash scripts/compare.sh --small
+
+# Override clauses/class (e.g. 1000 = cair/tmu IMDb default of num_clauses=2000 total)
+bash scripts/compare.sh --parallel --native --clauses 1000
 ```
 
 ---

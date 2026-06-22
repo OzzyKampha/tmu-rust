@@ -172,7 +172,14 @@ def main():
                        help="Run small (NoisyXOR-scale) config only — accuracy check, fast")
     group.add_argument("--both",  action="store_true",
                        help="Run both small then large configs")
+    parser.add_argument("--clauses", type=int, default=None,
+                        help="Clauses per class for the large config (default: 10000). "
+                             "Threshold scales proportionally.")
     args = parser.parse_args()
+
+    if args.clauses is not None:
+        LARGE["n_clauses_per_cls"] = args.clauses
+        LARGE["threshold"] = max(1, 8_000 * args.clauses // 10_000)
 
     if args.small:
         run_bench(SMALL)

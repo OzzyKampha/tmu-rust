@@ -2,11 +2,13 @@
 # compare.sh — Side-by-side Rust vs Python TMU throughput benchmark.
 #
 # Usage:
-#   bash scripts/compare.sh                    # Rust sequential + Python large
-#   bash scripts/compare.sh --parallel         # also run Rust with Rayon
-#   bash scripts/compare.sh --native           # RUSTFLAGS="-C target-cpu=native"
-#   bash scripts/compare.sh --small            # Python --small (NoisyXOR-scale accuracy check)
+#   bash scripts/compare.sh                          # Rust sequential + Python large
+#   bash scripts/compare.sh --parallel               # also run Rust with Rayon
+#   bash scripts/compare.sh --native                 # RUSTFLAGS="-C target-cpu=native"
+#   bash scripts/compare.sh --small                  # Python --small (NoisyXOR-scale accuracy check)
+#   bash scripts/compare.sh --clauses 1000           # override clauses/class (default 10000)
 #   bash scripts/compare.sh --parallel --native
+#   bash scripts/compare.sh --parallel --native --clauses 1000
 #
 # Note: --small applies to the Python run only; the Rust bench_training example
 # always uses the large (IMDb-scale) config. For a small Rust accuracy check,
@@ -20,18 +22,29 @@ cd "$(dirname "$0")/.."
 PARALLEL=0
 NATIVE=0
 SMALL=0
+CLAUSES=""
 
-for arg in "$@"; do
+i=1
+while [[ $i -le $# ]]; do
+    arg="${!i}"
     case "$arg" in
         --parallel) PARALLEL=1 ;;
         --native)   NATIVE=1 ;;
         --small)    SMALL=1 ;;
+        --clauses)
+            i=$((i+1))
+            CLAUSES="${!i}" ;;
         -h|--help)
-            sed -n '2,16p' "$0"
+            sed -n '2,18p' "$0"
             exit 0 ;;
         *) echo "Unknown flag: $arg" >&2; exit 1 ;;
     esac
+    i=$((i+1))
 done
+
+# Compute threshold proportionally to clauses (T/clauses ratio kept constant).
+N_CLAUSES_VAL=${CLAUSES:-10000}
+T_VAL=$(python3 -c "print(max(1, 8000 * ${N_CLAUSES_VAL} // 10000))")
 
 # ── Rust build flags ──────────────────────────────────────────────────────────
 RUSTFLAGS_EXTRA=""
@@ -70,7 +83,7 @@ echo ""
 echo "══════════════════════════════════════════════"
 echo "  RUST  (sequential)"
 echo "══════════════════════════════════════════════"
-RUSTFLAGS="$RUSTFLAGS_EXTRA" \
+RUSTFLAGS="$RUSTFLAGS_EXTRA" N_CLAUSES="$N_CLAUSES_VAL" T="$T_VAL" \
     cargo run --release --example bench_training 2>/dev/null \
     | tee "$rust_seq_out"
 
@@ -80,7 +93,7 @@ if [[ $PARALLEL -eq 1 ]]; then
     echo "══════════════════════════════════════════════"
     echo "  RUST  (parallel, --features parallel)"
     echo "══════════════════════════════════════════════"
-    RUSTFLAGS="$RUSTFLAGS_EXTRA" \
+    RUSTFLAGS="$RUSTFLAGS_EXTRA" N_CLAUSES="$N_CLAUSES_VAL" T="$T_VAL" \
         cargo run --release --features parallel --example bench_training 2>/dev/null \
         | tee "$rust_par_out"
 fi
@@ -89,6 +102,7 @@ fi
 if [[ $PYTHON_OK -eq 1 ]]; then
     PY_ARGS=""
     [[ $SMALL -eq 1 ]] && PY_ARGS="--small"
+    [[ -n "$CLAUSES" ]] && PY_ARGS="$PY_ARGS --clauses $CLAUSES"
     echo ""
     echo "══════════════════════════════════════════════"
     echo "  PYTHON TMU  (compare_tmu.py${PY_ARGS:+ $PY_ARGS})"
@@ -131,7 +145,7 @@ fi
 echo ""
 echo "══════════════════════════════════════════════════════════════════════"
 echo "  COMPARISON SUMMARY"
-echo "  (config: 2 classes · 1000 features · 10000 clauses/class · IMDb-scale)"
+echo "  (config: 2 classes · 1000 features · ${N_CLAUSES_VAL} clauses/class · T=${T_VAL})"
 echo "══════════════════════════════════════════════════════════════════════"
 printf "  %-32s  %12s  %16s\n" "Runner" "Median ms" "Mclause-ups/s"
 echo "  ────────────────────────────────────────────────────────────────────"

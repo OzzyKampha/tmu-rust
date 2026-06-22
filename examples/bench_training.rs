@@ -20,11 +20,17 @@ use tmu_rs::{Encoder, Rng, TsetlinMachine};
 
 fn main() {
     // Matches the TMU IMDB defaults: num_clauses=10_000, T=8_000, s=2.0.
-    // Features are synthetic binary (XOR label) so no dataset download is needed.
+    // Override via env vars: N_CLAUSES=1000 T=800 cargo run --release --example bench_training
     let n_features = 1_000usize;
-    let n_clauses  = 10_000usize;
+    let n_clauses: usize = std::env::var("N_CLAUSES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
     let n_classes  = 2usize;
-    let threshold  = 8_000i32;
+    let threshold: i32 = std::env::var("T")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8_000);
     let s          = 2.0f64;
     let n_train    = 2_000usize;
     let n_warmup   = 2usize;  // discarded — warm up allocator + L3 cache
