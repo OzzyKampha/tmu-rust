@@ -4,7 +4,7 @@ A Rust port of the [cair/tmu](https://github.com/cair/tmu) Tsetlin Machine libra
 
 Implements a bit-packed, weighted multiclass Tsetlin Machine with bit-parallel and multi-threaded training, a fast booleanizer, and ports of the TMU classification demos.
 
-For a full breakdown of what has been ported and what is missing, see [PORTING_STATUS.md](PORTING_STATUS.md).
+For a full breakdown of what has been ported and what is missing, see [PORTING_STATUS.md](PORTING_STATUS.md). For a Python vs Rust throughput and accuracy comparison, see [BENCHMARKS.md](BENCHMARKS.md).
 
 ---
 
@@ -13,6 +13,8 @@ For a full breakdown of what has been ported and what is missing, see [PORTING_S
 - Bit-packed clause bank for cache-efficient inference and training
 - Weighted multiclass classification (`TMClassifier`)
 - Optional multi-threaded training via [Rayon](https://github.com/rayon-rs/rayon) (`--features parallel`)
+- AVX2 fast paths for clause update loops with runtime dispatch — u8 TA counters processed 32-wide (4× smaller working set vs u32; scalar fallback on non-AVX2 targets)
+- Type-safe `Encoder` for binary, numeric (quantile booleanization), and categorical inputs
 - Fast booleanizer for continuous-valued inputs
 - Ports of the core TMU classification demos
 
@@ -38,11 +40,13 @@ For multi-threaded training:
 cargo run --release --features parallel --example mnist
 ```
 
-For maximum performance, compile with native CPU optimizations:
+For maximum performance, compile with native CPU optimizations (enables AVX2 and other extensions at compile time):
 
 ```sh
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
+
+AVX2 fast paths are also activated at runtime automatically when the CPU supports it, even without `target-cpu=native`.
 
 ---
 
@@ -59,8 +63,14 @@ The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) multiclass 
 | `MNISTDemo` / `MNISTDemoWeightedClauses` | `mnist` | MNIST | see [Data preparation](#data-preparation) |
 | `IMDbTextCategorizationDemo` | `imdb` | Keras IMDb | see [Data preparation](#data-preparation) |
 | *(extra)* | `ndr_flows` | — | `cargo run --release --example ndr_flows` |
+| *(extra)* | `bench_training` | — | `cargo run --release --example bench_training` |
+| *(extra)* | `absorb_timing` | — | `cargo run --release --example absorb_timing` |
 
 `ndr_flows` is not part of TMU — it is a synthetic network-flow detection example demonstrating the booleanizer and interpretable rule extraction.
+
+`bench_training` measures training throughput (sequential vs parallel) at IMDB-scale clause counts using a synthetic dataset — no download required. Compare with and without `--features parallel`.
+
+`absorb_timing` trains on a synthetic XOR dataset at various `state_bits` settings and prints per-epoch accuracy alongside absorbing-state fractions.
 
 ---
 
@@ -93,11 +103,13 @@ cargo run --release --features parallel --example imdb
 
 ```
 src/
-  booleanizer.rs       # Continuous-to-binary encoder
+  encoder.rs           # Type-safe Encoder (binary / numeric / categorical)
+  booleanizer.rs       # Quantile booleanization (used by Encoder)
   clause_bank/         # Bit-packed clause storage and update logic
   models/              # TMClassifier and supporting types
   rng.rs               # Fast RNG
 examples/              # Demo programs (ports of TMU + extras)
+benches/               # Criterion throughput benchmarks
 scripts/               # Python data preparation scripts
 data/tmu/              # cair/tmu submodule (reference implementation)
 ```
