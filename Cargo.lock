@@ -475,6 +475,7 @@ version = "0.5.0"
 dependencies = [
  "criterion",
  "rayon",
+ "serde_json",
 ]
 
 [[package]]

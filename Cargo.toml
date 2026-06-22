@@ -11,6 +11,7 @@ rayon = { version = "1", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
+serde_json = "1"  # examples/sysmon_windows.rs: parse real Mordor NDJSON logs
 
 [features]
 default = []
@@ -56,6 +57,10 @@ path = "examples/ndr_flows.rs"
 [[example]]
 name = "sysmon"            # extra: Sysmon Event ID 1 -> col::val tokens (not in TMU)
 path = "examples/sysmon.rs"
+
+[[example]]
+name = "sysmon_windows"    # extra: 10-min log windows -> presence+count features (not in TMU)
+path = "examples/sysmon_windows.rs"
 
 [[example]]
 name = "absorb_timing"
