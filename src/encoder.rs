@@ -31,12 +31,34 @@ pub struct EncodedBatch {
     pub(crate) words: usize,
 }
 
+impl EncodedSample {
+    /// Build an [`EncodedSample`] from a 0/1 byte slice.
+    ///
+    /// `bits` must have exactly `n_features` elements (one per binary feature).
+    /// Use this to integrate a custom encoder without modifying this crate.
+    pub fn from_bits(bits: &[u8], n_features: usize) -> Self {
+        assert_eq!(bits.len(), n_features, "bits.len() must equal n_features");
+        let mut out = vec![0u64; words_for(2 * n_features)];
+        pack(bits, n_features, &mut out);
+        Self(out)
+    }
+}
+
 impl EncodedBatch {
     pub fn len(&self) -> usize {
         self.n
     }
     pub fn is_empty(&self) -> bool {
         self.n == 0
+    }
+
+    /// Build an [`EncodedBatch`] from a flat, row-major word array.
+    ///
+    /// `data` must have exactly `n * words` elements.
+    /// Use this to integrate a custom encoder without modifying this crate.
+    pub fn from_words(data: Vec<u64>, n: usize, words: usize) -> Self {
+        assert_eq!(data.len(), n * words, "data.len() must equal n * words");
+        Self { data, n, words }
     }
 }
 
