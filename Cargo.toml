@@ -54,6 +54,10 @@ name = "ndr_flows"         # extra: network-flow detection (not in TMU)
 path = "examples/ndr_flows.rs"
 
 [[example]]
+name = "sysmon"            # extra: Sysmon Event ID 1 -> col::val tokens (not in TMU)
+path = "examples/sysmon.rs"
+
+[[example]]
 name = "absorb_timing"
 path = "examples/absorb_timing.rs"
 

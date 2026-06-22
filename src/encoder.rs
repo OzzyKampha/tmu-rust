@@ -60,6 +60,22 @@ impl EncodedBatch {
         assert_eq!(data.len(), n * words, "data.len() must equal n * words");
         Self { data, n, words }
     }
+
+    /// Build an [`EncodedBatch`] from row-major 0/1 bit slices (one slice per sample).
+    ///
+    /// Every row must have exactly `n_features` elements; each is packed into the
+    /// TM's literal format internally. This is the simplest way to feed a custom
+    /// encoder's output to the TM — you only produce bits, never raw words.
+    pub fn from_bit_rows(rows: &[&[u8]], n_features: usize) -> Self {
+        let words = words_for(2 * n_features);
+        let n = rows.len();
+        let mut data = vec![0u64; n * words];
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.len(), n_features, "each row must have n_features elements");
+            pack(row, n_features, &mut data[i * words..(i + 1) * words]);
+        }
+        Self { data, n, words }
+    }
 }
 
 // ── encoder kind ─────────────────────────────────────────────────────────────
