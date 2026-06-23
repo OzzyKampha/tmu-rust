@@ -471,10 +471,11 @@ dependencies = [
 
 [[package]]
 name = "tmu-rs"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "criterion",
  "rayon",
+ "serde_json",
 ]
 
 [[package]]

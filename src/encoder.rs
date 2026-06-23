@@ -31,12 +31,50 @@ pub struct EncodedBatch {
     pub(crate) words: usize,
 }
 
+impl EncodedSample {
+    /// Build an [`EncodedSample`] from a 0/1 byte slice.
+    ///
+    /// `bits` must have exactly `n_features` elements (one per binary feature).
+    /// Use this to integrate a custom encoder without modifying this crate.
+    pub fn from_bits(bits: &[u8], n_features: usize) -> Self {
+        assert_eq!(bits.len(), n_features, "bits.len() must equal n_features");
+        let mut out = vec![0u64; words_for(2 * n_features)];
+        pack(bits, n_features, &mut out);
+        Self(out)
+    }
+}
+
 impl EncodedBatch {
     pub fn len(&self) -> usize {
         self.n
     }
     pub fn is_empty(&self) -> bool {
         self.n == 0
+    }
+
+    /// Build an [`EncodedBatch`] from a flat, row-major word array.
+    ///
+    /// `data` must have exactly `n * words` elements.
+    /// Use this to integrate a custom encoder without modifying this crate.
+    pub fn from_words(data: Vec<u64>, n: usize, words: usize) -> Self {
+        assert_eq!(data.len(), n * words, "data.len() must equal n * words");
+        Self { data, n, words }
+    }
+
+    /// Build an [`EncodedBatch`] from row-major 0/1 bit slices (one slice per sample).
+    ///
+    /// Every row must have exactly `n_features` elements; each is packed into the
+    /// TM's literal format internally. This is the simplest way to feed a custom
+    /// encoder's output to the TM — you only produce bits, never raw words.
+    pub fn from_bit_rows(rows: &[&[u8]], n_features: usize) -> Self {
+        let words = words_for(2 * n_features);
+        let n = rows.len();
+        let mut data = vec![0u64; n * words];
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.len(), n_features, "each row must have n_features elements");
+            pack(row, n_features, &mut data[i * words..(i + 1) * words]);
+        }
+        Self { data, n, words }
     }
 }
 

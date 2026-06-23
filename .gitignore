@@ -5,5 +5,6 @@ data/*.csv
 data/*.txt
 data/*.json
 data/*.bin
+mordor_data/
 __pycache__/
 *.pyc
