@@ -355,11 +355,13 @@ fn main() {
 
     let mut tm = TsetlinMachine::with_config(2, encoder.n_features(), 80, 50, 5.0, 8, true, 42);
     for epoch in 1..=50 {
+        let t0 = std::time::Instant::now();
         tm.fit_epoch(&train_x, &train_y);
+        let elapsed = t0.elapsed();
         if epoch % 5 == 0 || epoch == 1 {
             let tr_acc = tm.accuracy(&train_x, &train_y) * 100.0;
             let te_acc = tm.accuracy(&test_x, &test_y) * 100.0;
-            println!("epoch {epoch:>2}  train={tr_acc:.2}%  test={te_acc:.2}%");
+            println!("epoch {epoch:>2}  train={tr_acc:.2}%  test={te_acc:.2}%  ({:.1}s)", elapsed.as_secs_f32());
         }
     }
 
