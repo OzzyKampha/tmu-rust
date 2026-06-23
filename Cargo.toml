@@ -63,6 +63,10 @@ name = "sysmon_windows"    # extra: 10-min log windows -> presence+count feature
 path = "examples/sysmon_windows.rs"
 
 [[example]]
+name = "sysmon_mordor"     # extra: train on real Mordor NDJSON, all Sysmon event types (not in TMU)
+path = "examples/sysmon_mordor.rs"
+
+[[example]]
 name = "absorb_timing"
 path = "examples/absorb_timing.rs"
 
