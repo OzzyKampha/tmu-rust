@@ -75,11 +75,14 @@ const SKIP_FIELDS: &[&str] = &[
     // Non-informative metadata
     "@version",
     // High-cardinality raw strings (CommandLine handled separately)
-    "CallTrace", "Hashes",
-    // System / Winlog metadata
-    "Channel", "Computer", "Hostname", "Keywords", "Level", "Message",
+    "CallTrace", "Hashes", "Details",
+    // NXLog / Syslog pipeline metadata (not part of the Sysmon event itself)
+    "SourceModuleName", "SourceModuleType",
+    // System / Winlog / NXLog metadata
+    "Channel", "Computer", "Hostname", "host", "Keywords", "Level", "Message",
     "Opcode", "Path", "RecordID", "EventRecordID", "RecordNumber",
     "SourceName", "Task", "Version", "ProcessID",
+    "AccountName", "AccountType",
     // EventID is emitted as the first token — skip in the loop
     "EventID",
 ];
@@ -355,14 +358,17 @@ fn main() {
             .filter(|&c| tm.clause_is_positive(c))
             .filter(|&c| tm.clause_rule(class, c).iter().any(|&(_, neg)| !neg))
             .collect();
+        // Sort: most positive literals first, then has-meaningful-token, then weight
         ranked.sort_by(|&a, &b| {
+            let pa = tm.clause_rule(class, a).iter().filter(|&&(_, neg)| !neg).count();
+            let pb = tm.clause_rule(class, b).iter().filter(|&&(_, neg)| !neg).count();
             let ma = tm.clause_rule(class, a).iter().any(|&(f, neg)| {
                 !neg && meaningful_prefixes.iter().any(|p| encoder.vocab_token(f).starts_with(p))
             });
             let mb = tm.clause_rule(class, b).iter().any(|&(f, neg)| {
                 !neg && meaningful_prefixes.iter().any(|p| encoder.vocab_token(f).starts_with(p))
             });
-            mb.cmp(&ma).then(tm.clause_weight(class, b).cmp(&tm.clause_weight(class, a)))
+            pb.cmp(&pa).then(mb.cmp(&ma)).then(tm.clause_weight(class, b).cmp(&tm.clause_weight(class, a)))
         });
         for (rank, &c) in ranked.iter().take(5).enumerate() {
             let rule = tm.clause_rule(class, c);
