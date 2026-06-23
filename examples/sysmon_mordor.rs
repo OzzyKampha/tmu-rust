@@ -286,4 +286,28 @@ fn main() {
         .filter(|&b| { let t = encoder.vocab_token(b); t.contains("<UNK>") || t.contains("<OOV>") })
         .count();
     println!("  … plus {n_sentinel} <UNK>/<OOV> sentinels");
+
+    // Print the positive attack rule with the most affirmative (non-negated) literals.
+    println!("\n--- top attack rule (class 1) ---");
+    let best = (0..tm.clauses_per_class())
+        .filter(|&c| tm.clause_is_positive(c))
+        .filter(|&c| tm.clause_rule(1, c).iter().any(|&(_, neg)| !neg))
+        .max_by_key(|&c| {
+            let rule = tm.clause_rule(1, c);
+            let pos = rule.iter().filter(|&&(_, neg)| !neg).count();
+            (pos, tm.clause_weight(1, c))
+        });
+    if let Some(c) = best {
+        let rule = tm.clause_rule(1, c);
+        let w = tm.clause_weight(1, c);
+        let pos: Vec<_> = rule.iter().filter(|&&(_, neg)| !neg).collect();
+        let neg_count = rule.len() - pos.len();
+        println!("  clause {c}  weight={w}");
+        for &(feat, _) in &pos {
+            println!("    AND {}", encoder.vocab_token(*feat));
+        }
+        if neg_count > 0 {
+            println!("    (+ {neg_count} NOT literals)");
+        }
+    }
 }
