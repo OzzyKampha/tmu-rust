@@ -23,7 +23,7 @@
 mod shared;
 use shared::{basename, hive_of};
 
-use std::{fs, path::Path};
+use std::{collections::HashSet, fs, path::Path};
 use tmu_rs::{Encoder, Rng, TsetlinMachine};
 
 // ── dataset URLs ───────────────────────────────────────────────────────────────
@@ -384,6 +384,52 @@ fn main() {
                 String::new()
             };
             println!("  [{}] w={}  {}{}", rank + 1, w, literals.join("  "), neg_suffix);
+        }
+    }
+
+    // Per-sample clause explanation: pick first test sample of each class and show
+    // which positive clauses actually fired on it (all their literals were satisfied).
+    for (class, label) in [(1usize, "attack"), (0, "benign")] {
+        let Some(idx) = test_y.iter().position(|&y| y == class) else { continue };
+        let tokens: &[String] = test_tokens[idx];
+        let token_set: HashSet<&str> = tokens.iter().map(String::as_str).collect();
+
+        let sample = encoder.encode_one_categorical(&te_inner[idx]);
+        let pred = tm.predict(&sample);
+        let verdict = if pred == class { "correct" } else { "WRONG" };
+
+        println!("\n--- {} sample explanation (pred={}, {}) ---", label, pred, verdict);
+        let mut sorted_toks: Vec<&str> = token_set.iter().cloned().collect();
+        sorted_toks.sort();
+        println!("  tokens: {}", sorted_toks.join("  "));
+
+        let mut firing: Vec<(i32, Vec<String>)> = vec![];
+        for c in 0..tm.clauses_per_class() {
+            if !tm.clause_is_positive(c) { continue; }
+            let rule = tm.clause_rule(class, c);
+            if rule.is_empty() { continue; }
+            let fires = rule.iter().all(|&(feat, is_neg)| {
+                let present = token_set.contains(encoder.vocab_token(feat));
+                if is_neg { !present } else { present }
+            });
+            if fires {
+                let pos_lits: Vec<String> = rule.iter()
+                    .filter(|&&(_, neg)| !neg)
+                    .map(|&(f, _)| encoder.vocab_token(f).to_string())
+                    .collect();
+                if pos_lits.is_empty() { continue; } // all-NOT clauses aren't interpretable
+                firing.push((tm.clause_weight(class, c), pos_lits));
+            }
+        }
+        firing.sort_by(|a, b| b.0.cmp(&a.0));
+
+        if firing.is_empty() {
+            println!("  (no positive clauses fired)");
+        } else {
+            println!("  top firing clauses ({} total):", firing.len());
+            for (w, lits) in firing.iter().take(5) {
+                println!("    w={}  {}", w, lits.join("  "));
+            }
         }
     }
 }
