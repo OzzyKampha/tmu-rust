@@ -3,8 +3,8 @@
 //!
 //! ## What this does
 //!
-//! 1. Downloads four Mordor execution traces from GitHub into `mordor_data/`
-//!    (skipped if already present).
+//! 1. Discovers all Mordor host datasets via the GitHub Contents API (8 ATT&CK tactics)
+//!    and downloads any not yet in `mordor_data/` (skipped per-file if already present).
 //! 2. Parses every Sysmon event into ECS-named `col::val` tokens. Every field in the
 //!    JSON is included (except high-cardinality noise like GUIDs/PIDs/timestamps).
 //!    Paths → basename + `file.path::<dir>` location tokens.
@@ -12,7 +12,7 @@
 //! 3. Labels each event using a within-trace heuristic: primary image in ATTACK_PROCS
 //!    → label 1; background OS processes → label 0.
 //! 4. Shuffles, 80/20 train/test split, trains a TM, reports accuracy every 5 epochs.
-//! 5. Prints the vocabulary and the top attack rule.
+//! 5. Prints the vocabulary, top attack/benign rules, and per-sample clause explanations.
 //!
 //! ## Run
 //! ```text
@@ -26,36 +26,35 @@ use shared::{basename, hive_of};
 use std::{collections::HashSet, fs, path::Path};
 use tmu_rs::{Encoder, Rng, TsetlinMachine};
 
-// ── dataset URLs ───────────────────────────────────────────────────────────────
-
-const DATASETS: &[(&str, &str)] = &[
-    (
-        "empire_launcher_vbs",
-        "https://raw.githubusercontent.com/OTRF/Security-Datasets/master/datasets/atomic/windows/execution/host/empire_launcher_vbs.zip",
-    ),
-    (
-        "cmd_sharpview_pcre_net",
-        "https://raw.githubusercontent.com/OTRF/Security-Datasets/master/datasets/atomic/windows/execution/host/cmd_sharpview_pcre_net.zip",
-    ),
-    (
-        "psh_powershell_httplistener",
-        "https://raw.githubusercontent.com/OTRF/Security-Datasets/master/datasets/atomic/windows/execution/host/psh_powershell_httplistener.zip",
-    ),
-    (
-        "psh_python_webserver",
-        "https://raw.githubusercontent.com/OTRF/Security-Datasets/master/datasets/atomic/windows/execution/host/psh_python_webserver.zip",
-    ),
-];
+// ── dataset discovery ─────────────────────────────────────────────────────────
 
 const DATA_DIR: &str = "mordor_data";
+
+const TACTIC_DIRS: &[&str] = &[
+    "execution", "credential_access", "defense_evasion", "discovery",
+    "lateral_movement", "persistence", "privilege_escalation", "collection",
+];
 
 // ── attack heuristic ──────────────────────────────────────────────────────────
 
 const ATTACK_PROCS: &[&str] = &[
-    "SharpView.exe", "powershell.exe", "netsh.exe",
-    "wscript.exe",   "python.exe",     "whoami.exe",
-    "cmd.exe",       "mshta.exe",      "vbc.exe",
-    "vbscript.dll",
+    // Execution
+    "SharpView.exe", "powershell.exe", "netsh.exe", "wscript.exe",
+    "python.exe",    "whoami.exe",     "cmd.exe",   "mshta.exe",
+    "vbc.exe",       "vbscript.dll",
+    // Credential access
+    "mimikatz.exe",   "mimilib.dll",    "Rubeus.exe",     "kekeo.exe",
+    "SharpDPAPI.exe", "SharpDump.exe",  "procdump.exe",   "procdump64.exe",
+    "wce.exe",        "fgdump.exe",
+    // Defense evasion / execution via LOLBins rarely seen in benign traces
+    "regsvcs.exe",  "regasm.exe",  "msbuild.exe", "cmstp.exe",
+    "odbcconf.exe", "cscript.exe", "msiexec.exe",
+    // Lateral movement
+    "PsExec.exe", "PsExec64.exe", "psexesvc.exe", "wmic.exe",
+    // Persistence helpers
+    "schtasks.exe", "at.exe",
+    // C2 / misc
+    "ncat.exe", "nc.exe", "nmap.exe",
 ];
 
 // ── field skip list (GUIDs, PIDs, timestamps, raw hashes, stack traces) ───────
@@ -238,43 +237,77 @@ fn parse_file(path: &str) -> std::io::Result<Vec<(Vec<String>, usize)>> {
     Ok(events)
 }
 
-// ── download + unzip ───────────────────────────────────────────────────────────
+// ── dynamic discovery + download ──────────────────────────────────────────────
 
-fn ensure_datasets() {
-    if Path::new(DATA_DIR).exists() {
-        println!("mordor_data/ already present — skipping download");
-        return;
-    }
+fn discover_and_download() {
     fs::create_dir_all(DATA_DIR).expect("could not create mordor_data/");
-    for (name, url) in DATASETS {
-        print!("downloading {name}… ");
-        let zip = format!("{DATA_DIR}/{name}.zip");
-        let status = std::process::Command::new("curl")
-            .args(["-sL", "--max-time", "60", "-o", &zip, url])
-            .status()
+    for tactic in TACTIC_DIRS {
+        let api_url = format!(
+            "https://api.github.com/repos/OTRF/Security-Datasets/contents/datasets/atomic/windows/{tactic}/host"
+        );
+        let out = std::process::Command::new("curl")
+            .args(["-sL", "--max-time", "30",
+                   "-H", "User-Agent: sysmon-mordor/1.0",
+                   &api_url])
+            .output()
             .expect("curl not available");
-        if !status.success() {
-            eprintln!("WARN: download failed for {name}, skipping");
+        let Ok(text) = std::str::from_utf8(&out.stdout) else { continue };
+        let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(text) else {
+            eprintln!("  WARN: GitHub API error for {tactic} (rate-limited or no network)");
             continue;
+        };
+        for entry in &entries {
+            let name = entry["name"].as_str().unwrap_or("");
+            if !name.ends_with(".zip") { continue; }
+            let stem = name.trim_end_matches(".zip");
+            let url  = entry["download_url"].as_str().unwrap_or("");
+            if url.is_empty() { continue; }
+
+            let zip_path = format!("{DATA_DIR}/{stem}.zip");
+            if Path::new(&zip_path).exists() { continue; }
+
+            print!("  [{tactic}] {stem}… ");
+            let status = std::process::Command::new("curl")
+                .args(["-sL", "--max-time", "120", "-o", &zip_path, url])
+                .status().expect("curl not available");
+            if !status.success() { eprintln!("WARN: download failed"); continue; }
+            let status = std::process::Command::new("unzip")
+                .args(["-o", &zip_path, "-d", DATA_DIR])
+                .status().expect("unzip not available");
+            if status.success() { println!("ok"); } else { eprintln!("WARN: unzip failed"); }
         }
-        let status = std::process::Command::new("unzip")
-            .args(["-o", &zip, "-d", DATA_DIR])
-            .status()
-            .expect("unzip not available");
-        if status.success() { println!("ok"); } else { eprintln!("WARN: unzip failed for {name}"); }
+    }
+}
+
+// ── recursive JSON file collection ────────────────────────────────────────────
+
+fn collect_json_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // skip macOS resource-fork artifact directories
+            if path.file_name().and_then(|n| n.to_str()) == Some("__MACOSX") { continue; }
+            collect_json_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            // skip macOS resource-fork files (start with "._")
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.starts_with("._") { out.push(path); }
+        }
     }
 }
 
 // ── main ───────────────────────────────────────────────────────────────────────
 
 fn main() {
-    ensure_datasets();
+    discover_and_download();
+
+    let mut json_files = Vec::new();
+    collect_json_files(Path::new(DATA_DIR), &mut json_files);
+    json_files.sort();
 
     let mut all_events: Vec<(Vec<String>, usize)> = Vec::new();
-    for entry in fs::read_dir(DATA_DIR).expect("mordor_data/ not found") {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
+    for path in &json_files {
         match parse_file(path.to_str().unwrap()) {
             Ok(evs) => {
                 println!("  {} → {} Sysmon events", path.file_name().unwrap().to_str().unwrap(), evs.len());
