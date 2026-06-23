@@ -5,38 +5,28 @@
 //!
 //! 1. Downloads four Mordor execution traces from GitHub into `mordor_data/`
 //!    (skipped if already present).
-//! 2. Parses every Sysmon event (EventIDs 1,3,5,7,9,10,11,12,13,17,18,22,23)
-//!    into `col::val` tokens. Each event type emits its own fields as columns,
-//!    e.g. `EventID::10`, `SourceImage::powershell.exe`, `TargetImage::lsass.exe`,
-//!    `GrantedAccess::0x1010`.
-//! 3. Labels each event using a **within-trace heuristic**: if the primary image
-//!    (Image / SourceImage) is a known attack tool → label 1 (attack);
-//!    otherwise the event is a background OS event → label 0 (benign).
-//!    Both classes come from real Mordor data — no synthetic events.
+//! 2. Parses every Sysmon event into ECS-named `col::val` tokens. Every field in the
+//!    JSON is included (except high-cardinality noise like GUIDs/PIDs/timestamps).
+//!    Paths → basename + `file.path::<dir>` location tokens.
+//!    CommandLine/ParentCommandLine → word-level `process.args::<token>` tokens.
+//! 3. Labels each event using a within-trace heuristic: primary image in ATTACK_PROCS
+//!    → label 1; background OS processes → label 0.
 //! 4. Shuffles, 80/20 train/test split, trains a TM, reports accuracy every 5 epochs.
-//! 5. Prints the full vocabulary so you can see which `col::val` features the TM
-//!    learned.
+//! 5. Prints the vocabulary and the top attack rule.
 //!
 //! ## Run
 //! ```text
 //! cargo run --release --example sysmon_mordor
 //! ```
-//!
-//! ## Note on labeling
-//!
-//! Mordor datasets are labeled at the file level (the whole trace is one attack
-//! scenario). Within each trace, events from known attack-tool processes
-//! (powershell.exe, SharpView.exe, etc.) are labeled 1; background OS events
-//! (svchost.exe, lsass.exe, Explorer.EXE, etc.) are labeled 0.
 
 #[path = "sysmon_shared.rs"]
 mod shared;
-use shared::{basename, hive_of, parent_dir};
+use shared::{basename, hive_of};
 
 use std::{fs, path::Path};
 use tmu_rs::{Encoder, Rng, TsetlinMachine};
 
-// ── dataset URLs (OTRF Security-Datasets, execution/host) ──────────────────────
+// ── dataset URLs ───────────────────────────────────────────────────────────────
 
 const DATASETS: &[(&str, &str)] = &[
     (
@@ -59,19 +49,191 @@ const DATASETS: &[(&str, &str)] = &[
 
 const DATA_DIR: &str = "mordor_data";
 
-// Known attack-tool process basenames (case-insensitive).
+// ── attack heuristic ──────────────────────────────────────────────────────────
+
 const ATTACK_PROCS: &[&str] = &[
-    "SharpView.exe",
-    "powershell.exe",
-    "netsh.exe",
-    "wscript.exe",
-    "python.exe",
-    "whoami.exe",
-    "cmd.exe",
-    "mshta.exe",
-    "vbc.exe",
+    "SharpView.exe", "powershell.exe", "netsh.exe",
+    "wscript.exe",   "python.exe",     "whoami.exe",
+    "cmd.exe",       "mshta.exe",      "vbc.exe",
     "vbscript.dll",
 ];
+
+// ── field skip list (GUIDs, PIDs, timestamps, raw hashes, stack traces) ───────
+
+const SKIP_FIELDS: &[&str] = &[
+    // GUIDs
+    "ProcessGuid", "ParentProcessGuid", "SourceProcessGUID", "TargetProcessGUID",
+    "LogonGuid", "ProviderGuid",
+    // Process / thread / session IDs
+    "ProcessId", "ParentProcessId", "SourceProcessId", "TargetProcessId",
+    "SourceThreadId", "ThreadID", "ExecutionProcessID", "LogonId", "TerminalSessionId",
+    // Ephemeral port numbers (source/high ports change per connection)
+    "SourcePort", "SourcePortName", "port",
+    // Timestamps
+    "@timestamp", "UtcTime", "TimeCreated", "SystemTime", "EventTime",
+    "EventReceivedTime", "CreationUtcTime", "ParentCreationUtcTime",
+    // Non-informative metadata
+    "@version",
+    // High-cardinality raw strings (CommandLine handled separately)
+    "CallTrace", "Hashes",
+    // System / Winlog metadata
+    "Channel", "Computer", "Hostname", "Keywords", "Level", "Message",
+    "Opcode", "Path", "RecordID", "EventRecordID", "RecordNumber",
+    "SourceName", "Task", "Version", "ProcessID",
+    // EventID is emitted as the first token — skip in the loop
+    "EventID",
+];
+
+const REGISTRY_HIVES: &[&str] = &[
+    "HKLM\\", "HKCU\\", "HKU\\", "HKCR\\", "HKCC\\",
+    "HKEY_LOCAL_MACHINE\\", "HKEY_CURRENT_USER\\",
+    "HKEY_USERS\\", "HKEY_CLASSES_ROOT\\",
+];
+
+// ── ECS field-name mapping ────────────────────────────────────────────────────
+
+fn to_ecs_field(sysmon: &str) -> &str {
+    match sysmon {
+        "Image"               => "process.name",
+        "ParentImage"         => "process.parent.name",
+        "User"                => "user.name",
+        "IntegrityLevel"      => "process.integrity_level",
+        "Company"             => "process.pe.company",
+        "Signed"              => "process.code_signature.exists",
+        "SignatureStatus"     => "process.code_signature.status",
+        "OriginalFileName"    => "process.pe.original_file_name",
+        "Description"         => "process.pe.description",
+        "Product"             => "process.pe.product",
+        "FileVersion"         => "process.pe.file_version",
+        "CurrentDirectory"    => "process.working_directory",
+        "SourceImage"         => "source.process.name",
+        "TargetImage"         => "target.process.name",
+        "GrantedAccess"       => "target.process.granted_access",
+        "ImageLoaded"         => "dll.name",
+        "DestinationPort"     => "destination.port",
+        "DestinationHostname" => "destination.hostname",
+        "DestinationPortName" => "destination.service",
+        "Protocol"            => "network.transport",
+        "Initiated"           => "network.direction",
+        "TargetFilename"      => "file.name",
+        "TargetObject"        => "registry.path",
+        "PipeName"            => "pipe.name",
+        "QueryName"           => "dns.question.name",
+        "QueryStatus"         => "dns.response_code",
+        "IsExecutable"        => "file.executable",
+        "EventType"           => "event.action",
+        "Device"              => "device.id",
+        "Archived"            => "file.archived",
+        other                 => other,
+    }
+}
+
+// ── path → `file.path::<category>` tokens ────────────────────────────────────
+
+const PATH_LOCATIONS: &[(&str, &str)] = &[
+    ("\\temp\\",        "Temp"),
+    ("/tmp/",           "Temp"),
+    ("\\users\\",       "Users"),
+    ("\\appdata\\",     "AppData"),
+    ("\\roaming\\",     "Roaming"),
+    ("\\local\\",       "LocalAppData"),
+    ("\\desktop\\",     "Desktop"),
+    ("\\downloads\\",   "Downloads"),
+    ("\\startup\\",     "Startup"),
+    ("\\system32\\",    "System32"),
+    ("\\syswow64\\",    "SysWow64"),
+    ("\\programdata\\", "ProgramData"),
+    ("\\public\\",      "Public"),
+];
+
+fn file_path_tokens(path: &str) -> Vec<String> {
+    let lower = path.to_lowercase();
+    PATH_LOCATIONS.iter()
+        .filter(|(seg, _)| lower.contains(seg))
+        .map(|(_, cat)| format!("file.path::{cat}"))
+        .collect()
+}
+
+// ── CommandLine → word-level tokens ──────────────────────────────────────────
+
+fn cmd_tokens(cmdline: &str) -> Vec<String> {
+    cmdline
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, ',' | ';' | '|' | '&' | '(' | ')' | '"' | '\'' | '`')
+        })
+        .map(|tok| tok.to_lowercase())
+        .filter(|tok| tok.len() >= 3 && !tok.chars().all(|c| c.is_ascii_hexdigit()))
+        .collect()
+}
+
+// ── per-event tokenizer (all fields, ECS names) ───────────────────────────────
+
+fn event_to_tokens(v: &serde_json::Value, eid: u32) -> Vec<String> {
+    let mut t = vec![format!("event.id::{eid}")];
+    let Some(obj) = v.as_object() else { return t };
+
+    for (key, val) in obj {
+        if SKIP_FIELDS.contains(&key.as_str()) { continue; }
+
+        // CommandLine fields → word-level tokens with ECS process.args prefix.
+        if key == "CommandLine" {
+            if let Some(s) = val.as_str() {
+                for tok in cmd_tokens(s) { t.push(format!("process.args::{tok}")); }
+            }
+            continue;
+        }
+        if key == "ParentCommandLine" {
+            if let Some(s) = val.as_str() {
+                for tok in cmd_tokens(s) { t.push(format!("process.parent.args::{tok}")); }
+            }
+            continue;
+        }
+
+        let s = match val {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b)   => b.to_string(),
+            _                            => continue,
+        };
+        if s.is_empty() { continue; }
+
+        let ecs = to_ecs_field(key);
+        if REGISTRY_HIVES.iter().any(|h| s.starts_with(h)) {
+            t.push(format!("{}::{}", ecs, hive_of(&s)));
+        } else if s.contains('\\') || s.contains('/') {
+            t.push(format!("{}::{}", ecs, basename(&s)));
+            t.extend(file_path_tokens(&s));
+        } else {
+            t.push(format!("{}::{}", ecs, s));
+        }
+    }
+    t
+}
+
+// ── labeling heuristic ────────────────────────────────────────────────────────
+
+fn is_attack(v: &serde_json::Value, eid: u32) -> bool {
+    let img_field = if eid == 10 { "SourceImage" } else { "Image" };
+    let base = basename(v[img_field].as_str().unwrap_or(""));
+    ATTACK_PROCS.iter().any(|p| base.eq_ignore_ascii_case(p))
+}
+
+// ── parse one NDJSON file ──────────────────────────────────────────────────────
+
+fn parse_file(path: &str) -> std::io::Result<Vec<(Vec<String>, usize)>> {
+    let text = fs::read_to_string(path)?;
+    let mut events = Vec::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if !v["Channel"].as_str().unwrap_or("").starts_with("Microsoft-Windows-Sysmon") {
+            continue;
+        }
+        let eid = v["EventID"].as_u64().unwrap_or(0) as u32;
+        let label = usize::from(is_attack(&v, eid));
+        events.push((event_to_tokens(&v, eid), label));
+    }
+    Ok(events)
+}
 
 // ── download + unzip ───────────────────────────────────────────────────────────
 
@@ -96,108 +258,8 @@ fn ensure_datasets() {
             .args(["-o", &zip, "-d", DATA_DIR])
             .status()
             .expect("unzip not available");
-        if status.success() {
-            println!("ok");
-        } else {
-            eprintln!("WARN: unzip failed for {name}");
-        }
+        if status.success() { println!("ok"); } else { eprintln!("WARN: unzip failed for {name}"); }
     }
-}
-
-// ── labeling heuristic ────────────────────────────────────────────────────────
-
-fn is_attack(v: &serde_json::Value, eid: u32) -> bool {
-    let img_field = if eid == 10 { "SourceImage" } else { "Image" };
-    let base = basename(v[img_field].as_str().unwrap_or(""));
-    ATTACK_PROCS.iter().any(|p| base.eq_ignore_ascii_case(p))
-}
-
-// ── per-event tokenizer ────────────────────────────────────────────────────────
-
-fn event_to_tokens(v: &serde_json::Value, eid: u32) -> Vec<String> {
-    let mut t = vec![format!("EventID::{eid}")];
-    let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
-
-    macro_rules! push {
-        ($col:expr, $val:expr) => {{
-            let v: String = $val;
-            if !v.is_empty() { t.push(format!("{}::{}", $col, v)); }
-        }};
-    }
-
-    match eid {
-        1 => {
-            push!("Image",          basename(&s("Image")));
-            push!("ParentImage",    basename(&s("ParentImage")));
-            push!("User",           s("User"));
-            push!("IntegrityLevel", s("IntegrityLevel"));
-            push!("Company",        s("Company"));
-            push!("Signed",         s("Signed"));
-        }
-        3 => {
-            push!("Image",           basename(&s("Image")));
-            push!("DestinationPort", s("DestinationPort"));
-            push!("Protocol",        s("Protocol"));
-            push!("Initiated",       s("Initiated"));
-        }
-        5 => {
-            push!("Image", basename(&s("Image")));
-        }
-        7 => {
-            push!("Image",       basename(&s("Image")));
-            push!("ImageLoaded", basename(&s("ImageLoaded")));
-            push!("Signed",      s("Signed"));
-            push!("Company",     s("Company"));
-        }
-        9 => {
-            push!("Image",  basename(&s("Image")));
-            push!("Device", s("Device"));
-        }
-        10 => {
-            push!("SourceImage",   basename(&s("SourceImage")));
-            push!("TargetImage",   basename(&s("TargetImage")));
-            push!("GrantedAccess", s("GrantedAccess"));
-        }
-        11 => {
-            push!("Image",          basename(&s("Image")));
-            push!("TargetFilename", parent_dir(&s("TargetFilename")));
-        }
-        12 | 13 => {
-            push!("Image",        basename(&s("Image")));
-            push!("TargetObject", hive_of(&s("TargetObject")));
-        }
-        17 | 18 => {
-            push!("Image",    basename(&s("Image")));
-            push!("PipeName", s("PipeName"));
-        }
-        22 => {
-            push!("Image",     basename(&s("Image")));
-            push!("QueryName", s("QueryName"));
-        }
-        23 => {
-            push!("Image",          basename(&s("Image")));
-            push!("TargetFilename", parent_dir(&s("TargetFilename")));
-        }
-        _ => {}
-    }
-    t
-}
-
-// ── parse one NDJSON file into (tokens, label) pairs ──────────────────────────
-
-fn parse_file(path: &str) -> std::io::Result<Vec<(Vec<String>, usize)>> {
-    let text = fs::read_to_string(path)?;
-    let mut events = Vec::new();
-    for line in text.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        if !v["Channel"].as_str().unwrap_or("").starts_with("Microsoft-Windows-Sysmon") {
-            continue;
-        }
-        let eid = v["EventID"].as_u64().unwrap_or(0) as u32;
-        let label = usize::from(is_attack(&v, eid));
-        events.push((event_to_tokens(&v, eid), label));
-    }
-    Ok(events)
 }
 
 // ── main ───────────────────────────────────────────────────────────────────────
@@ -205,14 +267,11 @@ fn parse_file(path: &str) -> std::io::Result<Vec<(Vec<String>, usize)>> {
 fn main() {
     ensure_datasets();
 
-    // Collect all Sysmon events with heuristic labels from real traces.
     let mut all_events: Vec<(Vec<String>, usize)> = Vec::new();
     for entry in fs::read_dir(DATA_DIR).expect("mordor_data/ not found") {
         let entry = entry.unwrap();
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
+        if path.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
         match parse_file(path.to_str().unwrap()) {
             Ok(evs) => {
                 println!("  {} → {} Sysmon events", path.file_name().unwrap().to_str().unwrap(), evs.len());
@@ -244,26 +303,20 @@ fn main() {
     let (train_tokens, train_y): (Vec<_>, Vec<_>) = train_all.iter().map(|(t, y)| (t, *y)).unzip();
     let (test_tokens,  test_y):  (Vec<_>, Vec<_>) = test_all.iter().map(|(t, y)| (t, *y)).unzip();
 
-    // Build &[&[&str]] references required by the categorical encoder.
     let tr_inner: Vec<Vec<&str>> = train_tokens.iter().map(|t| t.iter().map(String::as_str).collect()).collect();
-    let tr_refs: Vec<&[&str]> = tr_inner.iter().map(|v| v.as_slice()).collect();
-
+    let tr_refs: Vec<&[&str]>   = tr_inner.iter().map(|v| v.as_slice()).collect();
     let te_inner: Vec<Vec<&str>> = test_tokens.iter().map(|t| t.iter().map(String::as_str).collect()).collect();
-    let te_refs: Vec<&[&str]> = te_inner.iter().map(|v| v.as_slice()).collect();
+    let te_refs: Vec<&[&str]>   = te_inner.iter().map(|v| v.as_slice()).collect();
 
-    // Fit categorical encoder on training set.
     let encoder = Encoder::fit_categorical(&tr_refs);
     println!(
-        "train={} test={} | vocabulary: {} col::val features\n",
-        tr_refs.len(),
-        te_refs.len(),
-        encoder.n_features(),
+        "train={} test={} | vocabulary: {} ECS features\n",
+        tr_refs.len(), te_refs.len(), encoder.n_features(),
     );
 
     let train_x = encoder.encode_batch_categorical(&tr_refs);
     let test_x  = encoder.encode_batch_categorical(&te_refs);
 
-    // Train.
     let mut tm = TsetlinMachine::with_config(2, encoder.n_features(), 80, 50, 5.0, 8, true, 42);
     for epoch in 1..=50 {
         tm.fit_epoch(&train_x, &train_y);
@@ -287,27 +340,43 @@ fn main() {
         .count();
     println!("  … plus {n_sentinel} <UNK>/<OOV> sentinels");
 
-    // Print the positive attack rule with the most affirmative (non-negated) literals.
-    println!("\n--- top attack rule (class 1) ---");
-    let best = (0..tm.clauses_per_class())
+    // Top-5 attack rules: positive class-1 clauses ranked by weight.
+    // Prefer clauses that reference process/args/file tokens (more interpretable).
+    println!("\n--- top attack rules (class 1, by weight) ---");
+    let meaningful_prefixes = [
+        "process.name", "process.args", "process.parent",
+        "dll.name", "file.name", "file.path",
+        "target.process", "source.process",
+        "dns.question", "destination.",
+    ];
+    let is_meaningful = |feat: usize| {
+        let tok = encoder.vocab_token(feat);
+        meaningful_prefixes.iter().any(|p| tok.starts_with(p))
+    };
+
+    let mut ranked: Vec<usize> = (0..tm.clauses_per_class())
         .filter(|&c| tm.clause_is_positive(c))
         .filter(|&c| tm.clause_rule(1, c).iter().any(|&(_, neg)| !neg))
-        .max_by_key(|&c| {
-            let rule = tm.clause_rule(1, c);
-            let pos = rule.iter().filter(|&&(_, neg)| !neg).count();
-            (pos, tm.clause_weight(1, c))
-        });
-    if let Some(c) = best {
+        .collect();
+    // Sort by (has_meaningful_token DESC, weight DESC)
+    ranked.sort_by(|&a, &b| {
+        let ma = tm.clause_rule(1, a).iter().any(|&(f, neg)| !neg && is_meaningful(f));
+        let mb = tm.clause_rule(1, b).iter().any(|&(f, neg)| !neg && is_meaningful(f));
+        mb.cmp(&ma).then(tm.clause_weight(1, b).cmp(&tm.clause_weight(1, a)))
+    });
+
+    for (rank, &c) in ranked.iter().take(5).enumerate() {
         let rule = tm.clause_rule(1, c);
         let w = tm.clause_weight(1, c);
         let pos: Vec<_> = rule.iter().filter(|&&(_, neg)| !neg).collect();
         let neg_count = rule.len() - pos.len();
-        println!("  clause {c}  weight={w}");
+        println!("  [{}] clause {}  weight={}", rank + 1, c, w);
         for &(feat, _) in &pos {
             println!("    AND {}", encoder.vocab_token(*feat));
         }
         if neg_count > 0 {
             println!("    (+ {neg_count} NOT literals)");
         }
+        println!();
     }
 }
