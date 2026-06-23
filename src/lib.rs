@@ -23,13 +23,13 @@
 //! ```
 
 mod booleanizer;
-mod rng;
 pub(crate) mod clause_bank;
+pub mod data;
 pub mod encoder;
 pub mod models;
-pub mod data;
+mod rng;
 
 pub use booleanizer::Booleanizer;
 pub use encoder::{EncodedBatch, EncodedSample, Encoder};
-pub use rng::Rng;
 pub use models::TsetlinMachine;
+pub use rng::Rng;
