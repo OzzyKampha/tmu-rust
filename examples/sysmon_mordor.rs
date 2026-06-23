@@ -387,23 +387,13 @@ fn main() {
         }
     }
 
-    // Per-sample clause explanation: pick first test sample of each class and show
-    // which positive clauses actually fired on it (all their literals were satisfied).
-    for (class, label) in [(1usize, "attack"), (0, "benign")] {
-        let Some(idx) = test_y.iter().position(|&y| y == class) else { continue };
-        let tokens: &[String] = test_tokens[idx];
-        let token_set: HashSet<&str> = tokens.iter().map(String::as_str).collect();
-
-        let sample = encoder.encode_one_categorical(&te_inner[idx]);
-        let pred = tm.predict(&sample);
-        let verdict = if pred == class { "correct" } else { "WRONG" };
-
-        println!("\n--- {} sample explanation (pred={}, {}) ---", label, pred, verdict);
-        let mut sorted_toks: Vec<&str> = token_set.iter().cloned().collect();
-        sorted_toks.sort();
-        println!("  tokens: {}", sorted_toks.join("  "));
-
-        let mut firing: Vec<(i32, Vec<String>)> = vec![];
+    // Per-sample clause explanation.
+    // For each class: (a) pick the first correct test sample and show its top firing
+    // clauses by weight; (b) search all test samples of that class for the one whose
+    // best multi-literal (≥2 positive literals) firing clause has the most literals.
+    let firing_clauses = |class: usize, toks: &[String]| -> Vec<(i32, Vec<String>)> {
+        let token_set: HashSet<&str> = toks.iter().map(String::as_str).collect();
+        let mut out: Vec<(i32, Vec<String>)> = vec![];
         for c in 0..tm.clauses_per_class() {
             if !tm.clause_is_positive(c) { continue; }
             let rule = tm.clause_rule(class, c);
@@ -417,12 +407,38 @@ fn main() {
                     .filter(|&&(_, neg)| !neg)
                     .map(|&(f, _)| encoder.vocab_token(f).to_string())
                     .collect();
-                if pos_lits.is_empty() { continue; } // all-NOT clauses aren't interpretable
-                firing.push((tm.clause_weight(class, c), pos_lits));
+                if pos_lits.is_empty() { continue; }
+                out.push((tm.clause_weight(class, c), pos_lits));
             }
         }
-        firing.sort_by(|a, b| b.0.cmp(&a.0));
+        out.sort_by(|a, b| b.0.cmp(&a.0));
+        out
+    };
 
+    for (class, label) in [(1usize, "attack"), (0, "benign")] {
+        // Representative sample: first correct prediction for this class
+        let Some(idx) = test_y.iter().enumerate()
+            .filter(|&(i, &y)| {
+                if y != class { return false; }
+                let s = encoder.encode_one_categorical(&te_inner[i]);
+                tm.predict(&s) == class
+            })
+            .map(|(i, _)| i)
+            .next()
+        else { continue };
+
+        let tokens: &[String] = test_tokens[idx];
+        let token_set: HashSet<&str> = tokens.iter().map(String::as_str).collect();
+        let sample = encoder.encode_one_categorical(&te_inner[idx]);
+        let pred = tm.predict(&sample);
+        let verdict = if pred == class { "correct" } else { "WRONG" };
+
+        println!("\n--- {} sample explanation (pred={}, {}) ---", label, pred, verdict);
+        let mut sorted_toks: Vec<&str> = token_set.iter().cloned().collect();
+        sorted_toks.sort();
+        println!("  tokens: {}", sorted_toks.join("  "));
+
+        let firing = firing_clauses(class, tokens);
         if firing.is_empty() {
             println!("  (no positive clauses fired)");
         } else {
@@ -430,6 +446,23 @@ fn main() {
             for (w, lits) in firing.iter().take(5) {
                 println!("    w={}  {}", w, lits.join("  "));
             }
+        }
+
+        // Find the test sample (same class) whose best multi-literal firing clause
+        // has the most positive literals.
+        let best_multi = test_y.iter().enumerate()
+            .filter(|&(_, &y)| y == class)
+            .filter_map(|(i, _)| {
+                firing_clauses(class, test_tokens[i])
+                    .into_iter()
+                    .filter(|(_, l)| l.len() >= 2)
+                    .max_by_key(|(_, l)| l.len())
+            })
+            .max_by_key(|(_, l)| l.len());
+
+        if let Some((w, lits)) = best_multi {
+            println!("  richest AND clause across all {} test samples:", label);
+            println!("    w={}  {}", w, lits.join("  "));
         }
     }
 }
