@@ -8,6 +8,43 @@ For a full breakdown of what has been ported and what is missing, see [PORTING_S
 
 ---
 
+## Use as a library dependency
+
+Add to your project's `Cargo.toml`:
+
+```toml
+[dependencies]
+tmu-rs = { git = "https://github.com/ozzykampha/tmu-rust" }
+
+# Optional: pin to a specific tag for reproducible builds
+# tmu-rs = { git = "https://github.com/ozzykampha/tmu-rust", tag = "v0.7.0" }
+
+# Optional: enable multi-threaded training
+# tmu-rs = { git = "https://github.com/ozzykampha/tmu-rust", features = ["parallel"] }
+```
+
+Then use it:
+
+```rust
+use tmu_rs::{TsetlinMachine, Encoder};
+
+// Build encoder from training data (binary features in this example)
+let encoder = Encoder::binary(n_features);
+let train_x = encoder.encode_batch(&raw_train_x);
+
+// Create and train the classifier
+let mut tm = TsetlinMachine::with_config(
+    n_classes, clauses_per_class, n_features,
+    threshold, specificity, max_states, boost_true_positive, seed,
+);
+for _ in 0..epochs {
+    tm.fit_epoch(&train_x, &train_y);
+}
+let accuracy = tm.accuracy(&test_x, &test_y);
+```
+
+---
+
 ## Features
 
 - Bit-packed clause bank for cache-efficient inference and training
