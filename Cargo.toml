@@ -1,6 +1,6 @@
 [package]
 name = "tmu-rs"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "Bit-packed weighted multiclass Tsetlin Machine in Rust, with bit-parallel/multi-threaded training, a fast booleanizer, and ports of the TMU classification demos."
 license = "MIT"
