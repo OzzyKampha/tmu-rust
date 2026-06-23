@@ -12,7 +12,10 @@ use tmu_rs::{data, Encoder, Rng, TsetlinMachine};
 
 /// Load the Breast Cancer CSV, booleanize numeric features, and train a TM with 80/20 split.
 fn main() {
-    let epochs: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(50);
+    let epochs: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
     let path = "data/breast_cancer.csv";
 
     let (xs, ys) = data::read_numeric_csv(path).unwrap_or_else(|e| {
@@ -20,7 +23,11 @@ fn main() {
         std::process::exit(1);
     });
     let n_classes = ys.iter().copied().max().unwrap() + 1;
-    println!("{} samples, {} numeric features, {n_classes} classes", xs.len(), xs[0].len());
+    println!(
+        "{} samples, {} numeric features, {n_classes} classes",
+        xs.len(),
+        xs[0].len()
+    );
 
     let mut idx: Vec<usize> = (0..xs.len()).collect();
     let mut rng = Rng::new(1);
@@ -38,7 +45,8 @@ fn main() {
     let encoder = Encoder::fit_numeric(&tr_rows, 10);
     println!("booleanized to {} binary features\n", encoder.n_features());
 
-    let mut tm = TsetlinMachine::with_config(n_classes, encoder.n_features(), 300, 100, 5.0, 8, true, 7);
+    let mut tm =
+        TsetlinMachine::with_config(n_classes, encoder.n_features(), 300, 100, 5.0, 8, true, 7);
 
     let packed_tr = encoder.encode_batch_numeric(&tr_rows);
     let packed_te = encoder.encode_batch_numeric(&te_rows);

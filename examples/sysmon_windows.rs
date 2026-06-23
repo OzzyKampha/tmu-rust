@@ -45,8 +45,8 @@ const DISTINCT_THRESHOLDS: &[u32] = &[2, 5, 10]; // distinct-image thermometer
 #[derive(Clone)]
 struct Event {
     time_sec: u64,
-    image: String,        // basename, e.g. "powershell.exe"
-    parent: String,       // basename, e.g. "WINWORD.EXE"
+    image: String,  // basename, e.g. "powershell.exe"
+    parent: String, // basename, e.g. "WINWORD.EXE"
     user: String,
     integrity: String,
     company: String,
@@ -82,8 +82,8 @@ fn into_windows(mut events: Vec<Event>) -> Vec<Window> {
 // ── window encoder: tokens + counts -> bit vector ──────────────────────────────
 
 struct WindowEncoder {
-    tokens: Vec<String>,          // sorted vocabulary of col::val tokens
-    feature_names: Vec<String>,   // human-readable name per output bit
+    tokens: Vec<String>,        // sorted vocabulary of col::val tokens
+    feature_names: Vec<String>, // human-readable name per output bit
 }
 
 impl WindowEncoder {
@@ -110,7 +110,10 @@ impl WindowEncoder {
         for thr in DISTINCT_THRESHOLDS {
             feature_names.push(format!("distinct_images >= {thr}"));
         }
-        Self { tokens, feature_names }
+        Self {
+            tokens,
+            feature_names,
+        }
     }
 
     fn n_features(&self) -> usize {
@@ -269,14 +272,18 @@ fn read_mordor(path: &str) -> std::io::Result<Vec<Event>> {
     let text = std::fs::read_to_string(path)?;
     let mut events = Vec::new();
     for line in text.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
         let channel = v.get("Channel").and_then(|c| c.as_str()).unwrap_or("");
         let eid = v.get("EventID").and_then(|e| e.as_u64()).unwrap_or(0);
         if !channel.starts_with("Microsoft-Windows-Sysmon") || eid != 1 {
             continue;
         }
         let get = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-        let Some(time_sec) = parse_time(&get("EventTime")) else { continue };
+        let Some(time_sec) = parse_time(&get("EventTime")) else {
+            continue;
+        };
         let company = get("Company");
         events.push(Event {
             time_sec,
@@ -285,7 +292,11 @@ fn read_mordor(path: &str) -> std::io::Result<Vec<Event>> {
             user: get("User"),
             integrity: get("IntegrityLevel"),
             signed: company.contains("Microsoft") || company.contains("Google"),
-            company: if company.is_empty() { "<unknown>".to_string() } else { company },
+            company: if company.is_empty() {
+                "<unknown>".to_string()
+            } else {
+                company
+            },
         });
     }
     Ok(events)
@@ -321,12 +332,18 @@ fn synthetic_mode() {
     for epoch in 1..=40 {
         tm.fit_epoch(&train_x, &train_y);
         if epoch % 5 == 0 || epoch == 1 {
-            println!("epoch {epoch:>2}  accuracy={:.2}%", tm.accuracy(&test_x, &test_y) * 100.0);
+            println!(
+                "epoch {epoch:>2}  accuracy={:.2}%",
+                tm.accuracy(&test_x, &test_y) * 100.0
+            );
         }
     }
 
     // Interpretability: show a handful of the window features available to the TM.
-    println!("\nsample window features (first 12 of {}):", encoder.n_features());
+    println!(
+        "\nsample window features (first 12 of {}):",
+        encoder.n_features()
+    );
     for bit in 0..encoder.n_features().min(12) {
         println!("  bit {bit:>3} -> {}", encoder.feature_name(bit));
     }
@@ -341,7 +358,10 @@ fn real_file_mode(path: &str) {
             std::process::exit(1);
         }
     };
-    println!("parsed {} Sysmon Event ID 1 records from {path}", events.len());
+    println!(
+        "parsed {} Sysmon Event ID 1 records from {path}",
+        events.len()
+    );
     if events.is_empty() {
         eprintln!("no Event ID 1 records found — is this a Mordor/Security-Datasets NDJSON file?");
         return;
@@ -363,7 +383,11 @@ fn real_file_mode(path: &str) {
             .filter(|(_, &b)| b == 1)
             .map(|(bit, _)| encoder.feature_name(bit))
             .collect();
-        println!("window {i}: {} events, {} active features", w.len(), active.len());
+        println!(
+            "window {i}: {} events, {} active features",
+            w.len(),
+            active.len()
+        );
         for name in active.iter().take(20) {
             println!("    {name}");
         }

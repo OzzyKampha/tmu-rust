@@ -17,7 +17,14 @@ use tmu_rs::{Encoder, Rng, TsetlinMachine};
 
 /// Fields we tokenize. Low-cardinality, categorical fields make good features;
 /// high-cardinality fields like `CommandLine` and `Hashes` are skipped.
-const FIELDS: &[&str] = &["Image", "ParentImage", "User", "IntegrityLevel", "Company", "Signed"];
+const FIELDS: &[&str] = &[
+    "Image",
+    "ParentImage",
+    "User",
+    "IntegrityLevel",
+    "Company",
+    "Signed",
+];
 
 /// Take the basename of a Windows path: `C:\...\powershell.exe` -> `powershell.exe`.
 fn basename(path: &str) -> &str {
@@ -32,7 +39,9 @@ fn parse_record(raw: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     for line in raw.lines() {
         let line = line.trim();
-        let Some((key, value)) = line.split_once('=') else { continue };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
         if !FIELDS.contains(&key) {
             continue;
         }
@@ -117,10 +126,14 @@ fn main() {
     let test_tok: Vec<Vec<String>> = test_raw.iter().map(|r| parse_record(r)).collect();
 
     // Borrow as &[&[&str]] for the categorical encoder API.
-    let train_refs_v: Vec<Vec<&str>> =
-        train_tok.iter().map(|s| s.iter().map(String::as_str).collect()).collect();
-    let test_refs_v: Vec<Vec<&str>> =
-        test_tok.iter().map(|s| s.iter().map(String::as_str).collect()).collect();
+    let train_refs_v: Vec<Vec<&str>> = train_tok
+        .iter()
+        .map(|s| s.iter().map(String::as_str).collect())
+        .collect();
+    let test_refs_v: Vec<Vec<&str>> = test_tok
+        .iter()
+        .map(|s| s.iter().map(String::as_str).collect())
+        .collect();
     let train_refs: Vec<&[&str]> = train_refs_v.iter().map(|v| v.as_slice()).collect();
     let test_refs: Vec<&[&str]> = test_refs_v.iter().map(|v| v.as_slice()).collect();
 
@@ -141,7 +154,10 @@ fn main() {
 
     for epoch in 1..=30 {
         tm.fit_epoch(&train_x, &train_y);
-        println!("epoch {epoch:>2}  accuracy={:.2}%", tm.accuracy(&test_x, &test_y) * 100.0);
+        println!(
+            "epoch {epoch:>2}  accuracy={:.2}%",
+            tm.accuracy(&test_x, &test_y) * 100.0
+        );
     }
 
     // Interpretability: list the vocabulary tokens the model could key on.

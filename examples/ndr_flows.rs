@@ -14,7 +14,14 @@
 use tmu_rs::{Encoder, Rng, TsetlinMachine};
 
 const FEATURES: [&str; 8] = [
-    "duration", "src_bytes", "dst_bytes", "src_pkts", "dst_pkts", "dport", "iat_var", "syn_ratio",
+    "duration",
+    "src_bytes",
+    "dst_bytes",
+    "src_pkts",
+    "dst_pkts",
+    "dport",
+    "iat_var",
+    "syn_ratio",
 ];
 
 /// Sample a uniform random value in `[lo, hi)`.
@@ -83,7 +90,10 @@ fn main() {
     let xte_ref: Vec<&[f64]> = xte.iter().map(|r| r.as_slice()).collect();
 
     let encoder = Encoder::fit_numeric(&xtr_ref, 8);
-    println!("numeric features: 8  ->  binary features: {}\n", encoder.n_features());
+    println!(
+        "numeric features: 8  ->  binary features: {}\n",
+        encoder.n_features()
+    );
 
     let mut tm = TsetlinMachine::with_config(2, encoder.n_features(), 40, 50, 4.0, 8, true, 7);
 
@@ -103,8 +113,16 @@ fn main() {
             }
         }
         let acc = (tp + tn) as f64 / xte.len() as f64;
-        let prec = if tp + fp > 0 { tp as f64 / (tp + fp) as f64 } else { 0.0 };
-        let rec = if tp + fn_ > 0 { tp as f64 / (tp + fn_) as f64 } else { 0.0 };
+        let prec = if tp + fp > 0 {
+            tp as f64 / (tp + fp) as f64
+        } else {
+            0.0
+        };
+        let rec = if tp + fn_ > 0 {
+            tp as f64 / (tp + fn_) as f64
+        } else {
+            0.0
+        };
         println!("epoch {epoch}  acc={acc:.4}  precision={prec:.3}  recall={rec:.3}");
     }
 
@@ -126,7 +144,11 @@ fn main() {
                 format!("{} {} {:.1}", FEATURES[f], op, thr)
             })
             .collect();
-        println!("  (w={}) IF {}", tm.clause_weight(1, j), parts.join(" AND "));
+        println!(
+            "  (w={}) IF {}",
+            tm.clause_weight(1, j),
+            parts.join(" AND ")
+        );
         shown += 1;
         if shown == 6 {
             break;
