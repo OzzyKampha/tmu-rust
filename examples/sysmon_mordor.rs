@@ -340,43 +340,44 @@ fn main() {
         .count();
     println!("  … plus {n_sentinel} <UNK>/<OOV> sentinels");
 
-    // Top-5 attack rules: positive class-1 clauses ranked by weight.
-    // Prefer clauses that reference process/args/file tokens (more interpretable).
-    println!("\n--- top attack rules (class 1, by weight) ---");
+    // Top-5 rules per class: one compact line each, ranked by weight.
+    // Prefer clauses referencing process/args/file tokens (more interpretable).
     let meaningful_prefixes = [
         "process.name", "process.args", "process.parent",
         "dll.name", "file.name", "file.path",
         "target.process", "source.process",
         "dns.question", "destination.",
     ];
-    let is_meaningful = |feat: usize| {
-        let tok = encoder.vocab_token(feat);
-        meaningful_prefixes.iter().any(|p| tok.starts_with(p))
-    };
 
-    let mut ranked: Vec<usize> = (0..tm.clauses_per_class())
-        .filter(|&c| tm.clause_is_positive(c))
-        .filter(|&c| tm.clause_rule(1, c).iter().any(|&(_, neg)| !neg))
-        .collect();
-    // Sort by (has_meaningful_token DESC, weight DESC)
-    ranked.sort_by(|&a, &b| {
-        let ma = tm.clause_rule(1, a).iter().any(|&(f, neg)| !neg && is_meaningful(f));
-        let mb = tm.clause_rule(1, b).iter().any(|&(f, neg)| !neg && is_meaningful(f));
-        mb.cmp(&ma).then(tm.clause_weight(1, b).cmp(&tm.clause_weight(1, a)))
-    });
-
-    for (rank, &c) in ranked.iter().take(5).enumerate() {
-        let rule = tm.clause_rule(1, c);
-        let w = tm.clause_weight(1, c);
-        let pos: Vec<_> = rule.iter().filter(|&&(_, neg)| !neg).collect();
-        let neg_count = rule.len() - pos.len();
-        println!("  [{}] clause {}  weight={}", rank + 1, c, w);
-        for &(feat, _) in &pos {
-            println!("    AND {}", encoder.vocab_token(*feat));
+    for (class, label) in [(1usize, "attack"), (0, "benign")] {
+        println!("\n--- top {} rules (class {}) ---", label, class);
+        let mut ranked: Vec<usize> = (0..tm.clauses_per_class())
+            .filter(|&c| tm.clause_is_positive(c))
+            .filter(|&c| tm.clause_rule(class, c).iter().any(|&(_, neg)| !neg))
+            .collect();
+        ranked.sort_by(|&a, &b| {
+            let ma = tm.clause_rule(class, a).iter().any(|&(f, neg)| {
+                !neg && meaningful_prefixes.iter().any(|p| encoder.vocab_token(f).starts_with(p))
+            });
+            let mb = tm.clause_rule(class, b).iter().any(|&(f, neg)| {
+                !neg && meaningful_prefixes.iter().any(|p| encoder.vocab_token(f).starts_with(p))
+            });
+            mb.cmp(&ma).then(tm.clause_weight(class, b).cmp(&tm.clause_weight(class, a)))
+        });
+        for (rank, &c) in ranked.iter().take(5).enumerate() {
+            let rule = tm.clause_rule(class, c);
+            let w = tm.clause_weight(class, c);
+            let pos: Vec<_> = rule.iter().filter(|&&(_, neg)| !neg).collect();
+            let neg_count = rule.len() - pos.len();
+            let literals: Vec<String> = pos.iter()
+                .map(|&&(feat, _)| encoder.vocab_token(feat).to_string())
+                .collect();
+            let neg_suffix = if neg_count > 0 {
+                format!("  (+ {neg_count} NOT)")
+            } else {
+                String::new()
+            };
+            println!("  [{}] w={}  {}{}", rank + 1, w, literals.join("  "), neg_suffix);
         }
-        if neg_count > 0 {
-            println!("    (+ {neg_count} NOT literals)");
-        }
-        println!();
     }
 }
