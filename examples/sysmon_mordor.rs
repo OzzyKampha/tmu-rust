@@ -3,17 +3,18 @@
 //!
 //! ## What this does
 //!
-//! 1. Downloads three Mordor execution traces from GitHub into `mordor_data/`
+//! 1. Downloads four Mordor execution traces from GitHub into `mordor_data/`
 //!    (skipped if already present).
 //! 2. Parses every Sysmon event (EventIDs 1,3,5,7,9,10,11,12,13,17,18,22,23)
 //!    into `col::val` tokens. Each event type emits its own fields as columns,
 //!    e.g. `EventID::10`, `SourceImage::powershell.exe`, `TargetImage::lsass.exe`,
 //!    `GrantedAccess::0x1010`.
-//! 3. Labels all real-trace events as **attack (1)** (dataset-level ground truth).
-//! 4. Generates an equal number of synthetic **benign (0)** events across the same
-//!    event types so classes are balanced.
-//! 5. Shuffles, 80/20 train/test split, trains a TM, reports accuracy every 5 epochs.
-//! 6. Prints the full vocabulary so you can see which `col::val` features the TM
+//! 3. Labels each event using a **within-trace heuristic**: if the primary image
+//!    (Image / SourceImage) is a known attack tool → label 1 (attack);
+//!    otherwise the event is a background OS event → label 0 (benign).
+//!    Both classes come from real Mordor data — no synthetic events.
+//! 4. Shuffles, 80/20 train/test split, trains a TM, reports accuracy every 5 epochs.
+//! 5. Prints the full vocabulary so you can see which `col::val` features the TM
 //!    learned.
 //!
 //! ## Run
@@ -23,15 +24,14 @@
 //!
 //! ## Note on labeling
 //!
-//! Mordor datasets are labeled at the **file** level (the whole trace is one attack
-//! scenario); individual events are not labeled. We therefore label all events from
-//! the attack traces as class 1 and synthetic benign events as class 0. This means
-//! background OS events in the attack traces are also labeled 1 — the TM has to learn
-//! what correlates with attack traces, not a hand-curated per-event ground truth.
+//! Mordor datasets are labeled at the file level (the whole trace is one attack
+//! scenario). Within each trace, events from known attack-tool processes
+//! (powershell.exe, SharpView.exe, etc.) are labeled 1; background OS events
+//! (svchost.exe, lsass.exe, Explorer.EXE, etc.) are labeled 0.
 
 #[path = "sysmon_shared.rs"]
 mod shared;
-use shared::{basename, benign_tokens, hive_of, parent_dir};
+use shared::{basename, hive_of, parent_dir};
 
 use std::{fs, path::Path};
 use tmu_rs::{Encoder, Rng, TsetlinMachine};
@@ -58,6 +58,20 @@ const DATASETS: &[(&str, &str)] = &[
 ];
 
 const DATA_DIR: &str = "mordor_data";
+
+// Known attack-tool process basenames (case-insensitive).
+const ATTACK_PROCS: &[&str] = &[
+    "SharpView.exe",
+    "powershell.exe",
+    "netsh.exe",
+    "wscript.exe",
+    "python.exe",
+    "whoami.exe",
+    "cmd.exe",
+    "mshta.exe",
+    "vbc.exe",
+    "vbscript.dll",
+];
 
 // ── download + unzip ───────────────────────────────────────────────────────────
 
@@ -90,18 +104,20 @@ fn ensure_datasets() {
     }
 }
 
+// ── labeling heuristic ────────────────────────────────────────────────────────
+
+fn is_attack(v: &serde_json::Value, eid: u32) -> bool {
+    let img_field = if eid == 10 { "SourceImage" } else { "Image" };
+    let base = basename(v[img_field].as_str().unwrap_or(""));
+    ATTACK_PROCS.iter().any(|p| base.eq_ignore_ascii_case(p))
+}
+
 // ── per-event tokenizer ────────────────────────────────────────────────────────
 
-/// Convert a single Sysmon event to a list of `col::val` tokens.
-///
-/// Every event gets `EventID::N`. Additional fields are event-type-specific.
-/// High-cardinality raw values (full paths, GUIDs, PIDs) are normalized:
-/// paths → basename, registry paths → hive only, temp file paths → parent dir.
 fn event_to_tokens(v: &serde_json::Value, eid: u32) -> Vec<String> {
     let mut t = vec![format!("EventID::{eid}")];
     let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
 
-    // Push `Col::val` only when val is non-empty. $val must be an owned String.
     macro_rules! push {
         ($col:expr, $val:expr) => {{
             let v: String = $val;
@@ -111,7 +127,6 @@ fn event_to_tokens(v: &serde_json::Value, eid: u32) -> Vec<String> {
 
     match eid {
         1 => {
-            // ProcessCreate
             push!("Image",          basename(&s("Image")));
             push!("ParentImage",    basename(&s("ParentImage")));
             push!("User",           s("User"));
@@ -120,67 +135,57 @@ fn event_to_tokens(v: &serde_json::Value, eid: u32) -> Vec<String> {
             push!("Signed",         s("Signed"));
         }
         3 => {
-            // NetworkConnect
             push!("Image",           basename(&s("Image")));
             push!("DestinationPort", s("DestinationPort"));
             push!("Protocol",        s("Protocol"));
             push!("Initiated",       s("Initiated"));
         }
         5 => {
-            // ProcessTerminate
             push!("Image", basename(&s("Image")));
         }
         7 => {
-            // ImageLoad
             push!("Image",       basename(&s("Image")));
             push!("ImageLoaded", basename(&s("ImageLoaded")));
             push!("Signed",      s("Signed"));
             push!("Company",     s("Company"));
         }
         9 => {
-            // RawAccessRead
             push!("Image",  basename(&s("Image")));
             push!("Device", s("Device"));
         }
         10 => {
-            // ProcessAccess
             push!("SourceImage",   basename(&s("SourceImage")));
             push!("TargetImage",   basename(&s("TargetImage")));
             push!("GrantedAccess", s("GrantedAccess"));
         }
         11 => {
-            // FileCreate
             push!("Image",          basename(&s("Image")));
             push!("TargetFilename", parent_dir(&s("TargetFilename")));
         }
         12 | 13 => {
-            // RegistryEvent (object create/delete / value set)
             push!("Image",        basename(&s("Image")));
             push!("TargetObject", hive_of(&s("TargetObject")));
         }
         17 | 18 => {
-            // PipeEvent (created / connected)
             push!("Image",    basename(&s("Image")));
             push!("PipeName", s("PipeName"));
         }
         22 => {
-            // DnsQuery
             push!("Image",     basename(&s("Image")));
             push!("QueryName", s("QueryName"));
         }
         23 => {
-            // FileDelete
             push!("Image",          basename(&s("Image")));
             push!("TargetFilename", parent_dir(&s("TargetFilename")));
         }
-        _ => {} // unknown type — EventID token is enough
+        _ => {}
     }
     t
 }
 
-// ── parse one NDJSON file into token lists ─────────────────────────────────────
+// ── parse one NDJSON file into (tokens, label) pairs ──────────────────────────
 
-fn parse_file(path: &str) -> std::io::Result<Vec<Vec<String>>> {
+fn parse_file(path: &str) -> std::io::Result<Vec<(Vec<String>, usize)>> {
     let text = fs::read_to_string(path)?;
     let mut events = Vec::new();
     for line in text.lines() {
@@ -189,7 +194,8 @@ fn parse_file(path: &str) -> std::io::Result<Vec<Vec<String>>> {
             continue;
         }
         let eid = v["EventID"].as_u64().unwrap_or(0) as u32;
-        events.push(event_to_tokens(&v, eid));
+        let label = usize::from(is_attack(&v, eid));
+        events.push((event_to_tokens(&v, eid), label));
     }
     Ok(events)
 }
@@ -199,8 +205,8 @@ fn parse_file(path: &str) -> std::io::Result<Vec<Vec<String>>> {
 fn main() {
     ensure_datasets();
 
-    // Collect all Sysmon events from downloaded JSON files.
-    let mut attack: Vec<Vec<String>> = Vec::new();
+    // Collect all Sysmon events with heuristic labels from real traces.
+    let mut all_events: Vec<(Vec<String>, usize)> = Vec::new();
     for entry in fs::read_dir(DATA_DIR).expect("mordor_data/ not found") {
         let entry = entry.unwrap();
         let path = entry.path();
@@ -208,34 +214,35 @@ fn main() {
             continue;
         }
         match parse_file(path.to_str().unwrap()) {
-            Ok(mut evs) => {
+            Ok(evs) => {
                 println!("  {} → {} Sysmon events", path.file_name().unwrap().to_str().unwrap(), evs.len());
-                attack.append(&mut evs);
+                all_events.extend(evs);
             }
             Err(e) => eprintln!("  WARN: {e}"),
         }
     }
-    println!("\n{} real attack events (label 1)", attack.len());
 
-    // Generate equal-count synthetic benign events (label 0).
-    let mut rng = Rng::new(42);
-    let benign: Vec<Vec<String>> = (0..attack.len()).map(|_| benign_tokens(&mut rng)).collect();
-    println!("{} synthetic benign events (label 0)\n", benign.len());
+    let n_attack = all_events.iter().filter(|(_, y)| *y == 1).count();
+    let n_benign = all_events.iter().filter(|(_, y)| *y == 0).count();
+    println!("\n{n_attack} attack events (label 1)  ← real attack-tool activity");
+    println!("{n_benign} benign events (label 0)  ← real background OS activity\n");
 
-    // Combine, shuffle, 80/20 split.
-    let mut all: Vec<(Vec<String>, usize)> = attack
-        .into_iter().map(|t| (t, 1))
-        .chain(benign.into_iter().map(|t| (t, 0)))
-        .collect();
-    for i in (1..all.len()).rev() {
-        let j = rng.below(i + 1);
-        all.swap(i, j);
+    if n_attack == 0 || n_benign == 0 {
+        eprintln!("ERROR: one class is empty — check ATTACK_PROCS or dataset contents");
+        std::process::exit(1);
     }
-    let cut = all.len() * 4 / 5;
-    let (train_all, test_all) = all.split_at(cut);
+
+    // Shuffle, 80/20 split.
+    let mut rng = Rng::new(42);
+    for i in (1..all_events.len()).rev() {
+        let j = rng.below(i + 1);
+        all_events.swap(i, j);
+    }
+    let cut = all_events.len() * 4 / 5;
+    let (train_all, test_all) = all_events.split_at(cut);
 
     let (train_tokens, train_y): (Vec<_>, Vec<_>) = train_all.iter().map(|(t, y)| (t, *y)).unzip();
-    let (test_tokens, test_y): (Vec<_>, Vec<_>) = test_all.iter().map(|(t, y)| (t, *y)).unzip();
+    let (test_tokens,  test_y):  (Vec<_>, Vec<_>) = test_all.iter().map(|(t, y)| (t, *y)).unzip();
 
     // Build &[&[&str]] references required by the categorical encoder.
     let tr_inner: Vec<Vec<&str>> = train_tokens.iter().map(|t| t.iter().map(String::as_str).collect()).collect();
@@ -247,12 +254,10 @@ fn main() {
     // Fit categorical encoder on training set.
     let encoder = Encoder::fit_categorical(&tr_refs);
     println!(
-        "train={} test={} | vocabulary: {} features ({} col::val tokens + {} UNK/OOV)\n",
+        "train={} test={} | vocabulary: {} col::val features\n",
         tr_refs.len(),
         te_refs.len(),
         encoder.n_features(),
-        encoder.n_features().saturating_sub(25), // rough: subtract sentinel count
-        25,
     );
 
     let train_x = encoder.encode_batch_categorical(&tr_refs);
@@ -277,12 +282,8 @@ fn main() {
             println!("  {bit:>4}  {tok}");
         }
     }
-    println!("  … plus {} <UNK>/<OOV> sentinels", {
-        (0..encoder.n_features())
-            .filter(|&b| {
-                let t = encoder.vocab_token(b);
-                t.contains("<UNK>") || t.contains("<OOV>")
-            })
-            .count()
-    });
+    let n_sentinel = (0..encoder.n_features())
+        .filter(|&b| { let t = encoder.vocab_token(b); t.contains("<UNK>") || t.contains("<OOV>") })
+        .count();
+    println!("  … plus {n_sentinel} <UNK>/<OOV> sentinels");
 }

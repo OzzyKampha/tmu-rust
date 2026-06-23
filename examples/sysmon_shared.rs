@@ -1,6 +1,8 @@
 //! Shared utilities for the sysmon_* examples.
 //! Included via `#[path]` — not a standalone crate module.
 
+#![allow(dead_code)]
+
 use tmu_rs::Rng;
 
 // ── path helpers ───────────────────────────────────────────────────────────────
