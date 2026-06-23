@@ -11,6 +11,38 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-clippy-${{ hashFiles('**/Cargo.lock') }}
+      - name: Clippy (default)
+        run: cargo clippy -- -D warnings
+      - name: Clippy (parallel feature)
+        run: cargo clippy --features parallel -- -D warnings
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -30,14 +62,23 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build
+      - name: Build (debug)
         run: cargo build --verbose
 
-      - name: Build (parallel feature)
+      - name: Build (debug, parallel feature)
         run: cargo build --features parallel --verbose
+
+      - name: Build (release)
+        run: cargo build --release --verbose
+
+      - name: Build (release, parallel feature)
+        run: cargo build --release --features parallel --verbose
 
       - name: Run tests
         run: cargo test --verbose
 
       - name: Run tests (parallel feature)
         run: cargo test --features parallel --verbose
+
+      - name: Check crate packaging
+        run: cargo publish --dry-run --allow-dirty
