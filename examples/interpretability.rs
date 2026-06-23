@@ -18,7 +18,9 @@ fn make(n: usize, noise: f64, seed: u64) -> (Vec<Vec<u8>>, Vec<usize>) {
     let mut xs = Vec::with_capacity(n);
     let mut ys = Vec::with_capacity(n);
     for _ in 0..n {
-        let f: Vec<u8> = (0..N_FEATURES).map(|_| (rng.next_u64() & 1) as u8).collect();
+        let f: Vec<u8> = (0..N_FEATURES)
+            .map(|_| (rng.next_u64() & 1) as u8)
+            .collect();
         let mut y = (f[0] ^ f[1]) as usize;
         if rng.next_f64() <= noise {
             y = 1 - y;
@@ -40,7 +42,13 @@ fn render(rule: &[(usize, bool)]) -> String {
         return "(empty)".to_string();
     }
     rule.iter()
-        .map(|&(f, neg)| if neg { format!("¬x{f}") } else { format!("x{f}") })
+        .map(|&(f, neg)| {
+            if neg {
+                format!("¬x{f}")
+            } else {
+                format!("x{f}")
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ∧ ")
 }

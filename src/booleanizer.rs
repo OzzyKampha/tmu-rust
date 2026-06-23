@@ -51,6 +51,9 @@ impl Booleanizer {
             }
             remaining -= thrs.len();
         }
-        panic!("bit index {bit} out of range (total bits: {})", self.n_output_features());
+        panic!(
+            "bit index {bit} out of range (total bits: {})",
+            self.n_output_features()
+        );
     }
 }

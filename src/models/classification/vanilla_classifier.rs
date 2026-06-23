@@ -2,12 +2,12 @@
 //!
 //! Mirrors TMU's `vanilla_classifier.py` / `TMClassifier`.
 
+#[cfg(feature = "parallel")]
+use crate::clause_bank::dense::PARALLEL_MIN;
 use crate::clause_bank::dense::{
     bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, rebuild_include,
     type_i_update_bytes, type_ii_update_bytes, words_for, GOLDEN, MASK_BITS, WORD_BITS,
 };
-#[cfg(feature = "parallel")]
-use crate::clause_bank::dense::PARALLEL_MIN;
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
 
@@ -115,7 +115,17 @@ fn apply_one_clause(
         if fired_under {
             *w = (*w + 1).min(wmax);
         }
-        type_i_update_bytes(ta, n_literals, fired_under, boost, lit_b, inv_b, keep_b, active_b, max_state);
+        type_i_update_bytes(
+            ta,
+            n_literals,
+            fired_under,
+            boost,
+            lit_b,
+            inv_b,
+            keep_b,
+            active_b,
+            max_state,
+        );
     } else {
         // Type II: fire check, then SIMD TA update.
         if !clause_fire(inc, lit, val, words, lit_active) {
@@ -136,7 +146,16 @@ impl TsetlinMachine {
         threshold: i32,
         s: f64,
     ) -> Self {
-        Self::with_config(n_classes, n_features, clauses_per_class, threshold, s, 8, true, 42)
+        Self::with_config(
+            n_classes,
+            n_features,
+            clauses_per_class,
+            threshold,
+            s,
+            8,
+            true,
+            42,
+        )
     }
 
     /// Create a TsetlinMachine with full configuration.
@@ -185,12 +204,19 @@ impl TsetlinMachine {
         for cj in 0..n_clauses {
             let tb = cj * n_literals;
             for l in 0..n_literals {
-                ta[tb + l] = if rng.next_u64() & 1 == 0 { half - 1 } else { half };
+                ta[tb + l] = if rng.next_u64() & 1 == 0 {
+                    half - 1
+                } else {
+                    half
+                };
             }
             rebuild_include(
                 &ta[tb..tb + n_literals],
                 &mut include[cj * words..(cj + 1) * words],
-                &valid, words, n_literals, half,
+                &valid,
+                words,
+                n_literals,
+                half,
             );
         }
 
@@ -306,7 +332,11 @@ impl TsetlinMachine {
             for (j, &w) in cw.iter().enumerate() {
                 let cj = c * cps + j;
                 if fire_predict(&include[cj * words..(cj + 1) * words], lit, valid, words) {
-                    if j & 1 == 0 { sum += w; } else { sum -= w; }
+                    if j & 1 == 0 {
+                        sum += w;
+                    } else {
+                        sum -= w;
+                    }
                 }
             }
             let v = sum.clamp(-self.threshold, self.threshold);
@@ -338,7 +368,11 @@ impl TsetlinMachine {
             for (j, &w) in cw.iter().enumerate() {
                 let cj = c * cps + j;
                 if fire_predict(&include[cj * words..(cj + 1) * words], lit, valid, words) {
-                    if j & 1 == 0 { sum += w; } else { sum -= w; }
+                    if j & 1 == 0 {
+                        sum += w;
+                    } else {
+                        sum -= w;
+                    }
                 }
             }
             *out_c = sum.clamp(-self.threshold, self.threshold);
@@ -359,7 +393,9 @@ impl TsetlinMachine {
                 .map(|i| self.predict_lit(&packed[i * w..(i + 1) * w]))
                 .collect();
         }
-        (0..n).map(|i| self.predict_lit(&packed[i * w..(i + 1) * w])).collect()
+        (0..n)
+            .map(|i| self.predict_lit(&packed[i * w..(i + 1) * w]))
+            .collect()
     }
 
     // ---- training helpers ------------------------------------------------
@@ -375,9 +411,19 @@ impl TsetlinMachine {
         let mut sum: i32 = 0;
         for j in 0..cps {
             let cj = c * cps + j;
-            if clause_fire(&include[cj * words..(cj + 1) * words], lit, valid, words, lit_active) {
+            if clause_fire(
+                &include[cj * words..(cj + 1) * words],
+                lit,
+                valid,
+                words,
+                lit_active,
+            ) {
                 let w = self.weights[c * cps + j];
-                if j & 1 == 0 { sum += w; } else { sum -= w; }
+                if j & 1 == 0 {
+                    sum += w;
+                } else {
+                    sum -= w;
+                }
             }
         }
         sum.clamp(-self.threshold, self.threshold)
@@ -409,8 +455,18 @@ impl TsetlinMachine {
         let half = self.half;
         let max_state = self.max_state;
 
-        let Self { ta, include, weights, rngs, class_rngs, literals, valid, dig_inv, dig_keep, .. } =
-            self;
+        let Self {
+            ta,
+            include,
+            weights,
+            rngs,
+            class_rngs,
+            literals,
+            valid,
+            dig_inv,
+            dig_keep,
+            ..
+        } = self;
         let lit = literals.as_slice();
         let val = valid.as_slice();
         let crng = &mut class_rngs[c];
@@ -451,10 +507,9 @@ impl TsetlinMachine {
                 .enumerate()
                 .for_each(|(j, (((ta_c, inc_c), w), rng))| {
                     apply_one_clause(
-                        j, ta_c, inc_c, w, rng, target, p, &drop_mask,
-                        lit, val, lit_active, words,
-                        lit_b, &inv_b, &keep_b, active_b,
-                        n_literals, boost, wmax, max_inc, half, max_state,
+                        j, ta_c, inc_c, w, rng, target, p, &drop_mask, lit, val, lit_active, words,
+                        lit_b, &inv_b, &keep_b, active_b, n_literals, boost, wmax, max_inc, half,
+                        max_state,
                     );
                 });
             return;
@@ -467,10 +522,23 @@ impl TsetlinMachine {
                 &mut class_inc[j * words..(j + 1) * words],
                 &mut class_w[j],
                 &mut class_rng[j],
-                target, p, &drop_mask,
-                lit, val, lit_active, words,
-                lit_b, &inv_b, &keep_b, active_b,
-                n_literals, boost, wmax, max_inc, half, max_state,
+                target,
+                p,
+                &drop_mask,
+                lit,
+                val,
+                lit_active,
+                words,
+                lit_b,
+                &inv_b,
+                &keep_b,
+                active_b,
+                n_literals,
+                boost,
+                wmax,
+                max_inc,
+                half,
+                max_state,
             );
         }
     }
@@ -505,9 +573,9 @@ impl TsetlinMachine {
         // l < n_literals, this is equivalent to expand_bits_to_bytes(&lit_active, …).
         let active_b = expand_bits_to_bytes(&lit_active, n_literals);
 
-        let sum_y   = self.class_sum_train(y,   &lit_active);
+        let sum_y = self.class_sum_train(y, &lit_active);
         let sum_neg = self.class_sum_train(neg, &lit_active);
-        self.update_class(y,   1, sum_y,   &lit_active, &lit_b, &active_b);
+        self.update_class(y, 1, sum_y, &lit_active, &lit_b, &active_b);
         self.update_class(neg, 0, sum_neg, &lit_active, &lit_b, &active_b);
     }
 
@@ -579,7 +647,11 @@ impl TsetlinMachine {
                 }
             }
         }
-        if total == 0 { 0.0 } else { at_max as f64 / total as f64 }
+        if total == 0 {
+            0.0
+        } else {
+            at_max as f64 / total as f64
+        }
     }
 
     /// Fraction of (clause, literal) pairs whose TA is at the **absorbing exclude**
@@ -601,7 +673,11 @@ impl TsetlinMachine {
                 }
             }
         }
-        if total == 0 { 0.0 } else { at_min as f64 / total as f64 }
+        if total == 0 {
+            0.0
+        } else {
+            at_min as f64 / total as f64
+        }
     }
 
     // ---- interpretability ------------------------------------------------
@@ -699,9 +775,13 @@ mod tests {
 
         // Check the full range for a representative value.
         let mut v = 0u8;
-        for _ in 0..1000 { v = v.saturating_add(1).min(max_state); }
+        for _ in 0..1000 {
+            v = v.saturating_add(1).min(max_state);
+        }
         assert_eq!(v, max_state);
-        for _ in 0..1000 { v = v.saturating_sub(1); }
+        for _ in 0..1000 {
+            v = v.saturating_sub(1);
+        }
         assert_eq!(v, 0);
     }
 
@@ -719,7 +799,10 @@ mod tests {
             let s = e.encode_one(x);
             let by_predict = tm.predict(&s);
             let by_lit = tm.predict_lit(&s.0);
-            assert_eq!(by_predict, by_lit, "predict and predict_lit disagree for {x:?}");
+            assert_eq!(
+                by_predict, by_lit,
+                "predict and predict_lit disagree for {x:?}"
+            );
         }
     }
 
@@ -830,8 +913,8 @@ mod tests {
     fn clause_drop_p_one_leaves_state_unchanged() {
         let (xtr, ytr) = make_xor(200, 0.0, 15);
         let btr = enc(12).encode_batch(&as_slices(&xtr));
-        let mut tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42)
-            .clause_drop_p(0.9999);
+        let mut tm =
+            TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42).clause_drop_p(0.9999);
         let ta_before = tm.ta.clone();
         tm.fit_epoch(&btr, &ytr);
         let ta_changed = tm.ta.iter().zip(&ta_before).filter(|(a, b)| a != b).count();
@@ -849,8 +932,8 @@ mod tests {
         let e = enc(12);
         let btr = e.encode_batch(&as_slices(&xtr));
         let bte = e.encode_batch(&as_slices(&xte));
-        let mut tm = TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 8, true, 42)
-            .clause_drop_p(0.0);
+        let mut tm =
+            TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 8, true, 42).clause_drop_p(0.0);
         for _ in 0..10 {
             tm.fit_epoch(&btr, &ytr);
         }
@@ -881,9 +964,21 @@ mod tests {
         let mut weight = 5i32;
 
         clause_type_i_bytes(
-            &mut ta, &mut inc, &mut weight, &lit, &valid,
-            words, n_literals, false, &inv_mask, &keep_mask, 10, max_included, &all_active,
-            half, max_state,
+            &mut ta,
+            &mut inc,
+            &mut weight,
+            &lit,
+            &valid,
+            words,
+            n_literals,
+            false,
+            &inv_mask,
+            &keep_mask,
+            10,
+            max_included,
+            &all_active,
+            half,
+            max_state,
         );
 
         let n_after = (inc[0] & valid[0]).count_ones() as usize;
@@ -898,8 +993,8 @@ mod tests {
         let (xtr, ytr) = make_xor(2000, 0.0, 17);
         let btr = enc(12).encode_batch(&as_slices(&xtr));
 
-        let mut tm_tight = TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 8, true, 42)
-            .max_included_literals(2);
+        let mut tm_tight =
+            TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 8, true, 42).max_included_literals(2);
         let mut tm_free = TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 8, true, 42);
         for _ in 0..10 {
             tm_tight.fit_epoch(&btr, &ytr);
@@ -1008,10 +1103,26 @@ mod tests {
         assert_eq!((bits >> 1) & 1, 0, "x[1]=0: positive bit should be clear");
         assert_eq!((bits >> 2) & 1, 1, "x[2]=1: positive bit should be set");
         assert_eq!((bits >> 3) & 1, 0, "x[3]=0: positive bit should be clear");
-        assert_eq!((bits >> (nf + 0)) & 1, 0, "x[0]=1: negated bit should be clear");
-        assert_eq!((bits >> (nf + 1)) & 1, 1, "x[1]=0: negated bit should be set");
-        assert_eq!((bits >> (nf + 2)) & 1, 0, "x[2]=1: negated bit should be clear");
-        assert_eq!((bits >> (nf + 3)) & 1, 1, "x[3]=0: negated bit should be set");
+        assert_eq!(
+            (bits >> (nf + 0)) & 1,
+            0,
+            "x[0]=1: negated bit should be clear"
+        );
+        assert_eq!(
+            (bits >> (nf + 1)) & 1,
+            1,
+            "x[1]=0: negated bit should be set"
+        );
+        assert_eq!(
+            (bits >> (nf + 2)) & 1,
+            0,
+            "x[2]=1: negated bit should be clear"
+        );
+        assert_eq!(
+            (bits >> (nf + 3)) & 1,
+            1,
+            "x[3]=0: negated bit should be set"
+        );
     }
 
     // ---- fire_predict semantics ----------------------------------------------
@@ -1049,8 +1160,8 @@ mod tests {
     fn literal_drop_p_one_leaves_state_unchanged() {
         let (xtr, ytr) = make_xor(200, 0.0, 30);
         let btr = enc(12).encode_batch(&as_slices(&xtr));
-        let mut tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42)
-            .literal_drop_p(0.9999);
+        let mut tm =
+            TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42).literal_drop_p(0.9999);
         let ta_before = tm.ta.clone();
         tm.fit_epoch(&btr, &ytr);
         let ta_changed = tm.ta.iter().zip(&ta_before).filter(|(a, b)| a != b).count();
@@ -1068,13 +1179,16 @@ mod tests {
         let e = enc(12);
         let btr = e.encode_batch(&as_slices(&xtr));
         let bte = e.encode_batch(&as_slices(&xte));
-        let mut tm = TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 8, true, 42)
-            .literal_drop_p(0.0);
+        let mut tm =
+            TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 8, true, 42).literal_drop_p(0.0);
         for _ in 0..10 {
             tm.fit_epoch(&btr, &ytr);
         }
         let acc = tm.accuracy(&bte, &yte);
-        assert!(acc > 0.90, "literal_drop_p=0 should still converge, got {acc}");
+        assert!(
+            acc > 0.90,
+            "literal_drop_p=0 should still converge, got {acc}"
+        );
     }
 
     // ---- absorbing states -------------------------------------------------------
@@ -1085,12 +1199,12 @@ mod tests {
         // "exclude absent" feedback completely unchanged.
         let n_literals = 1usize;
         let words = 1usize;
-        let half = 8u8;     // sb=4 → half=8
+        let half = 8u8; // sb=4 → half=8
         let max_state = 15u8; // (1<<4)-1
-        // Literal 0 at max state (included); absent from x → violation → Ib path.
+                              // Literal 0 at max state (included); absent from x → violation → Ib path.
         let mut ta = vec![max_state];
         let mut inc = vec![1u64]; // bit 0 included
-        let lit = vec![0u64];     // absent
+        let lit = vec![0u64]; // absent
         let valid = vec![1u64];
         let inv_mask = vec![!0u64];
         let keep_mask = vec![!0u64];
@@ -1099,9 +1213,21 @@ mod tests {
 
         for _ in 0..1_000 {
             clause_type_i_bytes(
-                &mut ta, &mut inc, &mut weight, &lit, &valid,
-                words, n_literals, false, &inv_mask, &keep_mask, 100, usize::MAX, &all_active,
-                half, max_state,
+                &mut ta,
+                &mut inc,
+                &mut weight,
+                &lit,
+                &valid,
+                words,
+                n_literals,
+                false,
+                &inv_mask,
+                &keep_mask,
+                100,
+                usize::MAX,
+                &all_active,
+                half,
+                max_state,
             );
         }
 
@@ -1132,9 +1258,21 @@ mod tests {
         let mut weight = 1i32;
 
         clause_type_i_bytes(
-            &mut ta, &mut inc, &mut weight, &lit, &valid,
-            words, n_literals, false, &inv_mask, &keep_mask, 100, usize::MAX, &all_active,
-            half, max_state,
+            &mut ta,
+            &mut inc,
+            &mut weight,
+            &lit,
+            &valid,
+            words,
+            n_literals,
+            false,
+            &inv_mask,
+            &keep_mask,
+            100,
+            usize::MAX,
+            &all_active,
+            half,
+            max_state,
         );
 
         assert_ne!(
@@ -1154,15 +1292,23 @@ mod tests {
         // All-zero: every literal at min state; empty clause fires (no violations).
         let mut ta = vec![0u8];
         let mut inc = vec![0u64]; // excluded
-        let lit = vec![0u64];     // literal 0 absent from x
+        let lit = vec![0u64]; // literal 0 absent from x
         let valid = vec![1u64];
         let all_active = vec![!0u64];
         let mut weight = 5i32;
 
         for _ in 0..1_000 {
             clause_type_ii_bytes(
-                &mut ta, &mut inc, &mut weight, &lit, &valid,
-                words, n_literals, &all_active, half, max_state,
+                &mut ta,
+                &mut inc,
+                &mut weight,
+                &lit,
+                &valid,
+                words,
+                n_literals,
+                &all_active,
+                half,
+                max_state,
             );
         }
 
@@ -1183,8 +1329,8 @@ mod tests {
         let half = 8u8;
         let max_state = 15u8;
         let mut ta = vec![max_state, half]; // literal 0 absorbing, literal 1 just included
-        let mut inc = vec![0b11u64];         // both included
-        let lit = vec![0u64];               // both absent → violations on both → Ib path
+        let mut inc = vec![0b11u64]; // both included
+        let lit = vec![0u64]; // both absent → violations on both → Ib path
         let valid = vec![0b11u64];
         let inv_mask = vec![!0u64];
         let keep_mask = vec![!0u64];
@@ -1193,14 +1339,34 @@ mod tests {
 
         for _ in 0..500 {
             clause_type_i_bytes(
-                &mut ta, &mut inc, &mut weight, &lit, &valid,
-                words, n_literals, false, &inv_mask, &keep_mask, 5, 1, &all_active,
-                half, max_state,
+                &mut ta,
+                &mut inc,
+                &mut weight,
+                &lit,
+                &valid,
+                words,
+                n_literals,
+                false,
+                &inv_mask,
+                &keep_mask,
+                5,
+                1,
+                &all_active,
+                half,
+                max_state,
             );
         }
 
-        assert_eq!((inc[0] >> 0) & 1, 1, "absorbing literal 0 must stay included");
-        assert_eq!((inc[0] >> 1) & 1, 0, "non-absorbing literal 1 must be expelled");
+        assert_eq!(
+            (inc[0] >> 0) & 1,
+            1,
+            "absorbing literal 0 must stay included"
+        );
+        assert_eq!(
+            (inc[0] >> 1) & 1,
+            0,
+            "non-absorbing literal 1 must be expelled"
+        );
     }
 
     // ---- state_bits boundary configs ----------------------------------------
@@ -1219,7 +1385,10 @@ mod tests {
             tm.fit_epoch(&btr, &ytr);
         }
         let acc = tm.accuracy(&bte, &yte);
-        assert!((0.0..=1.0).contains(&acc), "state_bits=2 accuracy out of range: {acc}");
+        assert!(
+            (0.0..=1.0).contains(&acc),
+            "state_bits=2 accuracy out of range: {acc}"
+        );
     }
 
     #[test]
@@ -1238,10 +1407,16 @@ mod tests {
         // Fresh TM: every counter is initialised to half-1 or half, never 0 or
         // max_state, so both absorbing fractions must be exactly 0.
         let tm = TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 8, true, 42);
-        assert_eq!(tm.absorbed_include_fraction(), 0.0,
-            "fresh TM must have no include-absorbed states");
-        assert_eq!(tm.absorbed_exclude_fraction(), 0.0,
-            "fresh TM must have no exclude-absorbed states");
+        assert_eq!(
+            tm.absorbed_include_fraction(),
+            0.0,
+            "fresh TM must have no include-absorbed states"
+        );
+        assert_eq!(
+            tm.absorbed_exclude_fraction(),
+            0.0,
+            "fresh TM must have no exclude-absorbed states"
+        );
     }
 
     #[test]
@@ -1314,9 +1489,11 @@ mod tests {
                     .filter(|&l| (inc[l / 64] >> (l % 64)) & 1 != 0)
                     .count();
                 assert_eq!(
-                    rule.len(), bitset_count,
+                    rule.len(),
+                    bitset_count,
                     "clause ({class},{clause}): rule has {} literals but bitset has {}",
-                    rule.len(), bitset_count
+                    rule.len(),
+                    bitset_count
                 );
             }
         }

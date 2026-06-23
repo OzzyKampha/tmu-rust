@@ -71,7 +71,11 @@ impl EncodedBatch {
         let n = rows.len();
         let mut data = vec![0u64; n * words];
         for (i, row) in rows.iter().enumerate() {
-            assert_eq!(row.len(), n_features, "each row must have n_features elements");
+            assert_eq!(
+                row.len(),
+                n_features,
+                "each row must have n_features elements"
+            );
             pack(row, n_features, &mut data[i * words..(i + 1) * words]);
         }
         Self { data, n, words }
@@ -183,7 +187,11 @@ impl Encoder {
 
         let _ = n_regular; // used implicitly via index construction order
         Self {
-            kind: EncoderKind::Categorical { vocab, index, known_columns },
+            kind: EncoderKind::Categorical {
+                vocab,
+                index,
+                known_columns,
+            },
             n_features,
             words: words_for(2 * n_features),
         }
@@ -211,9 +219,10 @@ impl Encoder {
     /// Useful for printing interpretable clause rules.
     pub fn vocab_token(&self, bit: usize) -> &str {
         match &self.kind {
-            EncoderKind::Categorical { index, .. } => {
-                index.get(bit).map(|s| s.as_str()).expect("bit index out of vocab range")
-            }
+            EncoderKind::Categorical { index, .. } => index
+                .get(bit)
+                .map(|s| s.as_str())
+                .expect("bit index out of vocab range"),
             _ => panic!("vocab_token is only available on categorical encoders"),
         }
     }
@@ -248,7 +257,11 @@ impl Encoder {
     /// Encode a sample represented as a slice of `"col::val"` token strings.
     pub fn encode_one_categorical(&self, tokens: &[&str]) -> EncodedSample {
         match &self.kind {
-            EncoderKind::Categorical { vocab, known_columns, index } => {
+            EncoderKind::Categorical {
+                vocab,
+                known_columns,
+                index,
+            } => {
                 let oov_idx = index.len() - 1; // "<OOV>" is always last
                 let mut bin = vec![0u8; self.n_features];
                 for &token in tokens {

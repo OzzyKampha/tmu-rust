@@ -41,7 +41,11 @@ fn main() {
     let n_features = xtr[0].len(); // 784
 
     println!("done ({:.2}s)", t_load.elapsed().as_secs_f64());
-    println!("  train={:<6}  test={:<5}  features={n_features}", xtr.len(), xte.len());
+    println!(
+        "  train={:<6}  test={:<5}  features={n_features}",
+        xtr.len(),
+        xte.len()
+    );
 
     // ---- model config -------------------------------------------------------
     let threshold = 5000i32;
@@ -55,8 +59,9 @@ fn main() {
     println!();
 
     let encoder = Encoder::for_binary(n_features);
-    let mut tm = TsetlinMachine::with_config(10, encoder.n_features(), clauses, threshold, s, 8, true, 42)
-        .max_included_literals(32);
+    let mut tm =
+        TsetlinMachine::with_config(10, encoder.n_features(), clauses, threshold, s, 8, true, 42)
+            .max_included_literals(32);
 
     // ---- encode once --------------------------------------------------------
     print!("Encoding data... ");

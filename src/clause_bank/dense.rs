@@ -271,6 +271,7 @@ pub(crate) fn bmask_word(rng: &mut Rng, digits: &[u8]) -> u64 {
 /// (`_mm256_adds_epu8` / `_mm256_subs_epu8`) and `_mm256_min_epu8` clamping.
 ///
 /// **Scalar fallback**: branchless per-literal arithmetic.
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(crate) fn type_i_update_bytes(
     ta: &mut [u8],
@@ -289,16 +290,34 @@ pub(crate) fn type_i_update_bytes(
             // SAFETY: avx2 presence verified by the runtime check above.
             return unsafe {
                 type_i_update_bytes_avx2(
-                    ta, n_literals, fired_under, boost, lit_b, inv_b, keep_b, active_b,
+                    ta,
+                    n_literals,
+                    fired_under,
+                    boost,
+                    lit_b,
+                    inv_b,
+                    keep_b,
+                    active_b,
                     max_state,
                 )
             };
         }
     }
-    type_i_update_bytes_scalar(ta, n_literals, fired_under, boost, lit_b, inv_b, keep_b, active_b, max_state);
+    type_i_update_bytes_scalar(
+        ta,
+        n_literals,
+        fired_under,
+        boost,
+        lit_b,
+        inv_b,
+        keep_b,
+        active_b,
+        max_state,
+    );
 }
 
 /// Branchless scalar fallback for [`type_i_update_bytes`] on non-AVX2 targets.
+#[allow(clippy::too_many_arguments)]
 #[inline]
 fn type_i_update_bytes_scalar(
     ta: &mut [u8],
@@ -342,6 +361,7 @@ fn type_i_update_bytes_scalar(
 /// # Safety
 /// Caller must verify AVX2 is available.  Pointer reads/writes stay within the
 /// `ta` slice (loop guard: `l + 32 <= n_literals`).
+#[allow(clippy::too_many_arguments)]
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn type_i_update_bytes_avx2(
@@ -382,7 +402,10 @@ unsafe fn type_i_update_bytes_avx2(
             let la = load32!(active_b, l);
 
             // inc = present & (boost | keep) & la  (all values 0 or 1)
-            let inc = _mm256_and_si256(_mm256_and_si256(present, _mm256_or_si256(boost_v, keep_v)), la);
+            let inc = _mm256_and_si256(
+                _mm256_and_si256(present, _mm256_or_si256(boost_v, keep_v)),
+                la,
+            );
             // t_clamped = min(t + inc, max_state)
             let t_clamped = _mm256_min_epu8(_mm256_adds_epu8(t, inc), max_state_v);
 
@@ -391,7 +414,10 @@ unsafe fn type_i_update_bytes_avx2(
             // not_at_max: 0xFF where t != max_state, 0 where t == max_state
             let not_at_max = _mm256_andnot_si256(_mm256_cmpeq_epi8(t, max_state_v), all_ones);
             // dec = absent & inv & la (0 or 1); zeroed out where t == max_state
-            let dec = _mm256_and_si256(_mm256_and_si256(_mm256_and_si256(absent, inv_v), la), not_at_max);
+            let dec = _mm256_and_si256(
+                _mm256_and_si256(_mm256_and_si256(absent, inv_v), la),
+                not_at_max,
+            );
 
             // native saturating unsigned byte subtract
             let result = _mm256_subs_epu8(t_clamped, dec);
@@ -463,7 +489,9 @@ pub(crate) fn type_ii_update_bytes(
     {
         if is_x86_feature_detected!("avx2") {
             // SAFETY: avx2 presence verified by the runtime check above.
-            return unsafe { type_ii_update_bytes_avx2(ta, n_literals, lit_b, active_b, half, max_state) };
+            return unsafe {
+                type_ii_update_bytes_avx2(ta, n_literals, lit_b, active_b, half, max_state)
+            };
         }
     }
     type_ii_update_bytes_scalar(ta, n_literals, lit_b, active_b, half, max_state);
@@ -627,7 +655,17 @@ pub(crate) fn clause_type_i_bytes(
     if fired && under_limit {
         *weight = (*weight + 1).min(wmax);
     }
-    type_i_update_bytes(ta, n_literals, fired && under_limit, boost, &lit_b, &inv_b, &keep_b, &active_b, max_state);
+    type_i_update_bytes(
+        ta,
+        n_literals,
+        fired && under_limit,
+        boost,
+        &lit_b,
+        &inv_b,
+        &keep_b,
+        &active_b,
+        max_state,
+    );
     rebuild_include(ta, inc, valid, words, n_literals, half);
 }
 
@@ -641,6 +679,7 @@ pub(crate) fn clause_type_i_bytes(
 /// On fire: weight--; increments each absent active excluded non-zero TA counter.
 ///
 /// **Absorbing exclude state**: `ta[l] == 0` is immune to increment feedback.
+#[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 #[inline(always)]
 pub(crate) fn clause_type_ii_bytes(
@@ -702,8 +741,14 @@ mod tests {
         let lit = vec![!0u64]; // all features present
         let valid = vec![!0u64];
         let lit_active = vec![!0u64];
-        assert!(!fire_predict(&inc, &lit, &valid, words), "inference: empty clause must not vote");
-        assert!(clause_fire(&inc, &lit, &valid, words, &lit_active), "training: empty clause must fire");
+        assert!(
+            !fire_predict(&inc, &lit, &valid, words),
+            "inference: empty clause must not vote"
+        );
+        assert!(
+            clause_fire(&inc, &lit, &valid, words, &lit_active),
+            "training: empty clause must fire"
+        );
     }
 
     // ---- expand_bits_to_bytes round-trip ------------------------------------
@@ -753,7 +798,10 @@ mod tests {
         let valid = vec![0xFFu64];
         let mut inc = vec![!0u64]; // start with all bits set to verify they get cleared
         rebuild_include(&ta, &mut inc, &valid, words, n_literals, half);
-        assert_eq!(inc[0], 0, "all ta < half must produce an empty include bitset");
+        assert_eq!(
+            inc[0], 0,
+            "all ta < half must produce an empty include bitset"
+        );
     }
 
     #[test]
@@ -768,7 +816,9 @@ mod tests {
             let half = 128u8;
             let words = words_for(n);
             // Even-indexed literals → included (ta=half); odd → excluded (ta=half-1).
-            let ta: Vec<u8> = (0..n).map(|l| if l % 2 == 0 { half } else { half - 1 }).collect();
+            let ta: Vec<u8> = (0..n)
+                .map(|l| if l % 2 == 0 { half } else { half - 1 })
+                .collect();
             let mut valid = vec![0u64; words];
             for l in 0..n {
                 valid[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
@@ -779,7 +829,10 @@ mod tests {
             for l in 0..n {
                 let got: u64 = (inc[l / WORD_BITS] >> (l % WORD_BITS)) & 1;
                 let expected: u64 = if l % 2 == 0 { 1 } else { 0 };
-                assert_eq!(got, expected, "n={n} literal {l}: expected {expected} got {got}");
+                assert_eq!(
+                    got, expected,
+                    "n={n} literal {l}: expected {expected} got {got}"
+                );
             }
         }
     }
@@ -819,14 +872,16 @@ mod tests {
         let n_literals = 4usize;
         let max_state = 15u8;
         let mut ta = vec![5u8, 1, 0, max_state];
-        let lit_b    = vec![0u8; 4]; // all absent
-        let inv_b    = vec![1u8; 4]; // always trigger decrement
-        let keep_b   = vec![0u8; 4];
+        let lit_b = vec![0u8; 4]; // all absent
+        let inv_b = vec![1u8; 4]; // always trigger decrement
+        let keep_b = vec![0u8; 4];
         let active_b = vec![1u8; 4];
-        type_i_update_bytes(&mut ta, n_literals, false, false, &lit_b, &inv_b, &keep_b, &active_b, max_state);
-        assert_eq!(ta[0], 4,         "5 - 1 = 4");
-        assert_eq!(ta[1], 0,         "1 - 1 = 0");
-        assert_eq!(ta[2], 0,         "0 - 1 saturates at 0");
+        type_i_update_bytes(
+            &mut ta, n_literals, false, false, &lit_b, &inv_b, &keep_b, &active_b, max_state,
+        );
+        assert_eq!(ta[0], 4, "5 - 1 = 4");
+        assert_eq!(ta[1], 0, "1 - 1 = 0");
+        assert_eq!(ta[2], 0, "0 - 1 saturates at 0");
         assert_eq!(ta[3], max_state, "max_state is immune to Ib decrement");
     }
 
@@ -844,14 +899,14 @@ mod tests {
         // lit 2: absent, included (ta≥half)  → skipped (excluded guard)
         // lit 3: absent, excluded, zero      → skipped (absorbing-exclude guard)
         // lit 4: absent, excluded, non-zero  → incremented to the half boundary
-        let mut ta   = vec![3u8, 3, half, 0, half - 1];
-        let lit_b    = vec![0u8, 1, 0, 0, 0];
+        let mut ta = vec![3u8, 3, half, 0, half - 1];
+        let lit_b = vec![0u8, 1, 0, 0, 0];
         let active_b = vec![1u8; 5];
         type_ii_update_bytes(&mut ta, n_literals, &lit_b, &active_b, half, max_state);
-        assert_eq!(ta[0], 4,    "absent excluded non-zero → incremented");
-        assert_eq!(ta[1], 3,    "present → unchanged");
+        assert_eq!(ta[0], 4, "absent excluded non-zero → incremented");
+        assert_eq!(ta[1], 3, "present → unchanged");
         assert_eq!(ta[2], half, "included (ta≥half) → unchanged");
-        assert_eq!(ta[3], 0,    "ta=0 (absorbing exclude) → stays at 0");
+        assert_eq!(ta[3], 0, "ta=0 (absorbing exclude) → stays at 0");
         assert_eq!(ta[4], half, "absent excluded non-zero incremented to half");
     }
 }

@@ -19,7 +19,10 @@ const N_FEATURES: usize = 5000; // must match scripts/prepare_imdb.py
 
 /// Load pre-processed IMDb bag-of-words data and train a weighted TM for the configured number of epochs.
 fn main() {
-    let epochs: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(40);
+    let epochs: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
 
     let load = |p: &str| {
         data::read_sparse_binary(p, N_FEATURES).unwrap_or_else(|e| {
@@ -29,11 +32,16 @@ fn main() {
     };
     let (xtr, ytr) = load("data/imdb_train.txt");
     let (xte, yte) = load("data/imdb_test.txt");
-    println!("train={} test={} vocab(features)={N_FEATURES}", xtr.len(), xte.len());
+    println!(
+        "train={} test={} vocab(features)={N_FEATURES}",
+        xtr.len(),
+        xte.len()
+    );
 
     let encoder = Encoder::for_binary(N_FEATURES);
-    let mut tm = TsetlinMachine::with_config(2, encoder.n_features(), 10000, 8000, 2.0, 8, true, 42)
-        .clause_drop_p(0.75);
+    let mut tm =
+        TsetlinMachine::with_config(2, encoder.n_features(), 10000, 8000, 2.0, 8, true, 42)
+            .clause_drop_p(0.75);
 
     let xtr_r: Vec<&[u8]> = xtr.iter().map(|v| v.as_slice()).collect();
     let xte_r: Vec<&[u8]> = xte.iter().map(|v| v.as_slice()).collect();

@@ -1,4 +1,4 @@
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tmu_rs::TsetlinMachine;
 
 // ---- dataset helpers -------------------------------------------------------
@@ -169,13 +169,21 @@ fn bench_pack(c: &mut Criterion) {
         let sample: Vec<u8> = (0..n_features).map(|i| (i & 1) as u8).collect();
         let mut out = vec![0u64; (2 * n_features + 63) / 64];
         g.throughput(Throughput::Elements(n_features as u64));
-        g.bench_with_input(BenchmarkId::new("features", n_features), &n_features, |b, &nf| {
-            b.iter(|| TsetlinMachine::pack(&sample, nf, &mut out))
-        });
+        g.bench_with_input(
+            BenchmarkId::new("features", n_features),
+            &n_features,
+            |b, &nf| b.iter(|| TsetlinMachine::pack(&sample, nf, &mut out)),
+        );
     }
 
     g.finish();
 }
 
-criterion_group!(benches, bench_fit_epoch, bench_fit_epoch_packed, bench_predict, bench_pack);
+criterion_group!(
+    benches,
+    bench_fit_epoch,
+    bench_fit_epoch_packed,
+    bench_predict,
+    bench_pack
+);
 criterion_main!(benches);
