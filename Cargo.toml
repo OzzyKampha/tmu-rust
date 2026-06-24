@@ -78,6 +78,11 @@ path = "examples/absorb_timing.rs"
 name = "bench_training"
 path = "examples/bench_training.rs"
 
+# --- autoencoder demo ---
+[[example]]
+name = "autoencoder"       # TMAutoEncoder: reconstruct binary input (not in original TMU examples)
+path = "examples/autoencoder.rs"
+
 [[bench]]
 name = "throughput"
 path = "benches/throughput.rs"
