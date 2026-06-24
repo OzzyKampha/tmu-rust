@@ -1,6 +1,6 @@
 [package]
 name = "tmu-rs"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 description = "Bit-packed weighted multiclass Tsetlin Machine in Rust, with bit-parallel/multi-threaded training, a fast booleanizer, and ports of the TMU classification demos."
 license = "MIT"
@@ -81,6 +81,15 @@ path = "examples/absorb_timing.rs"
 [[example]]
 name = "bench_training"
 path = "examples/bench_training.rs"
+
+# --- autoencoder demo + benchmark ---
+[[example]]
+name = "autoencoder"       # TMAutoEncoder: reconstruct binary input (not in original TMU examples)
+path = "examples/autoencoder.rs"
+
+[[example]]
+name = "bench_autoencoder" # TMAutoEncoder: throughput + accuracy benchmark vs Python TMU
+path = "examples/bench_autoencoder.rs"
 
 [[bench]]
 name = "throughput"

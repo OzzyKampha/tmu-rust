@@ -195,3 +195,144 @@ split evenly across classes. `compare_tmu.py` passes
 `number_of_clauses = n_clauses_per_class × n_classes` to match the Rust
 `with_config(..., clauses_per_class, ...)` argument, ensuring both run the same
 per-class clause count.
+
+### TMAutoEncoder clause count convention
+
+The Rust and Python autoencoder architectures differ:
+
+- **Rust** (`TMAutoEncoder::with_config(n, clauses_per_output, ...)`) gives each output
+  its own **dedicated** clause bank of `clauses_per_output` clauses. Total clauses =
+  `n_features × clauses_per_output`.
+- **Python** (`TMAutoEncoder(number_of_clauses=N, ...)`) uses a single **shared** clause
+  bank of `N` total clauses across all outputs. Each output has its own weight bank but
+  reads the same `N` clause outputs.
+
+`bench_autoencoder.py` passes `number_of_clauses = n_features × clauses_per_output` so
+the total clause count matches the Rust configuration. The update cost per epoch differs
+because Python's inner loop iterates over all `N` clauses for each of the `n_features`
+outputs, whereas Rust iterates over only `clauses_per_output` clauses per output.
+
+---
+
+## Autoencoder benchmark
+
+Compares `TMAutoEncoder` throughput between this Rust implementation and Python `tmu`.
+Reconstruction accuracy is reported for the Rust implementation only — see the note on
+Python TMU accuracy below.
+
+### Running the autoencoder benchmark
+
+```sh
+# Rust (both configs: accuracy then throughput)
+cargo run --release --example bench_autoencoder
+
+# Rust with Rayon clause-parallel
+cargo run --release --features parallel --example bench_autoencoder
+
+# Python TMU (large throughput config only)
+python scripts/bench_autoencoder.py
+
+# Python TMU (small accuracy config only)
+python scripts/bench_autoencoder.py --small
+
+# Python TMU (both)
+python scripts/bench_autoencoder.py --both
+```
+
+### Autoencoder benchmark configs
+
+| Parameter | Small (accuracy) | Large (throughput) |
+|---|---|---|
+| n\_features | 20 | 200 |
+| clauses\_per\_output | 40 | 50 |
+| T (threshold) | 20 | 200 |
+| s | 3.9 | 2.0 |
+| state\_bits | 8 | 8 |
+| n\_train | 2 000 | 2 000 |
+| timed epochs | 20 | 8 |
+| warmup epochs | 0 | 2 |
+| clause updates / epoch (Rust) | 1.6 M | 20 M |
+| clause updates / epoch (Python) | 32 M | 4 000 M |
+
+**Small** is used to verify **Rust accuracy** — the Rust implementation converges from
+~50% to >98% reconstruction accuracy within 20 epochs on structured binary data
+(mirrored-half: bits `n/2+i` = bits `i`). Python TMU does not converge on this config
+(see the tmu accuracy note below).
+
+**Large** is used for **throughput comparison** — exercises the clause update hot loop
+at scale. Both Rust and Python produce valid speed numbers here.
+
+### Autoencoder clause updates formula
+
+The two implementations have different per-epoch work:
+
+**Rust** — dedicated per-output clause banks:
+```
+clause_updates_per_epoch = n_train × n_features × clauses_per_output
+```
+
+**Python** — shared clause bank iterated per output:
+```
+clause_updates_per_epoch = n_train × n_features × total_clauses
+                         = n_train × n_features × (n_features × clauses_per_output)
+```
+
+For the large config this gives Rust 20 M and Python 4 000 M clause updates per epoch —
+a 200× difference. Both throughput numbers (Mclause-updates/s) measure clause-update
+kernel throughput but over architecturally different inner loops.
+
+### Sample results (4-core cloud VM)
+
+**Rust** (sequential, `cargo run --release --example bench_autoencoder`):
+
+```
+Mode   : SEQUENTIAL  [small (accuracy check)]
+Config : 20 features · 40 clauses/output · T=20 · s=3.9 · 2000 training samples
+Workload: 1 M clause updates per epoch
+
+epoch         ms      samples/s    Mclause-ups/s  recon-acc
+    0      44.7          44704             35.8   0.9755
+    ...
+   19      37.5          53346             42.7   0.9834
+
+── Summary (20 timed epochs) ──────────────────────────────────────
+  median    38.1 ms  |  mean    40.1 ms  |  min    37.5 ms  |  max    57.8 ms
+  throughput  :     52431 samples/s          41.9 Mclause-updates/s
+
+Mode   : SEQUENTIAL  [large (throughput)]
+Config : 200 features · 50 clauses/output · T=200 · s=2 · 2000 training samples
+Workload: 20 M clause updates per epoch
+
+  median  1025.9 ms  | throughput: 1950 samples/s  19.5 Mclause-updates/s
+```
+
+**Python TMU** (`python scripts/bench_autoencoder.py --both`):
+
+```
+Mode   : Python TMU  [small (accuracy check)]
+Config : 20 features · 40 clauses/output · T=20 · s=3.9 · 2000 training samples
+Workload: 32 M clause updates per epoch
+
+  median  6135.8 ms  | throughput: 326 samples/s   5.2 Mclause-updates/s
+  recon-acc: 0.5267 (does not converge — see tmu accuracy note below)
+
+Mode   : Python TMU  [large (throughput)]
+Config : 200 features · 50 clauses/output · T=200 · s=2.0 · 2000 training samples
+Workload: 4000 M clause updates per epoch
+
+  median 270247 ms  | throughput: 7 samples/s   14.8 Mclause-updates/s
+```
+
+### tmu Python accuracy note
+
+Python `tmu` versions tested (0.7.9, 0.8.3) do not converge on the small accuracy config
+due to known implementation issues:
+
+- **tmu 0.8.3**: `produce_autoencoder_example` returns a `target_value` computed by
+  Python's RNG independently from the C extension's internal sample selection (which
+  uses `rand()`). This creates ~35% label-sample mismatch and prevents learning.
+- **tmu 0.7.9**: Labels are consistent (batch C function handles both sample and target),
+  but the shared clause bank fails to converge with the benchmark parameters — only the
+  first output converges while others stay at ~50%.
+
+Throughput numbers from the Python benchmark are unaffected by these accuracy issues.
