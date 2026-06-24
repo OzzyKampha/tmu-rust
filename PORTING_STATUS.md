@@ -40,7 +40,7 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | Batch prediction | ✅ | `predict_batch_packed()` |
 | Raw class scores | ✅ | `scores_packed()` |
 | GPU / CUDA acceleration | ❌ Not planned | |
-| Imbalanced-class weighting | ❌ Not planned | Per-class clause weights |
+| Imbalanced-class weighting | ✅ | Per-class feedback scaling via `class_weights()` builder method |
 
 ---
 
