@@ -1,7 +1,10 @@
-//! TMAutoEncoder demo: learn to reconstruct random 20-bit binary vectors.
+//! TMAutoEncoder demo: learn to reconstruct 20-bit binary vectors with structure.
 //!
-//! Demonstrates that reconstruction accuracy improves over epochs, starting
-//! near chance (50%) and converging toward high accuracy.
+//! The second half of each vector mirrors the first half, so each output bit
+//! can be predicted from the other bits (proper autoencoder — feature o is
+//! masked from the input when predicting output o). Demonstrates that
+//! reconstruction accuracy improves over epochs, starting near 50% and
+//! converging toward high accuracy.
 
 use tmu_rs::{Encoder, TMAutoEncoder};
 
@@ -10,21 +13,20 @@ fn main() {
     let n_train = 2000usize;
     let n_test = 500usize;
 
-    // Generate random binary training and test data.
-    let mut seed = 0x1234_5678u64;
-    let mut next_bit = || {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        (seed & 1) as u8
+    // Generate structured binary data: first half random, second half = first half.
+    // This gives the autoencoder something to learn (bit n/2+i correlates with bit i).
+    // Random i.i.d. data would stay near 50% — there's nothing inter-bit to discover.
+    let half = n_features / 2;
+    let mut rng = tmu_rs::Rng::new(0x1234_5678);
+    let mut make_sample = || {
+        let first: Vec<u8> = (0..half).map(|_| (rng.next_u64() & 1) as u8).collect();
+        let mut v = first.clone();
+        v.extend_from_slice(&first);
+        v
     };
 
-    let xs_train: Vec<Vec<u8>> = (0..n_train)
-        .map(|_| (0..n_features).map(|_| next_bit()).collect())
-        .collect();
-    let xs_test: Vec<Vec<u8>> = (0..n_test)
-        .map(|_| (0..n_features).map(|_| next_bit()).collect())
-        .collect();
+    let xs_train: Vec<Vec<u8>> = (0..n_train).map(|_| make_sample()).collect();
+    let xs_test: Vec<Vec<u8>> = (0..n_test).map(|_| make_sample()).collect();
 
     let enc = Encoder::for_binary(n_features);
     let batch_train = enc.encode_batch(&xs_train.iter().map(|v| v.as_slice()).collect::<Vec<_>>());

@@ -60,9 +60,18 @@ fn run_bench(cfg: &Config) {
         print_accuracy,
     } = cfg;
 
+    // Structured data: second half mirrors first half (bit n/2+i = bit i).
+    // Gives the autoencoder learnable correlations — random i.i.d. would stay
+    // at ~50% reconstruction accuracy since there's nothing inter-bit to learn.
+    let half = n_features / 2;
     let mut rng = Rng::new(42);
     let xs: Vec<Vec<u8>> = (0..*n_train)
-        .map(|_| (0..*n_features).map(|_| (rng.next_u64() & 1) as u8).collect())
+        .map(|_| {
+            let first: Vec<u8> = (0..half).map(|_| (rng.next_u64() & 1) as u8).collect();
+            let mut v = first.clone();
+            v.extend_from_slice(&first);
+            v
+        })
         .collect();
     let xs_ref: Vec<&[u8]> = xs.iter().map(|v| v.as_slice()).collect();
 

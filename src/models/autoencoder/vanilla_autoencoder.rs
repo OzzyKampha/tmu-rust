@@ -500,7 +500,7 @@ impl TMAutoEncoder {
 
         let lit_b = expand_bits_to_bytes(lit, n_literals);
 
-        let lit_active: Vec<u64> = if self.literal_drop_p > 0.0 {
+        let mut lit_active: Vec<u64> = if self.literal_drop_p > 0.0 {
             let rng = &mut self.literal_rng;
             let dig = &self.dig_lit_active;
             (0..words).map(|_| bmask_word(rng, dig)).collect()
@@ -508,12 +508,34 @@ impl TMAutoEncoder {
             vec![!0u64; words]
         };
 
-        let active_b = expand_bits_to_bytes(&lit_active, n_literals);
+        let mut active_b = expand_bits_to_bytes(&lit_active, n_literals);
 
         for o in 0..n_features {
             let target = ((lit[o / WORD_BITS] >> (o % WORD_BITS)) & 1) as u8;
+
+            // Mask out literal o and its negation (o + n_features) from the active mask
+            // before training output o. This prevents trivial memorization where the
+            // clause uses feature o directly to predict output o (proper autoencoder).
+            let neg_o = o + n_features;
+            let word_o = o / WORD_BITS;
+            let word_neg_o = neg_o / WORD_BITS;
+            let save_word_o = lit_active[word_o];
+            let save_word_neg_o = lit_active[word_neg_o];
+            let save_ab_o = active_b[o];
+            let save_ab_neg_o = active_b[neg_o];
+            lit_active[word_o] &= !(1u64 << (o % WORD_BITS));
+            lit_active[word_neg_o] &= !(1u64 << (neg_o % WORD_BITS));
+            active_b[o] = 0;
+            active_b[neg_o] = 0;
+
             let sum = self.output_sum_train(o, &lit_active);
             self.update_output(o, target, sum, &lit_active, &lit_b, &active_b);
+
+            // Restore the active mask for the next output's iteration.
+            lit_active[word_o] = save_word_o;
+            lit_active[word_neg_o] = save_word_neg_o;
+            active_b[o] = save_ab_o;
+            active_b[neg_o] = save_ab_neg_o;
         }
     }
 
@@ -675,7 +697,18 @@ mod tests {
 
     #[test]
     fn autoencoder_reconstructs_above_chance() {
-        let xs = make_bits(2000, 1);
+        // Use structured data: bits 6-11 are copies of bits 0-5.
+        // The autoencoder can learn bit 6+i from bit i (and vice versa).
+        // Random i.i.d. data can't exceed ~0.5 (nothing to learn per feature).
+        let mut rng = Rng::new(1);
+        let xs: Vec<Vec<u8>> = (0..2000)
+            .map(|_| {
+                let half: Vec<u8> = (0..6).map(|_| (rng.next_u64() & 1) as u8).collect();
+                let mut f = half.clone();
+                f.extend_from_slice(&half);
+                f
+            })
+            .collect();
         let e = enc(12);
         let batch = e.encode_batch(&as_slices(&xs));
 
@@ -689,14 +722,16 @@ mod tests {
 
     #[test]
     fn autoencoder_learns_structured_input() {
-        // Create data where bit 0 = XOR(bit 1, bit 2). The autoencoder should
-        // learn this dependency and reach higher accuracy than random chance.
+        // Data: bits 6-11 mirror bits 0-5. Every output bit can be predicted
+        // from its mirror counterpart — ensures all bits are learnable after
+        // the feature-o masking fix (XOR-only structure limits learnable bits).
         let mut rng = Rng::new(7);
         let n = 3000usize;
         let xs: Vec<Vec<u8>> = (0..n)
             .map(|_| {
-                let mut f: Vec<u8> = (0..12).map(|_| (rng.next_u64() & 1) as u8).collect();
-                f[0] = f[1] ^ f[2];
+                let half: Vec<u8> = (0..6).map(|_| (rng.next_u64() & 1) as u8).collect();
+                let mut f = half.clone();
+                f.extend_from_slice(&half);
                 f
             })
             .collect();

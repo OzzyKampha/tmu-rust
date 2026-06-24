@@ -17,7 +17,7 @@ except ImportError:
     sys.exit("ERROR: numpy is required.  Install with: pip install numpy")
 
 try:
-    from tmu.models.autoencoder.vanilla import TMAutoEncoder
+    from tmu.models.autoencoder.autoencoder import TMAutoEncoder
 except ImportError:
     sys.exit(
         "ERROR: tmu is not installed.\n"
@@ -27,9 +27,16 @@ except ImportError:
 
 # ── Configs ──────────────────────────────────────────────────────────────────
 #
-# clauses_per_output matches Rust's TMAutoEncoder::with_config() second argument.
-# TMAutoEncoder takes number_of_clauses as the per-output count (unlike TMClassifier
-# which takes the total across all classes).
+# Python TMU's TMAutoEncoder uses a SHARED clause bank across all output positions,
+# unlike the Rust implementation which gives each output its own dedicated clauses.
+# To match Rust's total clause count (n_features * clauses_per_output), we pass
+# number_of_clauses = n_features * clauses_per_output to the Python model.
+#
+# Clause-updates formula (Python):
+#   n_train * n_features * total_clauses
+#   = n_train * n_features * (n_features * clauses_per_output)
+# because the inner update loop iterates over all n_features outputs,
+# each time potentially updating all total_clauses clauses.
 
 LARGE = dict(
     label               = "large (throughput)",
@@ -60,10 +67,16 @@ SMALL = dict(
 )
 
 
-def make_binary_data(n_train: int, n_features: int, seed: int):
-    """Random i.i.d. Bernoulli(0.5) binary matrix, no labels needed."""
+def make_structured_data(n_train: int, n_features: int, seed: int):
+    """
+    Structured binary matrix: second half mirrors first half (bit n/2+i = bit i).
+    Gives the autoencoder learnable correlations. Random i.i.d. data stays at ~50%
+    reconstruction accuracy (nothing inter-bit to learn per feature).
+    """
+    half = n_features // 2
     rng = np.random.default_rng(seed)
-    xs = rng.integers(0, 2, size=(n_train, n_features), dtype=np.uint32)
+    first = rng.integers(0, 2, size=(n_train, half), dtype=np.uint32)
+    xs = np.concatenate([first, first], axis=1)
     return xs
 
 
@@ -80,14 +93,16 @@ def run_bench(cfg: dict) -> dict:
     seed               = cfg["seed"]
     print_accuracy     = cfg["print_accuracy"]
 
-    xs = make_binary_data(n_train, n_features, seed)
+    xs = make_structured_data(n_train, n_features, seed)
 
-    # clause_updates_per_epoch = n_train × n_features × clauses_per_output
-    # (all n_features outputs are updated per sample)
-    clause_updates_per_epoch = n_train * n_features * clauses_per_output
+    # Python TMU uses a shared clause bank: number_of_clauses is the TOTAL.
+    # We pass n_features * clauses_per_output to match Rust's total parameter count.
+    # Each update step iterates over n_features outputs × total_clauses clauses.
+    total_clauses = n_features * clauses_per_output
+    clause_updates_per_epoch = n_train * n_features * total_clauses
 
     ae = TMAutoEncoder(
-        number_of_clauses       = clauses_per_output,
+        number_of_clauses       = total_clauses,
         T                       = threshold,
         s                       = s,
         number_of_state_bits_ta = state_bits,
