@@ -4,4 +4,4 @@
 
 pub mod classification;
 
-pub use classification::TsetlinMachine;
+pub use classification::{CoalescedTsetlinMachine, TsetlinMachine};

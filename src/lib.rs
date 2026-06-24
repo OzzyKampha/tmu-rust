@@ -8,6 +8,7 @@
 //! | `clause_bank::dense` | Bit-manipulation primitives (fire, inc/dec, type I/II feedback, pack). Mirrors TMU's `clause_bank_dense.py`. |
 //! | [`models`] | TM model implementations. |
 //! | [`TsetlinMachine`] | Vanilla weighted multiclass TM. Mirrors TMU's `vanilla_classifier.py`. |
+//! | [`CoalescedTsetlinMachine`] | Coalesced TM: shared clause bank + signed per-class weights. Mirrors TMU's `coalesced_classifier.py`. |
 //! | [`data`] | CSV loaders for binary-valued datasets. |
 //! | [`Booleanizer`] | Feature booleanizer (thresholding / thermometer encoding). |
 //! | [`Rng`] | Fast xoshiro256** RNG used throughout. |
@@ -31,5 +32,5 @@ mod rng;
 
 pub use booleanizer::Booleanizer;
 pub use encoder::{EncodedBatch, EncodedSample, Encoder};
-pub use models::TsetlinMachine;
+pub use models::{CoalescedTsetlinMachine, TsetlinMachine};
 pub use rng::Rng;

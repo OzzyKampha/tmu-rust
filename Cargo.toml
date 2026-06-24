@@ -43,6 +43,10 @@ name = "interpretability"  # TMU InterpretabilityDemo
 path = "examples/interpretability.rs"
 
 [[example]]
+name = "coalesced"         # TMU TMCoalescedClassifier demo
+path = "examples/coalesced.rs"
+
+[[example]]
 name = "breast_cancer"     # TMU BreastCancerDemo
 path = "examples/breast_cancer.rs"
 
