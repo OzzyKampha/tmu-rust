@@ -23,7 +23,9 @@ fn make(n: usize, seed: u64) -> (Vec<Vec<u8>>, Vec<usize>) {
     let mut xs = Vec::with_capacity(n);
     let mut ys = Vec::with_capacity(n);
     for _ in 0..n {
-        let f: Vec<u8> = (0..N_FEATURES).map(|_| (rng.next_u64() & 1) as u8).collect();
+        let f: Vec<u8> = (0..N_FEATURES)
+            .map(|_| (rng.next_u64() & 1) as u8)
+            .collect();
         let y = ((f[0] ^ f[1]) as usize) * 2 + (f[2] ^ f[3]) as usize;
         xs.push(f);
         ys.push(y);
@@ -66,7 +68,10 @@ fn main() {
             );
         }
     }
-    println!("\nfinal test accuracy: {:.4}", tm.accuracy(&packed_te, &yte));
+    println!(
+        "\nfinal test accuracy: {:.4}",
+        tm.accuracy(&packed_te, &yte)
+    );
 
     println!("\nLearned signed weights for the first 8 shared clauses (rows = clause):");
     print!("{:>8}", "clause");

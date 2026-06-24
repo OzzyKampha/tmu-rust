@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use tmu_rs::TsetlinMachine;
+use tmu_rs::{EncodedSample, Encoder, TsetlinMachine};
 
 // ---- dataset helpers -------------------------------------------------------
 
@@ -28,7 +28,8 @@ fn as_slices(xs: &[Vec<u8>]) -> Vec<&[u8]> {
 
 // ---- training benchmarks ---------------------------------------------------
 
-/// Benchmark `fit_epoch` (pack + train) across varying clause counts and multiclass configurations.
+/// Benchmark encode + `fit_epoch` (pack + train) across varying clause counts and
+/// multiclass configurations.
 fn bench_fit_epoch(c: &mut Criterion) {
     let mut g = c.benchmark_group("fit_epoch");
 
@@ -36,11 +37,13 @@ fn bench_fit_epoch(c: &mut Criterion) {
     for &cpc in &[10usize, 40, 100, 200, 500] {
         let (xs, ys) = xor_dataset(1000);
         let xr = as_slices(&xs);
+        let encoder = Encoder::for_binary(12);
         g.throughput(Throughput::Elements(1000));
         g.bench_with_input(BenchmarkId::new("xor_clauses", cpc), &cpc, |b, &cpc| {
             b.iter(|| {
+                let batch = encoder.encode_batch(&xr);
                 let mut tm = TsetlinMachine::with_config(2, 12, cpc, 15, 3.9, 8, true, 42);
-                tm.fit_epoch(&xr, &ys);
+                tm.fit_epoch(&batch, &ys);
             })
         });
     }
@@ -49,11 +52,13 @@ fn bench_fit_epoch(c: &mut Criterion) {
     {
         let (xs, ys) = multiclass_dataset(2000, 64, 10);
         let xr = as_slices(&xs);
+        let encoder = Encoder::for_binary(64);
         g.throughput(Throughput::Elements(2000));
         g.bench_function("multiclass_10x64", |b| {
             b.iter(|| {
+                let batch = encoder.encode_batch(&xr);
                 let mut tm = TsetlinMachine::with_config(10, 64, 20, 25, 5.0, 8, true, 42);
-                tm.fit_epoch(&xr, &ys);
+                tm.fit_epoch(&batch, &ys);
             })
         });
     }
@@ -61,50 +66,35 @@ fn bench_fit_epoch(c: &mut Criterion) {
     g.finish();
 }
 
-// ---- packed training benchmarks (pre-pack once, reuse across epochs) -------
+// ---- pre-encoded training benchmarks (encode once, reuse across epochs) ----
 
-/// Benchmark `fit_epoch_packed` (pre-packed data) to isolate training throughput from packing cost.
+/// Benchmark `fit_epoch` on a pre-encoded batch to isolate training throughput from
+/// the encoding (packing) cost.
 fn bench_fit_epoch_packed(c: &mut Criterion) {
     let mut g = c.benchmark_group("fit_epoch_packed");
 
     for &cpc in &[10usize, 40, 100, 200, 500] {
         let (xs, ys) = xor_dataset(1000);
-        let tm0 = TsetlinMachine::with_config(2, 12, cpc, 15, 3.9, 8, true, 42);
-        let w = tm0.words_per_sample();
-        let packed: Vec<u64> = xs
-            .iter()
-            .flat_map(|x| {
-                let mut lit = vec![0u64; w];
-                TsetlinMachine::pack(x, 12, &mut lit);
-                lit
-            })
-            .collect();
+        let encoder = Encoder::for_binary(12);
+        let batch = encoder.encode_batch(&as_slices(&xs));
         g.throughput(Throughput::Elements(1000));
         g.bench_with_input(BenchmarkId::new("xor_clauses", cpc), &cpc, |b, &cpc| {
             b.iter(|| {
                 let mut tm = TsetlinMachine::with_config(2, 12, cpc, 15, 3.9, 8, true, 42);
-                tm.fit_epoch_packed(&packed, 1000, &ys);
+                tm.fit_epoch(&batch, &ys);
             })
         });
     }
 
     {
         let (xs, ys) = multiclass_dataset(2000, 64, 10);
-        let tm0 = TsetlinMachine::with_config(10, 64, 20, 25, 5.0, 8, true, 42);
-        let w = tm0.words_per_sample();
-        let packed: Vec<u64> = xs
-            .iter()
-            .flat_map(|x| {
-                let mut lit = vec![0u64; w];
-                TsetlinMachine::pack(x, 64, &mut lit);
-                lit
-            })
-            .collect();
+        let encoder = Encoder::for_binary(64);
+        let batch = encoder.encode_batch(&as_slices(&xs));
         g.throughput(Throughput::Elements(2000));
         g.bench_function("multiclass_10x64", |b| {
             b.iter(|| {
                 let mut tm = TsetlinMachine::with_config(10, 64, 20, 25, 5.0, 8, true, 42);
-                tm.fit_epoch_packed(&packed, 2000, &ys);
+                tm.fit_epoch(&batch, &ys);
             })
         });
     }
@@ -118,61 +108,55 @@ fn bench_fit_epoch_packed(c: &mut Criterion) {
 fn bench_predict(c: &mut Criterion) {
     let mut g = c.benchmark_group("predict");
 
-    // single-sample latency — pre-trained TM, one pack + predict call
+    // single-sample latency — pre-trained TM, one predict call on a pre-encoded sample
     {
         let (xs, ys) = xor_dataset(500);
-        let xr = as_slices(&xs);
+        let encoder = Encoder::for_binary(12);
+        let batch = encoder.encode_batch(&as_slices(&xs));
         let mut tm = TsetlinMachine::with_config(2, 12, 40, 15, 3.9, 8, true, 42);
         for _ in 0..10 {
-            tm.fit_epoch(&xr, &ys);
+            tm.fit_epoch(&batch, &ys);
         }
-        let sample = xs[0].as_slice();
+        let sample = encoder.encode_one(&xs[0]);
         g.throughput(Throughput::Elements(1));
-        g.bench_function("single_xor", |b| b.iter(|| tm.predict(sample)));
+        g.bench_function("single_xor", |b| b.iter(|| tm.predict(&sample)));
     }
 
-    // batch throughput — packed batch of N samples
+    // batch throughput — pre-encoded batch of N samples
     for &n in &[100usize, 1000, 10_000] {
         let (xs, ys) = xor_dataset(500);
-        let xr = as_slices(&xs);
+        let encoder = Encoder::for_binary(12);
+        let train = encoder.encode_batch(&as_slices(&xs));
         let mut tm = TsetlinMachine::with_config(2, 12, 40, 15, 3.9, 8, true, 42);
         for _ in 0..10 {
-            tm.fit_epoch(&xr, &ys);
+            tm.fit_epoch(&train, &ys);
         }
-        let w = tm.words_per_sample();
-        let batch: Vec<u64> = xs
-            .iter()
-            .cycle()
-            .take(n)
-            .flat_map(|x| {
-                let mut lit = vec![0u64; w];
-                tm.pack_sample(x, &mut lit);
-                lit
-            })
-            .collect();
+        let rows: Vec<&[u8]> = (0..n).map(|i| xs[i % xs.len()].as_slice()).collect();
+        let batch = encoder.encode_batch(&rows);
         g.throughput(Throughput::Elements(n as u64));
-        g.bench_with_input(BenchmarkId::new("batch_packed_xor", n), &n, |b, &n| {
-            b.iter(|| tm.predict_batch_packed(&batch, n))
+        g.bench_with_input(BenchmarkId::new("batch_xor", n), &n, |b, _| {
+            b.iter(|| tm.predict_batch(&batch))
         });
     }
 
     g.finish();
 }
 
-// ---- packing benchmark -----------------------------------------------------
+// ---- encoding (packing) benchmark ------------------------------------------
 
-/// Benchmark the `pack` function across varying feature counts.
+/// Benchmark the public packing primitive `EncodedSample::from_bits` across varying
+/// feature counts.  Unlike the lower-level internal `pack`, this allocates the output
+/// `EncodedSample` per call, so the measurement includes that allocation.
 fn bench_pack(c: &mut Criterion) {
     let mut g = c.benchmark_group("pack");
 
     for &n_features in &[12usize, 64, 256, 1024] {
         let sample: Vec<u8> = (0..n_features).map(|i| (i & 1) as u8).collect();
-        let mut out = vec![0u64; (2 * n_features + 63) / 64];
         g.throughput(Throughput::Elements(n_features as u64));
         g.bench_with_input(
             BenchmarkId::new("features", n_features),
             &n_features,
-            |b, &nf| b.iter(|| TsetlinMachine::pack(&sample, nf, &mut out)),
+            |b, &nf| b.iter(|| EncodedSample::from_bits(&sample, nf)),
         );
     }
 

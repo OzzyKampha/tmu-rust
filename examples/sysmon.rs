@@ -61,6 +61,7 @@ fn parse_record(raw: &str) -> Vec<String> {
 /// Label = suspicious (class 1) when either:
 ///   - an Office app (WINWORD/EXCEL) spawns a shell (powershell/cmd), or
 ///   - the process runs at `System` integrity while unsigned.
+///
 /// Otherwise benign (class 0).
 fn make(n: usize, seed: u64) -> (Vec<String>, Vec<usize>) {
     let images = [

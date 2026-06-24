@@ -136,7 +136,15 @@ fn apply_one_clause_coalesced(
             };
             let fired_under = out_j && under_limit;
             type_i_update_bytes(
-                ta, n_literals, fired_under, boost, lit_b, inv_b, keep_b, active_b, max_state,
+                ta,
+                n_literals,
+                fired_under,
+                boost,
+                lit_b,
+                inv_b,
+                keep_b,
+                active_b,
+                max_state,
             );
             rebuild_include(ta, inc, val, words, n_literals, half);
         } else if out_j {
@@ -232,7 +240,13 @@ impl CoalescedTsetlinMachine {
         // TA-init / feedback RNG sequences.
         let mut weight_rng = Rng::new(seed ^ 0x5747_4854_5F49_4E49u64); // "WGHT_INI"
         let weights = (0..n_classes * n_clauses)
-            .map(|_| if weight_rng.next_u64() & 1 == 0 { 1 } else { -1 })
+            .map(|_| {
+                if weight_rng.next_u64() & 1 == 0 {
+                    1
+                } else {
+                    -1
+                }
+            })
             .collect();
 
         let rngs = (0..n_clauses)
@@ -436,7 +450,12 @@ impl CoalescedTsetlinMachine {
     }
 
     /// Select the negative class (`!= y`) for a training sample.
-    fn choose_negative(&mut self, y: usize, clause_outputs: &[bool], clause_active: &[bool]) -> usize {
+    fn choose_negative(
+        &mut self,
+        y: usize,
+        clause_outputs: &[bool],
+        clause_active: &[bool],
+    ) -> usize {
         if self.focused_negative_sampling {
             let t = self.threshold as f64;
             let mut probs = vec![0f64; self.n_classes];
@@ -816,7 +835,10 @@ mod tests {
             tm.fit_epoch(&btr, &ys);
         }
         let acc = tm.accuracy(&bte, &yte);
-        assert!(acc > 0.85, "4-class coalesced should reach >0.85, got {acc}");
+        assert!(
+            acc > 0.85,
+            "4-class coalesced should reach >0.85, got {acc}"
+        );
     }
 
     #[test]
@@ -883,7 +905,10 @@ mod tests {
             tm.scores(&sample, &mut s);
             // Clamped scores must put the predicted class at (one of) the maxima.
             let max = *s.iter().max().unwrap();
-            assert_eq!(s[pred], max, "predict must agree with a maximal clamped score");
+            assert_eq!(
+                s[pred], max,
+                "predict must agree with a maximal clamped score"
+            );
         }
     }
 
@@ -941,8 +966,14 @@ mod tests {
             tm_uniform.fit_epoch(&btr, &ytr);
             tm_focused.fit_epoch(&btr, &ytr);
         }
-        assert!(tm_uniform.accuracy(&bte, &yte) > 0.85, "uniform should converge");
-        assert!(tm_focused.accuracy(&bte, &yte) > 0.85, "focused should converge");
+        assert!(
+            tm_uniform.accuracy(&bte, &yte) > 0.85,
+            "uniform should converge"
+        );
+        assert!(
+            tm_focused.accuracy(&bte, &yte) > 0.85,
+            "focused should converge"
+        );
     }
 
     #[test]
@@ -979,7 +1010,10 @@ mod tests {
             tm.fit_epoch(&btr, &ytr);
         }
         let acc = tm.accuracy(&bte, &yte);
-        assert!(acc > 0.85, "large shared bank should reach >0.85, got {acc}");
+        assert!(
+            acc > 0.85,
+            "large shared bank should reach >0.85, got {acc}"
+        );
     }
 
     #[test]
