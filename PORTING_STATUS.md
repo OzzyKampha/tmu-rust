@@ -77,6 +77,6 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | `IMDbTextCategorizationDemo` | `imdb` | ✅ Validated | 2000 clauses, T=80, s=10.0 |
 | Convolutional demos | — | ❌ Not ported | Requires `ConvolutionalTM` |
 | Regression demos | — | ❌ Not ported | Requires `TMRegressor` |
-| Autoencoder demos | — | ❌ Not ported | Requires `TMAutoEncoder` |
+| Autoencoder demos | `autoencoder`, `coalesced_autoencoder` | ✅ Ported | `TMAutoEncoder` (vanilla) + `TMCoalescedAutoEncoder` (shared-bank) |
 | Coalesced demo | `coalesced` | ✅ Validated | 4-class shared-bank demo; 100% accuracy |
 
