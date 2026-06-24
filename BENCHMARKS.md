@@ -320,7 +320,7 @@ Mode   : Python TMU  [large (throughput)]
 Config : 200 features · 50 clauses/output · T=200 · s=2.0 · 2000 training samples
 Workload: 4000 M clause updates per epoch
 
-  median ~273000 ms  | throughput: ~7 samples/s    ~14.7 Mclause-updates/s
+  median 270247 ms  | throughput: 7 samples/s   14.8 Mclause-updates/s
 ```
 
 ### tmu Python accuracy note
