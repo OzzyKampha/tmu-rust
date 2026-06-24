@@ -11,7 +11,8 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | `TMClassifier` | ✅ Ported | Weighted multiclass; full training + inference API |
 | `TMCoalesced` | ✅ Ported | Shared clause bank + signed per-class weight matrix; focused negative sampling |
 | `TMRegressor` | ❌ Not ported | Requires continuous-output learning rule |
-| `TMAutoEncoder` | ❌ Not ported | Unsupervised; different clause update logic |
+| `TMAutoEncoder` | ✅ Ported | Unsupervised; dedicated per-output clause banks |
+| `TMCoalescedAutoEncoder` | ✅ Ported | Coalesced variant: shared clause bank + signed per-output weights |
 | `TMCompositeClassifier` | ❌ Not ported | Hybrid architecture |
 | Convolutional TM | ❌ Not ported | Requires receptive-field clause structure |
 
