@@ -101,7 +101,15 @@ fn apply_one_clause_coalesced(
             };
             let fired_under = out_j && under_limit;
             type_i_update_bytes(
-                ta, n_literals, fired_under, boost, lit_b, inv_b, keep_b, active_b, max_state,
+                ta,
+                n_literals,
+                fired_under,
+                boost,
+                lit_b,
+                inv_b,
+                keep_b,
+                active_b,
+                max_state,
             );
             rebuild_include(ta, inc, val, words, n_literals, half);
         } else if out_j {
@@ -164,7 +172,11 @@ impl TMCoalescedAutoEncoder {
         for j in 0..n_clauses {
             let tb = j * n_literals;
             for l in 0..n_literals {
-                ta[tb + l] = if rng.next_u64() & 1 == 0 { half - 1 } else { half };
+                ta[tb + l] = if rng.next_u64() & 1 == 0 {
+                    half - 1
+                } else {
+                    half
+                };
             }
             rebuild_include(
                 &ta[tb..tb + n_literals],
@@ -179,7 +191,13 @@ impl TMCoalescedAutoEncoder {
         // Separate RNG stream for weight init so it does not perturb the TA sequence.
         let mut weight_rng = Rng::new(seed ^ 0x5747_4854_5F49_4E49u64);
         let weights = (0..n_features * n_clauses)
-            .map(|_| if weight_rng.next_u64() & 1 == 0 { 1i32 } else { -1i32 })
+            .map(|_| {
+                if weight_rng.next_u64() & 1 == 0 {
+                    1i32
+                } else {
+                    -1i32
+                }
+            })
             .collect();
 
         let rngs = (0..n_clauses)

@@ -40,8 +40,7 @@ fn main() {
     let xs_test: Vec<Vec<u8>> = (0..N_TEST).map(|_| sample()).collect();
 
     let enc = Encoder::for_binary(N_FEATURES);
-    let batch_train =
-        enc.encode_batch(&xs_train.iter().map(|v| v.as_slice()).collect::<Vec<_>>());
+    let batch_train = enc.encode_batch(&xs_train.iter().map(|v| v.as_slice()).collect::<Vec<_>>());
     let batch_test = enc.encode_batch(&xs_test.iter().map(|v| v.as_slice()).collect::<Vec<_>>());
 
     let mut ae = TMCoalescedAutoEncoder::new(N_FEATURES, N_CLAUSES, THRESHOLD, S);
@@ -73,7 +72,11 @@ fn main() {
     let sample_x = &xs_test[0];
     let sample_enc = enc.encode_one(sample_x);
     let recon = ae.reconstruct(&sample_enc);
-    let correct: usize = sample_x.iter().zip(&recon).filter(|(a, b)| *a == *b).count();
+    let correct: usize = sample_x
+        .iter()
+        .zip(&recon)
+        .filter(|(a, b)| *a == *b)
+        .count();
 
     println!("\nExample reconstruction (first test sample):");
     println!("  Input:  {:?}", sample_x);
