@@ -78,10 +78,14 @@ path = "examples/absorb_timing.rs"
 name = "bench_training"
 path = "examples/bench_training.rs"
 
-# --- autoencoder demo ---
+# --- autoencoder demo + benchmark ---
 [[example]]
 name = "autoencoder"       # TMAutoEncoder: reconstruct binary input (not in original TMU examples)
 path = "examples/autoencoder.rs"
+
+[[example]]
+name = "bench_autoencoder" # TMAutoEncoder: throughput + accuracy benchmark vs Python TMU
+path = "examples/bench_autoencoder.rs"
 
 [[bench]]
 name = "throughput"

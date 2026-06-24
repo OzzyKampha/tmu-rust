@@ -195,3 +195,66 @@ split evenly across classes. `compare_tmu.py` passes
 `number_of_clauses = n_clauses_per_class × n_classes` to match the Rust
 `with_config(..., clauses_per_class, ...)` argument, ensuring both run the same
 per-class clause count.
+
+### TMAutoEncoder clause count convention
+
+`TMAutoEncoder(number_of_clauses=N)` in Python allocates **N clauses per output**
+(not a total), so no rescaling is needed. The Rust `TMAutoEncoder::with_config`
+second argument is likewise the per-output count.
+
+---
+
+## Autoencoder benchmark
+
+Compares `TMAutoEncoder` throughput and reconstruction accuracy between this Rust
+implementation and Python `tmu`.
+
+### Running the autoencoder benchmark
+
+```sh
+# Rust (both configs: accuracy then throughput)
+cargo run --release --example bench_autoencoder
+
+# Rust with Rayon clause-parallel
+cargo run --release --features parallel --example bench_autoencoder
+
+# Python TMU (large throughput config only)
+python scripts/bench_autoencoder.py
+
+# Python TMU (small accuracy config only)
+python scripts/bench_autoencoder.py --small
+
+# Python TMU (both)
+python scripts/bench_autoencoder.py --both
+```
+
+### Autoencoder benchmark configs
+
+| Parameter | Small (accuracy) | Large (throughput) |
+|---|---|---|
+| n\_features | 20 | 200 |
+| clauses\_per\_output | 40 | 50 |
+| T (threshold) | 20 | 200 |
+| s | 3.9 | 2.0 |
+| state\_bits | 8 | 8 |
+| n\_train | 2 000 | 2 000 |
+| timed epochs | 20 | 8 |
+| warmup epochs | 0 | 2 |
+| clause updates / epoch | 1.6 M | 20 M |
+
+**Small** is used for **accuracy parity** — both implementations converge from ~50%
+to >95% reconstruction accuracy within 20 epochs on random binary data.
+
+**Large** is used for **throughput comparison** — 20 M clause-updates/epoch workload.
+
+### Autoencoder clause updates formula
+
+For the autoencoder, every sample updates **all** `n_features` output positions:
+
+```
+clause_updates_per_epoch = n_train × n_features × clauses_per_output
+```
+
+This differs from the classifier (`n_train × n_classes × clauses_per_class`) because
+the autoencoder updates every output on every sample rather than just the true-class
+and one negative-class output.
