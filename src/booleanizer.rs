@@ -56,4 +56,16 @@ impl Booleanizer {
             self.n_output_features()
         );
     }
+
+    /// Per-feature quantile thresholds (used by [`Encoder`] serialisation).
+    ///
+    /// [`Encoder`]: crate::Encoder
+    pub(crate) fn thresholds(&self) -> &[Vec<f64>] {
+        &self.thresholds
+    }
+
+    /// Reconstruct a booleanizer from previously-saved thresholds.
+    pub(crate) fn from_thresholds(thresholds: Vec<Vec<f64>>) -> Self {
+        Booleanizer { thresholds }
+    }
 }

@@ -75,6 +75,10 @@ name = "sysmon_mordor"     # extra: train on real Mordor NDJSON, all Sysmon even
 path = "examples/sysmon_mordor.rs"
 
 [[example]]
+name = "save_load"         # train → save → load → predict/resume round-trip
+path = "examples/save_load.rs"
+
+[[example]]
 name = "absorb_timing"
 path = "examples/absorb_timing.rs"
 

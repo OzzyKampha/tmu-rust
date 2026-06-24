@@ -26,6 +26,10 @@ use crate::clause_bank::dense::{
 };
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
+use crate::serial;
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::Path;
 
 /// A coalesced weighted multiclass Tsetlin Machine with u8 per-TA counters.
 ///
@@ -322,6 +326,142 @@ impl CoalescedTsetlinMachine {
     pub fn focused_negative_sampling(mut self, enabled: bool) -> Self {
         self.focused_negative_sampling = enabled;
         self
+    }
+
+    // ── persistence ────────────────────────────────────────────────────────
+
+    /// Serialise the fully-trained model to `path` (little-endian binary).
+    ///
+    /// Captures all learned state (shared-bank TA counters and the signed
+    /// per-class weight matrix) **and** every RNG stream, so a model reloaded
+    /// with [`CoalescedTsetlinMachine::load`] predicts identically and can
+    /// continue training (`fit_epoch` / `fit_one`) deterministically.
+    pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let mut w = BufWriter::new(File::create(path)?);
+        self.write_to(&mut w)?;
+        w.flush()
+    }
+
+    /// Load a model previously written by [`CoalescedTsetlinMachine::save`].
+    ///
+    /// Reconstructs the struct field-by-field without re-seeding RNGs or
+    /// re-randomising TA counters, so it resumes exactly where the saved model
+    /// left off.
+    pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
+        let mut r = BufReader::new(File::open(path)?);
+        Self::read_from(&mut r)
+    }
+
+    /// Write the model to any [`Write`] sink.
+    pub(crate) fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        serial::write_header(w, serial::TAG_COALESCED)?;
+        serial::w_usize(w, self.n_classes)?;
+        serial::w_usize(w, self.n_features)?;
+        serial::w_usize(w, self.n_clauses)?;
+        serial::w_i32(w, self.threshold)?;
+        serial::w_f64(w, self.s)?;
+        serial::w_bool(w, self.boost_true_positive)?;
+        serial::w_usize(w, self.max_included_literals)?;
+        serial::w_f64(w, self.clause_drop_p)?;
+        serial::w_f64(w, self.literal_drop_p)?;
+        serial::w_bool(w, self.focused_negative_sampling)?;
+        serial::w_u8(w, self.half)?;
+        serial::w_u8(w, self.max_state)?;
+        serial::w_vec_u8(w, &self.ta)?;
+        serial::w_vec_i32(w, &self.weights)?;
+        serial::w_u64(w, self.rng.state())?;
+        serial::w_u64(w, self.literal_rng.state())?;
+        serial::w_rngs(w, &self.rngs)?;
+        serial::w_rngs(w, &self.class_rngs)?;
+        Ok(())
+    }
+
+    /// Read a model from any [`Read`] source.
+    pub(crate) fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
+        serial::read_header(r, serial::TAG_COALESCED)?;
+        let n_classes = serial::r_usize(r)?;
+        let n_features = serial::r_usize(r)?;
+        let n_clauses = serial::r_usize(r)?;
+        let threshold = serial::r_i32(r)?;
+        let s = serial::r_f64(r)?;
+        let boost_true_positive = serial::r_bool(r)?;
+        let max_included_literals = serial::r_usize(r)?;
+        let clause_drop_p = serial::r_f64(r)?;
+        let literal_drop_p = serial::r_f64(r)?;
+        let focused_negative_sampling = serial::r_bool(r)?;
+        let half = serial::r_u8(r)?;
+        let max_state = serial::r_u8(r)?;
+        let ta = serial::r_vec_u8(r)?;
+        let weights = serial::r_vec_i32(r)?;
+        let rng = Rng::from_state(serial::r_u64(r)?);
+        let literal_rng = Rng::from_state(serial::r_u64(r)?);
+        let rngs = serial::r_rngs(r)?;
+        let class_rngs = serial::r_rngs(r)?;
+
+        let n_literals = 2 * n_features;
+        let words = words_for(n_literals);
+
+        if ta.len() != n_clauses * n_literals {
+            return Err(serial::bad("ta length does not match model geometry"));
+        }
+        if weights.len() != n_classes * n_clauses {
+            return Err(serial::bad("weights length does not match model geometry"));
+        }
+        if rngs.len() != n_clauses {
+            return Err(serial::bad(
+                "per-clause RNG count does not match model geometry",
+            ));
+        }
+        if class_rngs.len() != n_classes {
+            return Err(serial::bad("per-class RNG count does not match n_classes"));
+        }
+
+        let mut valid = vec![0u64; words];
+        for l in 0..n_literals {
+            valid[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
+        }
+
+        let mut include = vec![0u64; n_clauses * words];
+        for j in 0..n_clauses {
+            let tb = j * n_literals;
+            rebuild_include(
+                &ta[tb..tb + n_literals],
+                &mut include[j * words..(j + 1) * words],
+                &valid,
+                words,
+                n_literals,
+                half,
+            );
+        }
+
+        Ok(CoalescedTsetlinMachine {
+            n_classes,
+            n_features,
+            n_literals,
+            words,
+            n_clauses,
+            threshold,
+            s,
+            boost_true_positive,
+            max_included_literals,
+            clause_drop_p,
+            literal_drop_p,
+            focused_negative_sampling,
+            literal_rng,
+            dig_lit_active: digits_of(1.0 - literal_drop_p, MASK_BITS),
+            ta,
+            include,
+            half,
+            max_state,
+            weights,
+            rngs,
+            class_rngs,
+            valid,
+            dig_inv: digits_of(1.0 / s, MASK_BITS),
+            dig_keep: digits_of((s - 1.0) / s, MASK_BITS),
+            literals: vec![0u64; words],
+            rng,
+        })
     }
 
     // ---- dimensions / accessors ------------------------------------------
@@ -1025,5 +1165,85 @@ mod tests {
                 assert!(w == 1 || w == -1, "initial weight must be ±1, got {w}");
             }
         }
+    }
+
+    // ---- save / load ---------------------------------------------------------
+
+    #[test]
+    fn save_load_roundtrip_predicts_identically() {
+        let (xtr, ytr) = make_4class(2000, 1);
+        let (xte, yte) = make_4class(1000, 2);
+        let e = enc(8);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let bte = e.encode_batch(&as_slices(&xte));
+
+        let mut tm = CoalescedTsetlinMachine::with_config(4, 8, 24, 20, 3.9, 8, true, 7)
+            .focused_negative_sampling(true);
+        for _ in 0..20 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+
+        let mut buf = Vec::new();
+        tm.write_to(&mut buf).unwrap();
+        let loaded = CoalescedTsetlinMachine::read_from(&mut buf.as_slice()).unwrap();
+
+        assert_eq!(tm.predict_batch(&bte), loaded.predict_batch(&bte));
+        assert_eq!(tm.accuracy(&bte, &yte), loaded.accuracy(&bte, &yte));
+    }
+
+    #[test]
+    fn save_load_resumes_training_without_reinit() {
+        let (xtr, ytr) = make_4class(2000, 3);
+        let (xte, yte) = make_4class(1000, 4);
+        let e = enc(8);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let bte = e.encode_batch(&as_slices(&xte));
+
+        let mut tm = CoalescedTsetlinMachine::with_config(4, 8, 24, 20, 3.9, 8, true, 7);
+        for _ in 0..15 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+
+        let mut buf = Vec::new();
+        tm.write_to(&mut buf).unwrap();
+        let mut loaded = CoalescedTsetlinMachine::read_from(&mut buf.as_slice()).unwrap();
+
+        for _ in 0..15 {
+            tm.fit_epoch(&btr, &ytr);
+            loaded.fit_epoch(&btr, &ytr);
+        }
+
+        assert_eq!(tm.ta, loaded.ta, "TA counters diverged after resume");
+        assert_eq!(tm.weights, loaded.weights, "weights diverged after resume");
+        assert_eq!(tm.accuracy(&bte, &yte), loaded.accuracy(&bte, &yte));
+    }
+
+    #[test]
+    fn save_load_via_file_path() {
+        let (xtr, ytr) = make_xor(500, 0.0, 5);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let mut tm = CoalescedTsetlinMachine::with_config(2, 12, 16, 15, 3.9, 8, true, 42);
+        tm.fit_epoch(&btr, &ytr);
+
+        let mut path = std::env::temp_dir();
+        path.push("tmu_rs_coalesced_roundtrip.tmrs");
+        tm.save(&path).unwrap();
+        let loaded = CoalescedTsetlinMachine::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let (xte, _) = make_xor(200, 0.0, 6);
+        let bte = e.encode_batch(&as_slices(&xte));
+        assert_eq!(tm.predict_batch(&bte), loaded.predict_batch(&bte));
+    }
+
+    #[test]
+    fn load_rejects_corrupt_data() {
+        assert!(CoalescedTsetlinMachine::read_from(&mut [].as_slice()).is_err());
+        assert!(CoalescedTsetlinMachine::read_from(&mut b"XXXXjunkjunk".as_slice()).is_err());
+        // Right magic, wrong type tag (vanilla tag on a coalesced read).
+        let mut buf = Vec::new();
+        serial::write_header(&mut buf, serial::TAG_VANILLA).unwrap();
+        assert!(CoalescedTsetlinMachine::read_from(&mut buf.as_slice()).is_err());
     }
 }

@@ -11,9 +11,18 @@
 //! [`TsetlinMachine`]: crate::TsetlinMachine
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::Path;
 
 use crate::booleanizer::Booleanizer;
 use crate::clause_bank::dense::{pack, words_for};
+use crate::serial;
+
+/// Encoder-kind sub-tags written inside a serialised [`Encoder`].
+const KIND_BINARY: u8 = 0;
+const KIND_NUMERIC: u8 = 1;
+const KIND_CATEGORICAL: u8 = 2;
 
 // ── output types ─────────────────────────────────────────────────────────────
 
@@ -227,6 +236,128 @@ impl Encoder {
         }
     }
 
+    // ── persistence ────────────────────────────────────────────────────────
+
+    /// Serialise the (fitted) encoder to `path` (little-endian binary).
+    ///
+    /// Captures everything needed to reproduce identical encodings: the
+    /// numeric booleanizer thresholds or the categorical vocabulary, as
+    /// applicable.  Pair with [`Encoder::load`] so a saved model and its
+    /// encoder can be reloaded together.
+    pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let mut w = BufWriter::new(File::create(path)?);
+        self.write_to(&mut w)?;
+        w.flush()
+    }
+
+    /// Load an encoder previously written by [`Encoder::save`].
+    pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
+        let mut r = BufReader::new(File::open(path)?);
+        Self::read_from(&mut r)
+    }
+
+    /// Write the encoder to any [`Write`] sink.
+    pub(crate) fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        serial::write_header(w, serial::TAG_ENCODER)?;
+        match &self.kind {
+            EncoderKind::Binary => {
+                serial::w_u8(w, KIND_BINARY)?;
+                serial::w_usize(w, self.n_features)?;
+            }
+            EncoderKind::Numeric { booleanizer } => {
+                serial::w_u8(w, KIND_NUMERIC)?;
+                let thresholds = booleanizer.thresholds();
+                serial::w_usize(w, thresholds.len())?;
+                for thr in thresholds {
+                    serial::w_vec_f64(w, thr)?;
+                }
+            }
+            EncoderKind::Categorical {
+                index,
+                known_columns,
+                ..
+            } => {
+                serial::w_u8(w, KIND_CATEGORICAL)?;
+                serial::w_usize(w, index.len())?;
+                for tok in index {
+                    serial::w_str(w, tok)?;
+                }
+                serial::w_usize(w, known_columns.len())?;
+                for (col, &bit) in known_columns {
+                    serial::w_str(w, col)?;
+                    serial::w_usize(w, bit)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Read an encoder from any [`Read`] source.
+    pub(crate) fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
+        serial::read_header(r, serial::TAG_ENCODER)?;
+        let sub_tag = serial::r_u8(r)?;
+        match sub_tag {
+            KIND_BINARY => {
+                let n_features = serial::r_usize(r)?;
+                if n_features < 1 {
+                    return Err(serial::bad("binary encoder n_features must be >= 1"));
+                }
+                Ok(Self {
+                    kind: EncoderKind::Binary,
+                    n_features,
+                    words: words_for(2 * n_features),
+                })
+            }
+            KIND_NUMERIC => {
+                let n_raw = serial::r_usize(r)?;
+                let mut thresholds = Vec::with_capacity(n_raw);
+                for _ in 0..n_raw {
+                    thresholds.push(serial::r_vec_f64(r)?);
+                }
+                let booleanizer = Booleanizer::from_thresholds(thresholds);
+                let n_features = booleanizer.n_output_features();
+                Ok(Self {
+                    kind: EncoderKind::Numeric { booleanizer },
+                    n_features,
+                    words: words_for(2 * n_features),
+                })
+            }
+            KIND_CATEGORICAL => {
+                let n_index = serial::r_usize(r)?;
+                let mut index = Vec::with_capacity(n_index);
+                for _ in 0..n_index {
+                    index.push(serial::r_str(r)?);
+                }
+                let n_cols = serial::r_usize(r)?;
+                let mut known_columns = HashMap::with_capacity(n_cols);
+                for _ in 0..n_cols {
+                    let col = serial::r_str(r)?;
+                    let bit = serial::r_usize(r)?;
+                    known_columns.insert(col, bit);
+                }
+                let vocab: HashMap<String, usize> = index
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (s.clone(), i))
+                    .collect();
+                let n_features = index.len();
+                if n_features < 1 {
+                    return Err(serial::bad("categorical encoder vocabulary is empty"));
+                }
+                Ok(Self {
+                    kind: EncoderKind::Categorical {
+                        vocab,
+                        index,
+                        known_columns,
+                    },
+                    n_features,
+                    words: words_for(2 * n_features),
+                })
+            }
+            other => Err(serial::bad(format!("unknown encoder kind tag {other}"))),
+        }
+    }
+
     // ── single-sample encode ──────────────────────────────────────────────────
 
     /// Encode a binary (`0`/`1`) feature vector.
@@ -332,5 +463,78 @@ impl Encoder {
             data[i * w..(i + 1) * w].copy_from_slice(&s.0);
         }
         EncodedBatch { data, n, words: w }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(e: &Encoder) -> Encoder {
+        let mut buf = Vec::new();
+        e.write_to(&mut buf).unwrap();
+        Encoder::read_from(&mut buf.as_slice()).unwrap()
+    }
+
+    #[test]
+    fn binary_encoder_roundtrip() {
+        let e = Encoder::for_binary(5);
+        let loaded = roundtrip(&e);
+        assert_eq!(e.n_features(), loaded.n_features());
+
+        let rows: Vec<Vec<u8>> = vec![vec![1, 0, 1, 1, 0], vec![0, 0, 1, 0, 1]];
+        let refs: Vec<&[u8]> = rows.iter().map(|r| r.as_slice()).collect();
+        assert_eq!(e.encode_batch(&refs).data, loaded.encode_batch(&refs).data);
+    }
+
+    #[test]
+    fn numeric_encoder_roundtrip() {
+        let train: Vec<Vec<f64>> = (0..50)
+            .map(|i| vec![i as f64, (i % 7) as f64, (i as f64) * 0.5])
+            .collect();
+        let train_refs: Vec<&[f64]> = train.iter().map(|r| r.as_slice()).collect();
+        let e = Encoder::fit_numeric(&train_refs, 4);
+        let loaded = roundtrip(&e);
+        assert_eq!(e.n_features(), loaded.n_features());
+
+        let test: Vec<Vec<f64>> = vec![vec![3.0, 2.0, 9.0], vec![40.0, 1.0, 0.0]];
+        let test_refs: Vec<&[f64]> = test.iter().map(|r| r.as_slice()).collect();
+        assert_eq!(
+            e.encode_batch_numeric(&test_refs).data,
+            loaded.encode_batch_numeric(&test_refs).data
+        );
+        // Interpretable metadata must survive the round-trip too.
+        assert_eq!(e.bit_origin(0), loaded.bit_origin(0));
+    }
+
+    #[test]
+    fn categorical_encoder_roundtrip() {
+        let s1: Vec<&str> = vec!["proc::cmd.exe", "user::alice"];
+        let s2: Vec<&str> = vec!["proc::powershell.exe", "user::bob"];
+        let train: Vec<&[&str]> = vec![s1.as_slice(), s2.as_slice()];
+        let e = Encoder::fit_categorical(&train);
+        let loaded = roundtrip(&e);
+        assert_eq!(e.n_features(), loaded.n_features());
+
+        // Include an unseen token to exercise the UNK/OOV fallback paths.
+        let q1: Vec<&str> = vec!["proc::cmd.exe", "user::carol"];
+        let q2: Vec<&str> = vec!["proc::unknown.exe", "newcol::x"];
+        let query: Vec<&[&str]> = vec![q1.as_slice(), q2.as_slice()];
+        assert_eq!(
+            e.encode_batch_categorical(&query).data,
+            loaded.encode_batch_categorical(&query).data
+        );
+        assert_eq!(e.vocab_token(0), loaded.vocab_token(0));
+    }
+
+    #[test]
+    fn load_rejects_corrupt_data() {
+        assert!(Encoder::read_from(&mut [].as_slice()).is_err());
+        assert!(Encoder::read_from(&mut b"XXXXjunkjunk".as_slice()).is_err());
+        // Right header/tag but an unknown encoder-kind sub-tag.
+        let mut buf = Vec::new();
+        serial::write_header(&mut buf, serial::TAG_ENCODER).unwrap();
+        serial::w_u8(&mut buf, 99).unwrap();
+        assert!(Encoder::read_from(&mut buf.as_slice()).is_err());
     }
 }

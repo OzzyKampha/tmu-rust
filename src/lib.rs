@@ -29,6 +29,7 @@ pub mod data;
 pub mod encoder;
 pub mod models;
 mod rng;
+mod serial;
 
 pub use booleanizer::Booleanizer;
 pub use encoder::{EncodedBatch, EncodedSample, Encoder};
