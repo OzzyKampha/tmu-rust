@@ -31,5 +31,6 @@ mod rng;
 
 pub use booleanizer::Booleanizer;
 pub use encoder::{EncodedBatch, EncodedSample, Encoder};
+pub use models::TMAutoEncoder;
 pub use models::TsetlinMachine;
 pub use rng::Rng;
