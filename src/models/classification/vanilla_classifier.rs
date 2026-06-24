@@ -59,6 +59,11 @@ pub struct TsetlinMachine {
 
     literals: Vec<u64>,
     rng: Rng, // for shuffling and negative-class selection only
+
+    /// Per-class feedback scaling factors for imbalanced datasets.
+    /// `class_weights[c]` multiplies the feedback probability for class `c`.
+    /// Defaults to `1.0` for all classes (no reweighting).
+    class_weights: Vec<f64>,
 }
 
 /// Per-clause feedback kernel shared by the sequential and parallel training paths.
@@ -257,6 +262,7 @@ impl TsetlinMachine {
             dig_keep: digits_of((s - 1.0) / s, MASK_BITS),
             literals: vec![0u64; words],
             rng,
+            class_weights: vec![1.0f64; n_classes],
         }
     }
 
@@ -287,6 +293,32 @@ impl TsetlinMachine {
         self
     }
 
+    /// Per-class weights to compensate for label imbalance (default: all 1.0).
+    ///
+    /// `weights[c]` multiplies the feedback probability for every clause belonging
+    /// to class `c`.  Values > 1.0 cause clauses for that class to receive feedback
+    /// more often; values < 1.0 reduce feedback frequency.
+    ///
+    /// A standard formula for automatic computation:
+    /// ```text
+    /// weight[c] = n_samples / (n_classes * count[c])
+    /// ```
+    /// where `count[c]` is the number of training samples labelled `c`.
+    /// Probability is clamped to `[0, 1]`, so very large weights saturate at p = 1.
+    pub fn class_weights(mut self, weights: Vec<f64>) -> Self {
+        assert_eq!(
+            weights.len(),
+            self.n_classes,
+            "class_weights length must equal n_classes"
+        );
+        assert!(
+            weights.iter().all(|&w| w > 0.0),
+            "all class weights must be positive"
+        );
+        self.class_weights = weights;
+        self
+    }
+
     // ---- dimensions / accessors ------------------------------------------
 
     /// Return the number of output classes.
@@ -312,6 +344,11 @@ impl TsetlinMachine {
     /// Return the integer weight of clause `clause` for class `class`.
     pub fn clause_weight(&self, class: usize, clause: usize) -> i32 {
         self.weights[class * self.clauses_per_class + clause]
+    }
+
+    /// Return the per-class feedback scaling weight for `class`.
+    pub fn class_weight(&self, class: usize) -> f64 {
+        self.class_weights[class]
     }
 
     // ---- inference -------------------------------------------------------
@@ -454,6 +491,7 @@ impl TsetlinMachine {
         let drop_p = self.clause_drop_p;
         let half = self.half;
         let max_state = self.max_state;
+        let cw = self.class_weights[c];
 
         let Self {
             ta,
@@ -474,9 +512,9 @@ impl TsetlinMachine {
         let t = wmax as f64;
         let v = sum as f64;
         let p = if target == 1 {
-            (t - v) / (2.0 * t)
+            ((t - v) / (2.0 * t) * cw).min(1.0)
         } else {
-            (t + v) / (2.0 * t)
+            ((t + v) / (2.0 * t) * cw).min(1.0)
         };
 
         let drop_mask: Vec<bool> = if drop_p > 0.0 {
@@ -1438,6 +1476,253 @@ mod tests {
             after > before,
             "absorbing states must grow during training: before={before:.4}, after={after:.4}"
         );
+    }
+
+    // ---- class_weights -------------------------------------------------------
+
+    #[test]
+    fn class_weights_unit_same_as_default() {
+        // class_weights([1.0, 1.0]) must produce results identical to no weighting.
+        let (xtr, ytr) = make_xor(500, 0.0, 70);
+        let (xte, yte) = make_xor(200, 0.0, 71);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let bte = e.encode_batch(&as_slices(&xte));
+
+        let mut tm_default = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42);
+        let mut tm_unit =
+            TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42).class_weights(vec![1.0, 1.0]);
+        for _ in 0..5 {
+            tm_default.fit_epoch(&btr, &ytr);
+            tm_unit.fit_epoch(&btr, &ytr);
+        }
+        assert_eq!(
+            tm_default.accuracy(&bte, &yte),
+            tm_unit.accuracy(&bte, &yte),
+            "unit class weights must produce the same result as no weighting"
+        );
+    }
+
+    #[test]
+    fn class_weights_accessor_roundtrip() {
+        let tm = TsetlinMachine::with_config(3, 4, 4, 10, 3.0, 8, true, 1)
+            .class_weights(vec![1.0, 2.0, 0.5]);
+        assert!((tm.class_weight(0) - 1.0).abs() < 1e-12);
+        assert!((tm.class_weight(1) - 2.0).abs() < 1e-12);
+        assert!((tm.class_weight(2) - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn class_weights_high_weight_increases_minority_recall() {
+        // Build an imbalanced 2-class dataset: class 0 has 9x more samples.
+        // With matching inverse-frequency weights the minority class (1) recall
+        // should improve relative to uniform-weight training.
+        let mut rng = Rng::new(80);
+        let n = 2000usize;
+        let mut xs = Vec::with_capacity(n);
+        let mut ys = Vec::with_capacity(n);
+        for _ in 0..n {
+            let f: Vec<u8> = (0..8).map(|_| (rng.next_u64() & 1) as u8).collect();
+            // Class 1 only when both f[0] and f[1] are 1 (~25% natural freq).
+            // Then downsample class 1 to ~10% by rejection.
+            let natural_y = (f[0] & f[1]) as usize;
+            let y = if natural_y == 1 && rng.next_f64() > 0.4 {
+                0
+            } else {
+                natural_y
+            };
+            xs.push(f);
+            ys.push(y);
+        }
+        let class1_count = ys.iter().filter(|&&y| y == 1).count();
+        let class0_count = n - class1_count;
+
+        let e = enc(8);
+        let btr = e.encode_batch(&as_slices(&xs));
+
+        // Inverse-frequency weights: weight[c] = n / (n_classes * count[c]).
+        let w0 = n as f64 / (2.0 * class0_count as f64);
+        let w1 = n as f64 / (2.0 * class1_count as f64);
+
+        let mut tm_balanced = TsetlinMachine::with_config(2, 8, 20, 20, 3.0, 8, true, 42)
+            .class_weights(vec![w0, w1]);
+        let mut tm_uniform = TsetlinMachine::with_config(2, 8, 20, 20, 3.0, 8, true, 42);
+        for _ in 0..15 {
+            tm_balanced.fit_epoch(&btr, &ys);
+            tm_uniform.fit_epoch(&btr, &ys);
+        }
+
+        // Measure per-class recall on training set.
+        let recall_c1 = |tm: &TsetlinMachine| -> f64 {
+            let w = tm.words_per_sample();
+            let data = btr.data.as_slice();
+            let (correct, total) = (0..n)
+                .filter(|&i| ys[i] == 1)
+                .fold((0usize, 0usize), |(c, t), i| {
+                    let pred = tm.predict_lit(&data[i * w..(i + 1) * w]);
+                    (c + (pred == 1) as usize, t + 1)
+                });
+            if total == 0 { 0.0 } else { correct as f64 / total as f64 }
+        };
+
+        let recall_balanced = recall_c1(&tm_balanced);
+        let recall_uniform = recall_c1(&tm_uniform);
+        assert!(
+            recall_balanced >= recall_uniform,
+            "inverse-frequency weights should improve minority-class recall: \
+             balanced={recall_balanced:.3} uniform={recall_uniform:.3}"
+        );
+    }
+
+    // ---- class_weights validation --------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "class_weights length must equal n_classes")]
+    fn class_weights_wrong_length_panics() {
+        TsetlinMachine::with_config(2, 4, 4, 10, 3.0, 8, true, 1)
+            .class_weights(vec![1.0, 1.0, 1.0]); // 3 weights for 2 classes
+    }
+
+    #[test]
+    #[should_panic(expected = "all class weights must be positive")]
+    fn class_weights_zero_panics() {
+        TsetlinMachine::with_config(2, 4, 4, 10, 3.0, 8, true, 1)
+            .class_weights(vec![1.0, 0.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "all class weights must be positive")]
+    fn class_weights_negative_panics() {
+        TsetlinMachine::with_config(2, 4, 4, 10, 3.0, 8, true, 1)
+            .class_weights(vec![-1.0, 1.0]);
+    }
+
+    // ---- class_weights saturation / safety -----------------------------------
+
+    #[test]
+    fn class_weights_very_high_clamped_safe() {
+        // Weights >> 1 saturate p at 1.0 (clamp); must not panic and clause
+        // weights must remain in [1, threshold].
+        let (xtr, ytr) = make_xor(300, 0.0, 90);
+        let btr = enc(12).encode_batch(&as_slices(&xtr));
+        let threshold = 10i32;
+        let mut tm = TsetlinMachine::with_config(2, 12, 8, threshold, 3.0, 8, true, 42)
+            .class_weights(vec![1000.0, 1000.0]);
+        for _ in 0..5 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+        for c in 0..2 {
+            for j in 0..tm.clauses_per_class() {
+                let w = tm.clause_weight(c, j);
+                assert!(
+                    (1..=threshold).contains(&w),
+                    "clause ({c},{j}) weight {w} out of [1, {threshold}] with very high class weight"
+                );
+            }
+        }
+    }
+
+    // ---- class_weights suppression -------------------------------------------
+
+    #[test]
+    fn class_weights_near_zero_suppresses_clause_updates() {
+        // A weight of 1e-9 multiplies p by ~0; over 1000 training steps the
+        // probability of any single clause receiving Type Ia feedback is ~1e-6.
+        // All clause weights for the suppressed class must remain at the initial
+        // value of 1; class 1 (weight 1.0) must evolve normally.
+        let (xtr, ytr) = make_xor(200, 0.0, 91);
+        let btr = enc(12).encode_batch(&as_slices(&xtr));
+        let cps = 12usize;
+        let mut tm = TsetlinMachine::with_config(2, 12, cps, 10, 3.0, 8, true, 42)
+            .class_weights(vec![1e-9, 1.0]);
+        for _ in 0..5 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+        let all_frozen = (0..cps).all(|j| tm.clause_weight(0, j) == 1);
+        assert!(
+            all_frozen,
+            "near-zero class weight should keep all clause weights at initial value 1"
+        );
+        let any_evolved = (0..cps).any(|j| tm.clause_weight(1, j) > 1);
+        assert!(any_evolved, "class 1 with weight 1.0 should evolve normally");
+    }
+
+    // ---- class_weights determinism -------------------------------------------
+
+    #[test]
+    fn class_weights_same_seed_same_result() {
+        // Same seed + same asymmetric weights must produce bit-identical outcomes.
+        let (xtr, ytr) = make_xor(500, 0.0, 92);
+        let (xte, yte) = make_xor(200, 0.0, 93);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let bte = e.encode_batch(&as_slices(&xte));
+
+        let weights = vec![2.0, 0.5];
+        let mut tm1 = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 99)
+            .class_weights(weights.clone());
+        let mut tm2 = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 99)
+            .class_weights(weights);
+        for _ in 0..5 {
+            tm1.fit_epoch(&btr, &ytr);
+            tm2.fit_epoch(&btr, &ytr);
+        }
+        assert_eq!(
+            tm1.accuracy(&bte, &yte),
+            tm2.accuracy(&bte, &yte),
+            "class_weights must not break determinism for the same seed"
+        );
+        for c in 0..2 {
+            for j in 0..tm1.clauses_per_class() {
+                assert_eq!(
+                    tm1.clause_weight(c, j),
+                    tm2.clause_weight(c, j),
+                    "clause ({c},{j}) weight differs between identical runs"
+                );
+            }
+        }
+    }
+
+    // ---- class_weights multiclass independence --------------------------------
+
+    #[test]
+    fn class_weights_multiclass_independent_per_class() {
+        // 4-class problem: freeze classes 0 and 2 (weight ≈ 0), train 1 and 3
+        // normally (weight 1.0). Frozen classes must have all clause weights at 1;
+        // active classes must have at least one clause weight above 1.
+        let mut rng = Rng::new(94);
+        let n = 1000usize;
+        let mut xs = Vec::with_capacity(n);
+        let mut ys = Vec::with_capacity(n);
+        for _ in 0..n {
+            let f: Vec<u8> = (0..8).map(|_| (rng.next_u64() & 1) as u8).collect();
+            let y = ((f[0] ^ f[1]) as usize) * 2 + (f[2] ^ f[3]) as usize;
+            xs.push(f);
+            ys.push(y);
+        }
+        let btr = enc(8).encode_batch(&as_slices(&xs));
+        let cps = 10usize;
+
+        let mut tm = TsetlinMachine::with_config(4, 8, cps, 15, 3.0, 8, true, 42)
+            .class_weights(vec![1e-9, 1.0, 1e-9, 1.0]);
+        for _ in 0..10 {
+            tm.fit_epoch(&btr, &ys);
+        }
+
+        for &frozen in &[0usize, 2usize] {
+            let all_at_one = (0..cps).all(|j| tm.clause_weight(frozen, j) == 1);
+            assert!(
+                all_at_one,
+                "frozen class {frozen} should have all clause weights at initial 1"
+            );
+        }
+        for &active in &[1usize, 3usize] {
+            let any_evolved = (0..cps).any(|j| tm.clause_weight(active, j) > 1);
+            assert!(
+                any_evolved,
+                "active class {active} should have some clause weights > 1 after training"
+            );
+        }
     }
 
     // ---- scores are clamped to ±threshold -----------------------------------
