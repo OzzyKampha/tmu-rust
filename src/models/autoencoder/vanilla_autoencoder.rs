@@ -124,12 +124,7 @@ fn apply_one_clause(
 
 impl TMAutoEncoder {
     /// Create a TMAutoEncoder with default settings: 8 state bits, boost enabled, seed 42.
-    pub fn new(
-        n_features: usize,
-        clauses_per_output: usize,
-        threshold: i32,
-        s: f64,
-    ) -> Self {
+    pub fn new(n_features: usize, clauses_per_output: usize, threshold: i32, s: f64) -> Self {
         Self::with_config(n_features, clauses_per_output, threshold, s, 8, true, 42)
     }
 
@@ -286,7 +281,7 @@ impl TMAutoEncoder {
         let valid = self.valid.as_slice();
 
         let mut out = vec![0u8; n_features];
-        for o in 0..n_features {
+        for (o, out_o) in out.iter_mut().enumerate() {
             let cw = &self.weights[o * cpo..(o + 1) * cpo];
             let mut sum = 0i32;
             for (j, &w) in cw.iter().enumerate() {
@@ -299,7 +294,7 @@ impl TMAutoEncoder {
                     }
                 }
             }
-            out[o] = (sum > 0) as u8;
+            *out_o = (sum > 0) as u8;
         }
         out
     }
@@ -454,9 +449,9 @@ impl TMAutoEncoder {
                 .enumerate()
                 .for_each(|(j, (((ta_o, inc_o), w), rng))| {
                     apply_one_clause(
-                        j, ta_o, inc_o, w, rng, target, p, &drop_mask, lit, val, lit_active,
-                        words, lit_b, &inv_b, &keep_b, active_b, n_literals, boost, wmax, max_inc,
-                        half, max_state,
+                        j, ta_o, inc_o, w, rng, target, p, &drop_mask, lit, val, lit_active, words,
+                        lit_b, &inv_b, &keep_b, active_b, n_literals, boost, wmax, max_inc, half,
+                        max_state,
                     );
                 });
             return;
@@ -624,7 +619,11 @@ impl TMAutoEncoder {
                 }
             }
         }
-        if total == 0 { 0.0 } else { at_max as f64 / total as f64 }
+        if total == 0 {
+            0.0
+        } else {
+            at_max as f64 / total as f64
+        }
     }
 
     /// Fraction of (clause, literal) pairs at the absorbing exclude state (counter == 0).
@@ -645,7 +644,11 @@ impl TMAutoEncoder {
                 }
             }
         }
-        if total == 0 { 0.0 } else { at_min as f64 / total as f64 }
+        if total == 0 {
+            0.0
+        } else {
+            at_min as f64 / total as f64
+        }
     }
 
     // ---- interpretability ----------------------------------------------------
@@ -717,7 +720,10 @@ mod tests {
             ae.fit_epoch(&batch);
         }
         let acc = ae.reconstruction_accuracy(&batch);
-        assert!(acc > 0.8, "expected reconstruction accuracy > 0.80, got {acc:.4}");
+        assert!(
+            acc > 0.8,
+            "expected reconstruction accuracy > 0.80, got {acc:.4}"
+        );
     }
 
     #[test]
@@ -743,7 +749,10 @@ mod tests {
             ae.fit_epoch(&batch);
         }
         let acc = ae.reconstruction_accuracy(&batch);
-        assert!(acc > 0.80, "expected structured-input accuracy > 0.80, got {acc:.4}");
+        assert!(
+            acc > 0.80,
+            "expected structured-input accuracy > 0.80, got {acc:.4}"
+        );
     }
 
     // ---- behavioral / contract -----------------------------------------------
@@ -867,8 +876,7 @@ mod tests {
     fn clause_drop_p_one_leaves_state_unchanged() {
         let xs = make_bits(200, 15);
         let batch = enc(12).encode_batch(&as_slices(&xs));
-        let mut ae =
-            TMAutoEncoder::with_config(12, 8, 10, 3.0, 8, true, 42).clause_drop_p(0.9999);
+        let mut ae = TMAutoEncoder::with_config(12, 8, 10, 3.0, 8, true, 42).clause_drop_p(0.9999);
         let ta_before = ae.ta.clone();
         ae.fit_epoch(&batch);
         let ta_changed = ae.ta.iter().zip(&ta_before).filter(|(a, b)| a != b).count();
@@ -883,8 +891,7 @@ mod tests {
     fn literal_drop_p_one_leaves_state_unchanged() {
         let xs = make_bits(200, 30);
         let batch = enc(12).encode_batch(&as_slices(&xs));
-        let mut ae =
-            TMAutoEncoder::with_config(12, 8, 10, 3.0, 8, true, 42).literal_drop_p(0.9999);
+        let mut ae = TMAutoEncoder::with_config(12, 8, 10, 3.0, 8, true, 42).literal_drop_p(0.9999);
         let ta_before = ae.ta.clone();
         ae.fit_epoch(&batch);
         let ta_changed = ae.ta.iter().zip(&ta_before).filter(|(a, b)| a != b).count();
@@ -939,7 +946,7 @@ mod tests {
     fn words_per_sample_correct() {
         for &nf in &[1usize, 32, 63, 64, 65, 100, 128, 784] {
             let ae = TMAutoEncoder::with_config(nf, 2, 5, 2.0, 8, true, 1);
-            let expected = (2 * nf + 63) / 64;
+            let expected = (2 * nf).div_ceil(64);
             assert_eq!(
                 ae.words_per_sample(),
                 expected,

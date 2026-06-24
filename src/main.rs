@@ -8,5 +8,6 @@ fn main() {
     println!("  cargo run --release --example xor");
     println!("  cargo run --release --example noisy_xor");
     println!("  cargo run --release --example interpretability");
+    println!("  cargo run --release --example coalesced");
     println!("  cargo run --release --example ndr_flows");
 }

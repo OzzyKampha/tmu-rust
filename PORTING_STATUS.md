@@ -9,7 +9,7 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | TMU type | Rust status | Notes |
 |---|---|---|
 | `TMClassifier` | ✅ Ported | Weighted multiclass; full training + inference API |
-| `TMCoalesced` | ❌ Not ported | Requires different memory layout |
+| `TMCoalesced` | ✅ Ported | Shared clause bank + signed per-class weight matrix; focused negative sampling |
 | `TMRegressor` | ❌ Not ported | Requires continuous-output learning rule |
 | `TMAutoEncoder` | ❌ Not ported | Unsupervised; different clause update logic |
 | `TMCompositeClassifier` | ❌ Not ported | Hybrid architecture |
@@ -44,6 +44,23 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 
 ---
 
+## TMCoalesced features
+
+| Feature | Status | Notes |
+|---|---|---|
+| Single shared clause bank | ✅ | `n_clauses` clauses shared across all classes (vs per-class pools) |
+| Signed per-class weight matrix | ✅ | `weights[class][clause]`, initialised to ±1, may go negative; polarity = sign |
+| Type Ia / Ib / II feedback | ✅ | Reuses the dense bit primitives; feedback type chosen by weight sign |
+| Boost true positives | ✅ | `boost_true_positive_feedback` option |
+| Clause / literal dropout | ✅ | `clause_drop_p`, `literal_drop_p` builders |
+| Max included literals | ✅ | `max_included_literals` Type Ia guard |
+| Focused negative sampling | ✅ | `focused_negative_sampling()` builder (proportional to per-class update probability) |
+| Multi-threaded training | ✅ | `--features parallel` (Rayon), clause-parallel feedback |
+| Configurable TA state bits | ✅ | 2–8 bits per counter |
+| Clause rule extraction | ✅ | `clause_rule()`, `clause_weight()`, `clause_is_positive()` |
+
+---
+
 ## Examples (TMU demo ports)
 
 | TMU demo | Rust example | Status | Notes |
@@ -60,5 +77,5 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | Convolutional demos | — | ❌ Not ported | Requires `ConvolutionalTM` |
 | Regression demos | — | ❌ Not ported | Requires `TMRegressor` |
 | Autoencoder demos | — | ❌ Not ported | Requires `TMAutoEncoder` |
-| Coalesced demos | — | ❌ Not ported | Requires `TMCoalesced` |
+| Coalesced demo | `coalesced` | ✅ Validated | 4-class shared-bank demo; 100% accuracy |
 

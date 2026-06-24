@@ -55,6 +55,10 @@ fn main() {
     println!("\nExample reconstruction (first test sample):");
     println!("  Input:  {:?}", sample_x);
     println!("  Output: {:?}", recon);
-    let correct: usize = sample_x.iter().zip(&recon).filter(|(a, b)| *a == *b).count();
+    let correct: usize = sample_x
+        .iter()
+        .zip(&recon)
+        .filter(|(a, b)| *a == *b)
+        .count();
     println!("  {correct}/{n_features} bits correct");
 }

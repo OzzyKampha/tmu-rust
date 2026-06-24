@@ -49,6 +49,7 @@ let accuracy = tm.accuracy(&test_x, &test_y);
 
 - Bit-packed clause bank for cache-efficient inference and training
 - Weighted multiclass classification (`TMClassifier`)
+- Coalesced multiclass classification (`TMCoalescedClassifier`) — one shared clause bank with signed per-class weights
 - Optional multi-threaded training via [Rayon](https://github.com/rayon-rs/rayon) (`--features parallel`)
 - AVX2 fast paths for clause update loops with runtime dispatch — u8 TA counters processed 32-wide (4× smaller working set vs u32; scalar fallback on non-AVX2 targets)
 - Type-safe `Encoder` for binary, numeric (quantile booleanization), and categorical inputs
@@ -89,13 +90,14 @@ AVX2 fast paths are also activated at runtime automatically when the CPU support
 
 ## Examples
 
-The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) multiclass `TMClassifier` demos with matching hyperparameters (e.g. MNIST: 2000 clauses, T=50, s=10.0; IMDb: 2000 clauses, T=80, s=10.0). Convolutional, coalesced, regression, autoencoder, and composite variants are not included as they rely on machine types not yet ported. See [PORTING_STATUS.md](PORTING_STATUS.md) for the full status.
+The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) multiclass `TMClassifier` (and `TMCoalescedClassifier`) demos with matching hyperparameters (e.g. MNIST: 2000 clauses, T=50, s=10.0; IMDb: 2000 clauses, T=80, s=10.0). Convolutional, regression, autoencoder, and composite variants are not included as they rely on machine types not yet ported. See [PORTING_STATUS.md](PORTING_STATUS.md) for the full status.
 
 | TMU demo | Example | Data required | Command |
 |---|---|---|---|
 | `XORDemo` | `xor` | — | `cargo run --release --example xor` |
 | `NoisyXORDemo` | `noisy_xor` | — | `cargo run --release --example noisy_xor` |
 | `InterpretabilityDemo` | `interpretability` | — | `cargo run --release --example interpretability` |
+| `TMCoalescedClassifier` | `coalesced` | — | `cargo run --release --example coalesced` |
 | `BreastCancerDemo` | `breast_cancer` | scikit-learn | see [Data preparation](#data-preparation) |
 | `MNISTDemo` / `MNISTDemoWeightedClauses` | `mnist` | MNIST | see [Data preparation](#data-preparation) |
 | `IMDbTextCategorizationDemo` | `imdb` | Keras IMDb | see [Data preparation](#data-preparation) |

@@ -1119,7 +1119,7 @@ mod tests {
     fn words_per_sample_correct() {
         for &nf in &[1usize, 32, 63, 64, 65, 100, 128, 784] {
             let tm = TsetlinMachine::with_config(2, nf, 2, 5, 2.0, 8, true, 1);
-            let expected = (2 * nf + 63) / 64;
+            let expected = (2 * nf).div_ceil(64);
             assert_eq!(
                 tm.words_per_sample(),
                 expected,
@@ -1133,19 +1133,15 @@ mod tests {
     fn pack_sets_positive_and_negated_bits() {
         let nf = 4usize;
         let x: Vec<u8> = vec![1, 0, 1, 0];
-        let words = (2 * nf + 63) / 64;
+        let words = (2 * nf).div_ceil(64);
         let mut lit = vec![0u64; words];
         crate::clause_bank::dense::pack(&x, nf, &mut lit);
         let bits = lit[0];
-        assert_eq!((bits >> 0) & 1, 1, "x[0]=1: positive bit should be set");
+        assert_eq!(bits & 1, 1, "x[0]=1: positive bit should be set");
         assert_eq!((bits >> 1) & 1, 0, "x[1]=0: positive bit should be clear");
         assert_eq!((bits >> 2) & 1, 1, "x[2]=1: positive bit should be set");
         assert_eq!((bits >> 3) & 1, 0, "x[3]=0: positive bit should be clear");
-        assert_eq!(
-            (bits >> (nf + 0)) & 1,
-            0,
-            "x[0]=1: negated bit should be clear"
-        );
+        assert_eq!((bits >> nf) & 1, 0, "x[0]=1: negated bit should be clear");
         assert_eq!(
             (bits >> (nf + 1)) & 1,
             1,
@@ -1395,11 +1391,7 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            (inc[0] >> 0) & 1,
-            1,
-            "absorbing literal 0 must stay included"
-        );
+        assert_eq!(inc[0] & 1, 1, "absorbing literal 0 must stay included");
         assert_eq!(
             (inc[0] >> 1) & 1,
             0,
@@ -1490,8 +1482,8 @@ mod tests {
         let bte = e.encode_batch(&as_slices(&xte));
 
         let mut tm_default = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42);
-        let mut tm_unit =
-            TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42).class_weights(vec![1.0, 1.0]);
+        let mut tm_unit = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42)
+            .class_weights(vec![1.0, 1.0]);
         for _ in 0..5 {
             tm_default.fit_epoch(&btr, &ytr);
             tm_unit.fit_epoch(&btr, &ytr);
@@ -1544,8 +1536,8 @@ mod tests {
         let w0 = n as f64 / (2.0 * class0_count as f64);
         let w1 = n as f64 / (2.0 * class1_count as f64);
 
-        let mut tm_balanced = TsetlinMachine::with_config(2, 8, 20, 20, 3.0, 8, true, 42)
-            .class_weights(vec![w0, w1]);
+        let mut tm_balanced =
+            TsetlinMachine::with_config(2, 8, 20, 20, 3.0, 8, true, 42).class_weights(vec![w0, w1]);
         let mut tm_uniform = TsetlinMachine::with_config(2, 8, 20, 20, 3.0, 8, true, 42);
         for _ in 0..15 {
             tm_balanced.fit_epoch(&btr, &ys);
@@ -1556,13 +1548,18 @@ mod tests {
         let recall_c1 = |tm: &TsetlinMachine| -> f64 {
             let w = tm.words_per_sample();
             let data = btr.data.as_slice();
-            let (correct, total) = (0..n)
-                .filter(|&i| ys[i] == 1)
-                .fold((0usize, 0usize), |(c, t), i| {
-                    let pred = tm.predict_lit(&data[i * w..(i + 1) * w]);
-                    (c + (pred == 1) as usize, t + 1)
-                });
-            if total == 0 { 0.0 } else { correct as f64 / total as f64 }
+            let (correct, total) =
+                (0..n)
+                    .filter(|&i| ys[i] == 1)
+                    .fold((0usize, 0usize), |(c, t), i| {
+                        let pred = tm.predict_lit(&data[i * w..(i + 1) * w]);
+                        (c + (pred == 1) as usize, t + 1)
+                    });
+            if total == 0 {
+                0.0
+            } else {
+                correct as f64 / total as f64
+            }
         };
 
         let recall_balanced = recall_c1(&tm_balanced);
@@ -1586,15 +1583,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "all class weights must be positive")]
     fn class_weights_zero_panics() {
-        TsetlinMachine::with_config(2, 4, 4, 10, 3.0, 8, true, 1)
-            .class_weights(vec![1.0, 0.0]);
+        TsetlinMachine::with_config(2, 4, 4, 10, 3.0, 8, true, 1).class_weights(vec![1.0, 0.0]);
     }
 
     #[test]
     #[should_panic(expected = "all class weights must be positive")]
     fn class_weights_negative_panics() {
-        TsetlinMachine::with_config(2, 4, 4, 10, 3.0, 8, true, 1)
-            .class_weights(vec![-1.0, 1.0]);
+        TsetlinMachine::with_config(2, 4, 4, 10, 3.0, 8, true, 1).class_weights(vec![-1.0, 1.0]);
     }
 
     // ---- class_weights saturation / safety -----------------------------------
@@ -1644,7 +1639,10 @@ mod tests {
             "near-zero class weight should keep all clause weights at initial value 1"
         );
         let any_evolved = (0..cps).any(|j| tm.clause_weight(1, j) > 1);
-        assert!(any_evolved, "class 1 with weight 1.0 should evolve normally");
+        assert!(
+            any_evolved,
+            "class 1 with weight 1.0 should evolve normally"
+        );
     }
 
     // ---- class_weights determinism -------------------------------------------
@@ -1661,8 +1659,8 @@ mod tests {
         let weights = vec![2.0, 0.5];
         let mut tm1 = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 99)
             .class_weights(weights.clone());
-        let mut tm2 = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 99)
-            .class_weights(weights);
+        let mut tm2 =
+            TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 99).class_weights(weights);
         for _ in 0..5 {
             tm1.fit_epoch(&btr, &ytr);
             tm2.fit_epoch(&btr, &ytr);

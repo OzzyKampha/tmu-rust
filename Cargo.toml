@@ -1,6 +1,6 @@
 [package]
 name = "tmu-rs"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 description = "Bit-packed weighted multiclass Tsetlin Machine in Rust, with bit-parallel/multi-threaded training, a fast booleanizer, and ports of the TMU classification demos."
 license = "MIT"
@@ -41,6 +41,10 @@ path = "examples/noisy_xor.rs"
 [[example]]
 name = "interpretability"  # TMU InterpretabilityDemo
 path = "examples/interpretability.rs"
+
+[[example]]
+name = "coalesced"         # TMU TMCoalescedClassifier demo
+path = "examples/coalesced.rs"
 
 [[example]]
 name = "breast_cancer"     # TMU BreastCancerDemo
