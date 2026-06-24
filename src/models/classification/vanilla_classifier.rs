@@ -1574,6 +1574,157 @@ mod tests {
         );
     }
 
+    // ---- class_weights validation --------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "class_weights length must equal n_classes")]
+    fn class_weights_wrong_length_panics() {
+        TsetlinMachine::with_config(2, 4, 4, 10, 3.0, 8, true, 1)
+            .class_weights(vec![1.0, 1.0, 1.0]); // 3 weights for 2 classes
+    }
+
+    #[test]
+    #[should_panic(expected = "all class weights must be positive")]
+    fn class_weights_zero_panics() {
+        TsetlinMachine::with_config(2, 4, 4, 10, 3.0, 8, true, 1)
+            .class_weights(vec![1.0, 0.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "all class weights must be positive")]
+    fn class_weights_negative_panics() {
+        TsetlinMachine::with_config(2, 4, 4, 10, 3.0, 8, true, 1)
+            .class_weights(vec![-1.0, 1.0]);
+    }
+
+    // ---- class_weights saturation / safety -----------------------------------
+
+    #[test]
+    fn class_weights_very_high_clamped_safe() {
+        // Weights >> 1 saturate p at 1.0 (clamp); must not panic and clause
+        // weights must remain in [1, threshold].
+        let (xtr, ytr) = make_xor(300, 0.0, 90);
+        let btr = enc(12).encode_batch(&as_slices(&xtr));
+        let threshold = 10i32;
+        let mut tm = TsetlinMachine::with_config(2, 12, 8, threshold, 3.0, 8, true, 42)
+            .class_weights(vec![1000.0, 1000.0]);
+        for _ in 0..5 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+        for c in 0..2 {
+            for j in 0..tm.clauses_per_class() {
+                let w = tm.clause_weight(c, j);
+                assert!(
+                    (1..=threshold).contains(&w),
+                    "clause ({c},{j}) weight {w} out of [1, {threshold}] with very high class weight"
+                );
+            }
+        }
+    }
+
+    // ---- class_weights suppression -------------------------------------------
+
+    #[test]
+    fn class_weights_near_zero_suppresses_clause_updates() {
+        // A weight of 1e-9 multiplies p by ~0; over 1000 training steps the
+        // probability of any single clause receiving Type Ia feedback is ~1e-6.
+        // All clause weights for the suppressed class must remain at the initial
+        // value of 1; class 1 (weight 1.0) must evolve normally.
+        let (xtr, ytr) = make_xor(200, 0.0, 91);
+        let btr = enc(12).encode_batch(&as_slices(&xtr));
+        let cps = 12usize;
+        let mut tm = TsetlinMachine::with_config(2, 12, cps, 10, 3.0, 8, true, 42)
+            .class_weights(vec![1e-9, 1.0]);
+        for _ in 0..5 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+        let all_frozen = (0..cps).all(|j| tm.clause_weight(0, j) == 1);
+        assert!(
+            all_frozen,
+            "near-zero class weight should keep all clause weights at initial value 1"
+        );
+        let any_evolved = (0..cps).any(|j| tm.clause_weight(1, j) > 1);
+        assert!(any_evolved, "class 1 with weight 1.0 should evolve normally");
+    }
+
+    // ---- class_weights determinism -------------------------------------------
+
+    #[test]
+    fn class_weights_same_seed_same_result() {
+        // Same seed + same asymmetric weights must produce bit-identical outcomes.
+        let (xtr, ytr) = make_xor(500, 0.0, 92);
+        let (xte, yte) = make_xor(200, 0.0, 93);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let bte = e.encode_batch(&as_slices(&xte));
+
+        let weights = vec![2.0, 0.5];
+        let mut tm1 = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 99)
+            .class_weights(weights.clone());
+        let mut tm2 = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 99)
+            .class_weights(weights);
+        for _ in 0..5 {
+            tm1.fit_epoch(&btr, &ytr);
+            tm2.fit_epoch(&btr, &ytr);
+        }
+        assert_eq!(
+            tm1.accuracy(&bte, &yte),
+            tm2.accuracy(&bte, &yte),
+            "class_weights must not break determinism for the same seed"
+        );
+        for c in 0..2 {
+            for j in 0..tm1.clauses_per_class() {
+                assert_eq!(
+                    tm1.clause_weight(c, j),
+                    tm2.clause_weight(c, j),
+                    "clause ({c},{j}) weight differs between identical runs"
+                );
+            }
+        }
+    }
+
+    // ---- class_weights multiclass independence --------------------------------
+
+    #[test]
+    fn class_weights_multiclass_independent_per_class() {
+        // 4-class problem: freeze classes 0 and 2 (weight ≈ 0), train 1 and 3
+        // normally (weight 1.0). Frozen classes must have all clause weights at 1;
+        // active classes must have at least one clause weight above 1.
+        let mut rng = Rng::new(94);
+        let n = 1000usize;
+        let mut xs = Vec::with_capacity(n);
+        let mut ys = Vec::with_capacity(n);
+        for _ in 0..n {
+            let f: Vec<u8> = (0..8).map(|_| (rng.next_u64() & 1) as u8).collect();
+            let y = ((f[0] ^ f[1]) as usize) * 2 + (f[2] ^ f[3]) as usize;
+            xs.push(f);
+            ys.push(y);
+        }
+        let btr = enc(8).encode_batch(&as_slices(&xs));
+        let cps = 10usize;
+
+        let mut tm = TsetlinMachine::with_config(4, 8, cps, 15, 3.0, 8, true, 42)
+            .class_weights(vec![1e-9, 1.0, 1e-9, 1.0]);
+        for _ in 0..10 {
+            tm.fit_epoch(&btr, &ys);
+        }
+
+        for &frozen in &[0usize, 2usize] {
+            let all_at_one = (0..cps).all(|j| tm.clause_weight(frozen, j) == 1);
+            assert!(
+                all_at_one,
+                "frozen class {frozen} should have all clause weights at initial 1"
+            );
+        }
+        for &active in &[1usize, 3usize] {
+            let any_evolved = (0..cps).any(|j| tm.clause_weight(active, j) > 1);
+            assert!(
+                any_evolved,
+                "active class {active} should have some clause weights > 1 after training"
+            );
+        }
+    }
+
     // ---- scores are clamped to ±threshold -----------------------------------
 
     #[test]
