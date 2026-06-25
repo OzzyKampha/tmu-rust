@@ -537,7 +537,7 @@ fn run_vanilla(
     println!("\n━━━ TMAutoEncoder ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
     let nf = encoder.n_features();
-    let clauses_per_output = 40;
+    let clauses_per_output = 200; // ≥ PARALLEL_MIN(128) → Rayon clause updates active
     let threshold = 50;
     let s = 5.0;
 
@@ -571,7 +571,7 @@ fn run_vanilla(
 
     println!("{:>6}  {:>12}  {:>12}  {:>8}", "Epoch", "Ben recon", "Atk recon", "Gap");
     let n_train = train_benign.len();
-    for epoch in 1..=30 {
+    for epoch in 1..=15 {
         // Shuffle training indices for this epoch.
         let mut order: Vec<usize> = (0..n_train).collect();
         for i in (1..n_train).rev() {
@@ -589,7 +589,7 @@ fn run_vanilla(
             let mini = encoder.encode_batch_categorical(&slices);
             ae.fit_epoch(&mini);
         }
-        if epoch % 5 == 0 || epoch == 1 {
+        if epoch % 3 == 0 || epoch == 1 {
             let ben = ae.reconstruction_accuracy(&batch_test_ben);
             let atk = ae.reconstruction_accuracy(&batch_test_atk);
             println!("{epoch:>6}  {ben:>12.4}  {atk:>12.4}  {:>8.4}", ben - atk);
@@ -720,7 +720,7 @@ fn run_coalesced(
 
     println!("{:>6}  {:>12}  {:>12}  {:>8}", "Epoch", "Ben recon", "Atk recon", "Gap");
     let n_train = train_benign.len();
-    for epoch in 1..=30 {
+    for epoch in 1..=15 {
         let mut order: Vec<usize> = (0..n_train).collect();
         for i in (1..n_train).rev() {
             let j = shuffle_rng.below(i + 1);
@@ -735,7 +735,7 @@ fn run_coalesced(
             let mini = encoder.encode_batch_categorical(&slices);
             ae.fit_epoch(&mini);
         }
-        if epoch % 5 == 0 || epoch == 1 {
+        if epoch % 3 == 0 || epoch == 1 {
             let ben = ae.reconstruction_accuracy(&batch_test_ben);
             let atk = ae.reconstruction_accuracy(&batch_test_atk);
             println!("{epoch:>6}  {ben:>12.4}  {atk:>12.4}  {:>8.4}", ben - atk);
