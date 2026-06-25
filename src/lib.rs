@@ -34,7 +34,9 @@ mod serial;
 
 pub use booleanizer::Booleanizer;
 pub use encoder::{EncodedBatch, EncodedSample, Encoder};
-pub use models::{CoalescedTsetlinMachine, TMAutoEncoder, TMCoalescedAutoEncoder, TsetlinMachine};
+pub use models::{
+    CoalescedTsetlinMachine, TMAutoEncoder, TMCoalescedAutoEncoder, TMRegressor, TsetlinMachine,
+};
 pub use rng::Rng;
 #[cfg(feature = "serde")]
 pub use serial::SaveLoad;

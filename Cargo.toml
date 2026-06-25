@@ -104,6 +104,10 @@ path = "examples/bench_autoencoder.rs"
 name = "coalesced_autoencoder" # TMCoalescedAutoEncoder: shared clause bank reconstruction demo
 path = "examples/coalesced_autoencoder.rs"
 
+[[example]]
+name = "regression"           # TMRegressor: continuous output from binary features
+path = "examples/regression.rs"
+
 [[bench]]
 name = "throughput"
 path = "benches/throughput.rs"

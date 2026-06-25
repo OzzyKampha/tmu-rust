@@ -27,6 +27,7 @@ pub(crate) const TAG_COALESCED: u8 = 2;
 pub(crate) const TAG_AUTOENCODER: u8 = 3;
 pub(crate) const TAG_ENCODER: u8 = 4;
 pub(crate) const TAG_COALESCED_AUTOENCODER: u8 = 5;
+pub(crate) const TAG_REGRESSOR: u8 = 6;
 
 /// Build an `InvalidData` I/O error with a descriptive message.
 pub(crate) fn bad(msg: impl Into<String>) -> io::Error {

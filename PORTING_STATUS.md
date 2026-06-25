@@ -10,7 +10,7 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 |---|---|---|
 | `TMClassifier` | ✅ Ported | Weighted multiclass; full training + inference API |
 | `TMCoalesced` | ✅ Ported | Shared clause bank + signed per-class weight matrix; focused negative sampling |
-| `TMRegressor` | ❌ Not ported | Requires continuous-output learning rule |
+| `TMRegressor` | ✅ Ported | Continuous-output weighted clauses; feedback probability driven by current prediction vs target |
 | `TMAutoEncoder` | ✅ Ported | Unsupervised; dedicated per-output clause banks |
 | `TMCoalescedAutoEncoder` | ✅ Ported | Coalesced variant: shared clause bank + signed per-output weights |
 | `TMCompositeClassifier` | ❌ Not ported | Hybrid architecture |
@@ -30,7 +30,7 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | Literal dropout | ✅ | `literal_drop_p` per sample |
 | Clause dropout | ✅ | `clause_drop_p` per epoch |
 | Max included literals | ✅ | Type Ia guard on dense clauses |
-| Configurable TA state bits | ✅ | 2–16 bits per automaton counter |
+| Configurable TA state bits | ✅ | 2–8 bits per automaton counter (u8 storage) |
 | Absorbing state tracking | ✅ | `absorbed_include_fraction()`, `absorbed_exclude_fraction()` |
 | Clause rule extraction | ✅ | `clause_rule()`, `clause_is_positive()` |
 | Booleanizer | ✅ | Quantile-based continuous-to-binary encoder |
@@ -42,6 +42,29 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | Raw class scores | ✅ | `scores_packed()` |
 | GPU / CUDA acceleration | ❌ Not planned | |
 | Imbalanced-class weighting | ✅ | Per-class feedback scaling via `class_weights()` builder method |
+
+---
+
+## TMRegressor features
+
+| Feature | Status | Notes |
+|---|---|---|
+| Bit-packed clause bank | ✅ | Same 64-bit word packing as classifier; even clauses positive, odd negative |
+| Weighted clauses | ✅ | Integer weights per clause, >= 1; max weight = threshold |
+| Continuous-output prediction | ✅ | Vote sum clamped to `[0, threshold]`, returned as `f64` |
+| Type Ia / Ib feedback | ✅ | Feedback probability `(T − v) / (2T)` when pushing output up |
+| Type II feedback | ✅ | Feedback probability `v / (2T)` when pushing output down |
+| Boost true positives | ✅ | `boost_true_positive` option |
+| Literal dropout | ✅ | `literal_drop_p` builder |
+| Clause dropout | ✅ | `clause_drop_p` builder |
+| Max included literals | ✅ | `max_included_literals` Type Ia guard |
+| Configurable TA state bits | ✅ | 2–8 bits per counter |
+| Clause rule extraction | ✅ | `clause_rule()`, `clause_is_positive()` |
+| Batch prediction | ✅ | `predict_batch()` |
+| MAE / RMSE metrics | ✅ | `mae()`, `rmse()` over encoded batches |
+| Multi-threaded training | ✅ | `--features parallel` (Rayon), clause-parallel feedback |
+| Save / load | ✅ | `serde` feature; file tag `TAG_REGRESSOR = 6` |
+| GPU / CUDA acceleration | ❌ Not planned | |
 
 ---
 
@@ -76,7 +99,8 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | `MNISTDemo` / `MNISTDemoWeightedClauses` | `mnist` | ✅ Validated | ~93% (2000 clauses, T=50, s=10.0) |
 | `IMDbTextCategorizationDemo` | `imdb` | ✅ Validated | 2000 clauses, T=80, s=10.0 |
 | Convolutional demos | — | ❌ Not ported | Requires `ConvolutionalTM` |
-| Regression demos | — | ❌ Not ported | Requires `TMRegressor` |
+| Regression demo | `regression` | ✅ Ported | Continuous target (count function scaled to `[0, T]`); MAE + RMSE metrics |
 | Autoencoder demos | `autoencoder`, `coalesced_autoencoder` | ✅ Ported | `TMAutoEncoder` (vanilla) + `TMCoalescedAutoEncoder` (shared-bank) |
 | Coalesced demo | `coalesced` | ✅ Validated | 4-class shared-bank demo; 100% accuracy |
+| *(extra)* Save/load round-trip | `save_load` | ✅ Complete | Train → save → load → predict/resume; serde feature |
 
