@@ -3,6 +3,7 @@
 /// For each feature, `n_thresholds` evenly-spaced quantile cut points are computed from the
 /// training set. `transform_row` maps each value to 1 if it exceeds the threshold, else 0.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Booleanizer {
     thresholds: Vec<Vec<f64>>,
 }

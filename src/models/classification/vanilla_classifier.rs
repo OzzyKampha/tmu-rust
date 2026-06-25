@@ -17,6 +17,7 @@ use crate::rng::Rng;
 /// as a separate `Vec<u64>` for O(words) fire checks.  Optional clause-level parallelism
 /// via `--features parallel`.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TsetlinMachine {
     n_classes: usize,
     n_features: usize,
@@ -64,6 +65,11 @@ pub struct TsetlinMachine {
     /// `class_weights[c]` multiplies the feedback probability for class `c`.
     /// Defaults to `1.0` for all classes (no reweighting).
     class_weights: Vec<f64>,
+}
+
+#[cfg(feature = "serde")]
+impl crate::serial::SaveLoad for TsetlinMachine {
+    const TAG: u8 = crate::serial::TAG_VANILLA;
 }
 
 /// Per-clause feedback kernel shared by the sequential and parallel training paths.
@@ -1780,5 +1786,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- save / load (requires the `serde` feature) --------------------------
+
+    #[cfg(feature = "serde")]
+    use crate::serial::{self, SaveLoad};
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn save_load_roundtrip_predicts_identically() {
+        let (xtr, ytr) = make_xor(2000, 0.1, 1);
+        let (xte, yte) = make_xor(1000, 0.0, 2);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let bte = e.encode_batch(&as_slices(&xte));
+
+        let mut tm = TsetlinMachine::with_config(2, 12, 8, 15, 3.9, 8, true, 7)
+            .clause_drop_p(0.1)
+            .literal_drop_p(0.1)
+            .class_weights(vec![1.0, 2.0]);
+        for _ in 0..10 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+
+        // Round-trip through an in-memory buffer.
+        let mut buf = Vec::new();
+        tm.write_to(&mut buf).unwrap();
+        let loaded = TsetlinMachine::read_from(&mut buf.as_slice()).unwrap();
+
+        // Predictions must be bit-identical.
+        assert_eq!(tm.predict_batch(&bte), loaded.predict_batch(&bte));
+        assert_eq!(tm.accuracy(&bte, &yte), loaded.accuracy(&bte, &yte));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn save_load_resumes_training_without_reinit() {
+        let (xtr, ytr) = make_xor(2000, 0.1, 3);
+        let (xte, yte) = make_xor(1000, 0.0, 4);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let bte = e.encode_batch(&as_slices(&xte));
+
+        let mut tm = TsetlinMachine::with_config(2, 12, 8, 15, 3.9, 8, true, 7);
+        for _ in 0..8 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+
+        // Save, reload, and keep training both copies in lockstep.
+        let mut buf = Vec::new();
+        tm.write_to(&mut buf).unwrap();
+        let mut loaded = TsetlinMachine::read_from(&mut buf.as_slice()).unwrap();
+
+        for _ in 0..8 {
+            tm.fit_epoch(&btr, &ytr);
+            loaded.fit_epoch(&btr, &ytr);
+        }
+
+        // Resumed training must follow the exact same RNG streams.
+        assert_eq!(tm.ta, loaded.ta, "TA counters diverged after resume");
+        assert_eq!(tm.weights, loaded.weights, "weights diverged after resume");
+        assert_eq!(tm.accuracy(&bte, &yte), loaded.accuracy(&bte, &yte));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn save_load_via_file_path() {
+        let (xtr, ytr) = make_xor(500, 0.0, 5);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let mut tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42);
+        tm.fit_epoch(&btr, &ytr);
+
+        let mut path = std::env::temp_dir();
+        path.push("tmu_rs_vanilla_roundtrip.tmrs");
+        tm.save(&path).unwrap();
+        let loaded = TsetlinMachine::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let (xte, _) = make_xor(200, 0.0, 6);
+        let bte = e.encode_batch(&as_slices(&xte));
+        assert_eq!(tm.predict_batch(&bte), loaded.predict_batch(&bte));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn load_rejects_corrupt_data() {
+        // Empty / truncated input.
+        assert!(TsetlinMachine::read_from(&mut [].as_slice()).is_err());
+        // Bad magic.
+        assert!(TsetlinMachine::read_from(&mut b"XXXXjunkjunk".as_slice()).is_err());
+        // Right magic, wrong type tag (coalesced tag on a vanilla read).
+        let mut buf = Vec::new();
+        serial::write_header(&mut buf, serial::TAG_COALESCED).unwrap();
+        assert!(TsetlinMachine::read_from(&mut buf.as_slice()).is_err());
     }
 }

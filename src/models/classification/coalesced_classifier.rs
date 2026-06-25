@@ -32,6 +32,7 @@ use crate::rng::Rng;
 /// One shared clause bank of `n_clauses` clauses is voted on by every class via a
 /// signed weight matrix.  Optional clause-level parallelism via `--features parallel`.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CoalescedTsetlinMachine {
     n_classes: usize,
     n_features: usize,
@@ -82,6 +83,11 @@ pub struct CoalescedTsetlinMachine {
     literals: Vec<u64>,
     /// Global RNG for shuffling, clause dropout, and negative-class selection.
     rng: Rng,
+}
+
+#[cfg(feature = "serde")]
+impl crate::serial::SaveLoad for CoalescedTsetlinMachine {
+    const TAG: u8 = crate::serial::TAG_COALESCED;
 }
 
 /// Per-clause feedback + weight-update kernel shared by the sequential and parallel
@@ -1025,5 +1031,92 @@ mod tests {
                 assert!(w == 1 || w == -1, "initial weight must be ±1, got {w}");
             }
         }
+    }
+
+    // ---- save / load (requires the `serde` feature) --------------------------
+
+    #[cfg(feature = "serde")]
+    use crate::serial::{self, SaveLoad};
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn save_load_roundtrip_predicts_identically() {
+        let (xtr, ytr) = make_4class(2000, 1);
+        let (xte, yte) = make_4class(1000, 2);
+        let e = enc(8);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let bte = e.encode_batch(&as_slices(&xte));
+
+        let mut tm = CoalescedTsetlinMachine::with_config(4, 8, 24, 20, 3.9, 8, true, 7)
+            .focused_negative_sampling(true);
+        for _ in 0..20 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+
+        let mut buf = Vec::new();
+        tm.write_to(&mut buf).unwrap();
+        let loaded = CoalescedTsetlinMachine::read_from(&mut buf.as_slice()).unwrap();
+
+        assert_eq!(tm.predict_batch(&bte), loaded.predict_batch(&bte));
+        assert_eq!(tm.accuracy(&bte, &yte), loaded.accuracy(&bte, &yte));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn save_load_resumes_training_without_reinit() {
+        let (xtr, ytr) = make_4class(2000, 3);
+        let (xte, yte) = make_4class(1000, 4);
+        let e = enc(8);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let bte = e.encode_batch(&as_slices(&xte));
+
+        let mut tm = CoalescedTsetlinMachine::with_config(4, 8, 24, 20, 3.9, 8, true, 7);
+        for _ in 0..15 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+
+        let mut buf = Vec::new();
+        tm.write_to(&mut buf).unwrap();
+        let mut loaded = CoalescedTsetlinMachine::read_from(&mut buf.as_slice()).unwrap();
+
+        for _ in 0..15 {
+            tm.fit_epoch(&btr, &ytr);
+            loaded.fit_epoch(&btr, &ytr);
+        }
+
+        assert_eq!(tm.ta, loaded.ta, "TA counters diverged after resume");
+        assert_eq!(tm.weights, loaded.weights, "weights diverged after resume");
+        assert_eq!(tm.accuracy(&bte, &yte), loaded.accuracy(&bte, &yte));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn save_load_via_file_path() {
+        let (xtr, ytr) = make_xor(500, 0.0, 5);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let mut tm = CoalescedTsetlinMachine::with_config(2, 12, 16, 15, 3.9, 8, true, 42);
+        tm.fit_epoch(&btr, &ytr);
+
+        let mut path = std::env::temp_dir();
+        path.push("tmu_rs_coalesced_roundtrip.tmrs");
+        tm.save(&path).unwrap();
+        let loaded = CoalescedTsetlinMachine::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let (xte, _) = make_xor(200, 0.0, 6);
+        let bte = e.encode_batch(&as_slices(&xte));
+        assert_eq!(tm.predict_batch(&bte), loaded.predict_batch(&bte));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn load_rejects_corrupt_data() {
+        assert!(CoalescedTsetlinMachine::read_from(&mut [].as_slice()).is_err());
+        assert!(CoalescedTsetlinMachine::read_from(&mut b"XXXXjunkjunk".as_slice()).is_err());
+        // Right magic, wrong type tag (vanilla tag on a coalesced read).
+        let mut buf = Vec::new();
+        serial::write_header(&mut buf, serial::TAG_VANILLA).unwrap();
+        assert!(CoalescedTsetlinMachine::read_from(&mut buf.as_slice()).is_err());
     }
 }

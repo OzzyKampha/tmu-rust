@@ -84,6 +84,7 @@ impl EncodedBatch {
 
 // ── encoder kind ─────────────────────────────────────────────────────────────
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 enum EncoderKind {
     Binary,
     Numeric {
@@ -105,10 +106,16 @@ enum EncoderKind {
 ///
 /// Train the encoder once on your training set, then use it to encode both
 /// train and test data before passing to the TM.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Encoder {
     kind: EncoderKind,
     n_features: usize,
     words: usize,
+}
+
+#[cfg(feature = "serde")]
+impl crate::serial::SaveLoad for Encoder {
+    const TAG: u8 = crate::serial::TAG_ENCODER;
 }
 
 impl Encoder {
@@ -332,5 +339,82 @@ impl Encoder {
             data[i * w..(i + 1) * w].copy_from_slice(&s.0);
         }
         EncodedBatch { data, n, words: w }
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod tests {
+    use super::*;
+    use crate::serial::{self, SaveLoad};
+
+    fn roundtrip(e: &Encoder) -> Encoder {
+        let mut buf = Vec::new();
+        e.write_to(&mut buf).unwrap();
+        Encoder::read_from(&mut buf.as_slice()).unwrap()
+    }
+
+    #[test]
+    fn binary_encoder_roundtrip() {
+        let e = Encoder::for_binary(5);
+        let loaded = roundtrip(&e);
+        assert_eq!(e.n_features(), loaded.n_features());
+
+        let rows: Vec<Vec<u8>> = vec![vec![1, 0, 1, 1, 0], vec![0, 0, 1, 0, 1]];
+        let refs: Vec<&[u8]> = rows.iter().map(|r| r.as_slice()).collect();
+        assert_eq!(e.encode_batch(&refs).data, loaded.encode_batch(&refs).data);
+    }
+
+    #[test]
+    fn numeric_encoder_roundtrip() {
+        let train: Vec<Vec<f64>> = (0..50)
+            .map(|i| vec![i as f64, (i % 7) as f64, (i as f64) * 0.5])
+            .collect();
+        let train_refs: Vec<&[f64]> = train.iter().map(|r| r.as_slice()).collect();
+        let e = Encoder::fit_numeric(&train_refs, 4);
+        let loaded = roundtrip(&e);
+        assert_eq!(e.n_features(), loaded.n_features());
+
+        let test: Vec<Vec<f64>> = vec![vec![3.0, 2.0, 9.0], vec![40.0, 1.0, 0.0]];
+        let test_refs: Vec<&[f64]> = test.iter().map(|r| r.as_slice()).collect();
+        assert_eq!(
+            e.encode_batch_numeric(&test_refs).data,
+            loaded.encode_batch_numeric(&test_refs).data
+        );
+        // Interpretable metadata must survive the round-trip too.
+        assert_eq!(e.bit_origin(0), loaded.bit_origin(0));
+    }
+
+    #[test]
+    fn categorical_encoder_roundtrip() {
+        let s1: Vec<&str> = vec!["proc::cmd.exe", "user::alice"];
+        let s2: Vec<&str> = vec!["proc::powershell.exe", "user::bob"];
+        let train: Vec<&[&str]> = vec![s1.as_slice(), s2.as_slice()];
+        let e = Encoder::fit_categorical(&train);
+        let loaded = roundtrip(&e);
+        assert_eq!(e.n_features(), loaded.n_features());
+
+        // Include an unseen token to exercise the UNK/OOV fallback paths.
+        let q1: Vec<&str> = vec!["proc::cmd.exe", "user::carol"];
+        let q2: Vec<&str> = vec!["proc::unknown.exe", "newcol::x"];
+        let query: Vec<&[&str]> = vec![q1.as_slice(), q2.as_slice()];
+        assert_eq!(
+            e.encode_batch_categorical(&query).data,
+            loaded.encode_batch_categorical(&query).data
+        );
+        assert_eq!(e.vocab_token(0), loaded.vocab_token(0));
+    }
+
+    #[test]
+    fn load_rejects_corrupt_data() {
+        assert!(Encoder::read_from(&mut [].as_slice()).is_err());
+        assert!(Encoder::read_from(&mut b"XXXXjunkjunk".as_slice()).is_err());
+        // Valid header/tag but a truncated (empty) bincode payload.
+        let mut buf = Vec::new();
+        serial::write_header(&mut buf, serial::TAG_ENCODER).unwrap();
+        assert!(Encoder::read_from(&mut buf.as_slice()).is_err());
+        // Right magic/version but the wrong artifact type.
+        let mut buf = Vec::new();
+        serial::write_header(&mut buf, serial::TAG_VANILLA).unwrap();
+        assert!(Encoder::read_from(&mut buf.as_slice()).is_err());
     }
 }

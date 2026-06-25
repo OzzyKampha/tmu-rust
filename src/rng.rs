@@ -1,6 +1,7 @@
 /// SplitMix64 — extremely fast non-cryptographic PRNG, suitable for the
 /// high-frequency RNG calls in the TM inner training loop.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Rng(u64);
 
 impl Rng {

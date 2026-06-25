@@ -54,6 +54,7 @@ let accuracy = tm.accuracy(&test_x, &test_y);
 - AVX2 fast paths for clause update loops with runtime dispatch — u8 TA counters processed 32-wide (4× smaller working set vs u32; scalar fallback on non-AVX2 targets)
 - Type-safe `Encoder` for binary, numeric (quantile booleanization), and categorical inputs
 - Fast booleanizer for continuous-valued inputs
+- Save/load trained models and encoders to disk via the `SaveLoad` trait (on by default through the `serde` feature) — serde + bincode preserve all learned state **and** RNG streams, so a reloaded model predicts identically and can resume training deterministically. Build with `--no-default-features` for a dependency-free build without save/load
 - Ports of the core TMU classification demos
 
 ---
@@ -101,6 +102,7 @@ The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) multiclass 
 | `BreastCancerDemo` | `breast_cancer` | scikit-learn | see [Data preparation](#data-preparation) |
 | `MNISTDemo` / `MNISTDemoWeightedClauses` | `mnist` | MNIST | see [Data preparation](#data-preparation) |
 | `IMDbTextCategorizationDemo` | `imdb` | Keras IMDb | see [Data preparation](#data-preparation) |
+| *(extra)* | `save_load` | — | `cargo run --release --example save_load` |
 | *(extra)* | `ndr_flows` | — | `cargo run --release --example ndr_flows` |
 | *(extra)* | `bench_training` | — | `cargo run --release --example bench_training` |
 | *(extra)* | `absorb_timing` | — | `cargo run --release --example absorb_timing` |

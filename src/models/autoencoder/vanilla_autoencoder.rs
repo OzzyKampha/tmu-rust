@@ -24,6 +24,7 @@ use crate::rng::Rng;
 ///
 /// [`TsetlinMachine`]: crate::TsetlinMachine
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TMAutoEncoder {
     n_features: usize,
     n_literals: usize,
@@ -55,6 +56,11 @@ pub struct TMAutoEncoder {
 
     literals: Vec<u64>,
     rng: Rng,
+}
+
+#[cfg(feature = "serde")]
+impl crate::serial::SaveLoad for TMAutoEncoder {
+    const TAG: u8 = crate::serial::TAG_AUTOENCODER;
 }
 
 /// Per-clause feedback kernel (identical to the one in vanilla_classifier.rs).
@@ -1005,5 +1011,103 @@ mod tests {
         let ae = TMAutoEncoder::with_config(4, 2, 5, 2.0, 8, true, 1);
         assert_eq!(ae.max_state, 255u8, "state_bits=8 → max_state must be 255");
         assert_eq!(ae.half, 128u8, "state_bits=8 → half must be 128");
+    }
+
+    // ---- save / load (requires the `serde` feature) --------------------------
+
+    #[cfg(feature = "serde")]
+    use crate::serial::{self, SaveLoad};
+
+    /// Structured data where bits 6..12 mirror bits 0..6 (learnable correlations).
+    #[cfg(feature = "serde")]
+    fn make_mirror(n: usize, seed: u64) -> Vec<Vec<u8>> {
+        let mut rng = Rng::new(seed);
+        (0..n)
+            .map(|_| {
+                let half: Vec<u8> = (0..6).map(|_| (rng.next_u64() & 1) as u8).collect();
+                let mut f = half.clone();
+                f.extend_from_slice(&half);
+                f
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn save_load_roundtrip_reconstructs_identically() {
+        let xs = make_mirror(2000, 1);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xs));
+
+        let mut ae = TMAutoEncoder::with_config(12, 8, 15, 3.9, 8, true, 7);
+        for _ in 0..15 {
+            ae.fit_epoch(&btr);
+        }
+
+        let mut buf = Vec::new();
+        ae.write_to(&mut buf).unwrap();
+        let loaded = TMAutoEncoder::read_from(&mut buf.as_slice()).unwrap();
+
+        let xte = make_mirror(500, 2);
+        let bte = e.encode_batch(&as_slices(&xte));
+        assert_eq!(ae.reconstruct_batch(&bte), loaded.reconstruct_batch(&bte));
+        assert_eq!(
+            ae.reconstruction_accuracy(&bte),
+            loaded.reconstruction_accuracy(&bte)
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn save_load_resumes_training_without_reinit() {
+        let xs = make_mirror(2000, 3);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xs));
+
+        let mut ae = TMAutoEncoder::with_config(12, 8, 15, 3.9, 8, true, 7);
+        for _ in 0..10 {
+            ae.fit_epoch(&btr);
+        }
+
+        let mut buf = Vec::new();
+        ae.write_to(&mut buf).unwrap();
+        let mut loaded = TMAutoEncoder::read_from(&mut buf.as_slice()).unwrap();
+
+        for _ in 0..10 {
+            ae.fit_epoch(&btr);
+            loaded.fit_epoch(&btr);
+        }
+
+        assert_eq!(ae.ta, loaded.ta, "TA counters diverged after resume");
+        assert_eq!(ae.weights, loaded.weights, "weights diverged after resume");
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn save_load_via_file_path() {
+        let xs = make_mirror(500, 5);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xs));
+        let mut ae = TMAutoEncoder::with_config(12, 4, 10, 3.0, 8, true, 42);
+        ae.fit_epoch(&btr);
+
+        let mut path = std::env::temp_dir();
+        path.push("tmu_rs_autoencoder_roundtrip.tmrs");
+        ae.save(&path).unwrap();
+        let loaded = TMAutoEncoder::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let bte = e.encode_batch(&as_slices(&make_mirror(200, 6)));
+        assert_eq!(ae.reconstruct_batch(&bte), loaded.reconstruct_batch(&bte));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn load_rejects_corrupt_data() {
+        assert!(TMAutoEncoder::read_from(&mut [].as_slice()).is_err());
+        assert!(TMAutoEncoder::read_from(&mut b"XXXXjunkjunk".as_slice()).is_err());
+        let mut buf = Vec::new();
+        serial::write_header(&mut buf, serial::TAG_VANILLA).unwrap();
+        assert!(TMAutoEncoder::read_from(&mut buf.as_slice()).is_err());
     }
 }
