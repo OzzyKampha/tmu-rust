@@ -32,6 +32,11 @@ use tmu_rs::{Encoder, Rng, TMAutoEncoder, TMCoalescedAutoEncoder};
 // 16K raw features → 21 GB.  Cap to top-N by frequency to keep it < 100 MB.
 const MAX_VOCAB: usize = 1024;
 
+// Mini-batch size for training.  Encoding the full 428K training set upfront
+// costs ~116 MB; with mini-batches we only hold MINI_BATCH_SIZE × 34 words
+// (~560 KB) in memory at a time and can report progress within each epoch.
+const MINI_BATCH_SIZE: usize = 4096;
+
 // ── dataset discovery ─────────────────────────────────────────────────────────
 
 const DATA_DIR: &str = "mordor_data";
@@ -538,29 +543,56 @@ fn run_vanilla(
 
     println!(
         "config: n_features={nf}  clauses_per_output={clauses_per_output}  \
-         threshold={threshold}  s={s}"
+         threshold={threshold}  s={s}  mini_batch={MINI_BATCH_SIZE}"
     );
     println!(
         "train on {} benign events (unsupervised, no labels)\n",
         train_benign.len()
     );
 
-    // Encode training batch (benign only).
-    let train_refs: Vec<Vec<&str>> = train_benign
+    // Pre-encode only the test sets — small enough to hold in memory, reused every epoch.
+    let te_ben_refs: Vec<Vec<&str>> = test_benign
         .iter()
         .map(|t| t.iter().map(String::as_str).collect())
         .collect();
-    let train_slices: Vec<&[&str]> = train_refs.iter().map(|v| v.as_slice()).collect();
-    let batch_train = encoder.encode_batch_categorical(&train_slices);
+    let te_ben_slices: Vec<&[&str]> = te_ben_refs.iter().map(|v| v.as_slice()).collect();
+    let batch_test_ben = encoder.encode_batch_categorical(&te_ben_slices);
+
+    let te_atk_refs: Vec<Vec<&str>> = test_attack
+        .iter()
+        .map(|t| t.iter().map(String::as_str).collect())
+        .collect();
+    let te_atk_slices: Vec<&[&str]> = te_atk_refs.iter().map(|v| v.as_slice()).collect();
+    let batch_test_atk = encoder.encode_batch_categorical(&te_atk_slices);
 
     let mut ae = TMAutoEncoder::with_config(nf, clauses_per_output, threshold, s, 8, true, 42);
+    // Separate RNG for epoch-level shuffling (decoupled from the model's internal RNG).
+    let mut shuffle_rng = Rng::new(0xDEAD_BEEF);
 
-    println!("{:>6}  {:>12}", "Epoch", "Train recon");
+    println!("{:>6}  {:>12}  {:>12}  {:>8}", "Epoch", "Ben recon", "Atk recon", "Gap");
+    let n_train = train_benign.len();
     for epoch in 1..=30 {
-        ae.fit_epoch(&batch_train);
+        // Shuffle training indices for this epoch.
+        let mut order: Vec<usize> = (0..n_train).collect();
+        for i in (1..n_train).rev() {
+            let j = shuffle_rng.below(i + 1);
+            order.swap(i, j);
+        }
+        // Encode and train one mini-batch at a time — peak extra memory is
+        // MINI_BATCH_SIZE × words × 8 bytes ≈ 560 KB instead of ~116 MB.
+        for chunk in order.chunks(MINI_BATCH_SIZE) {
+            let refs: Vec<Vec<&str>> = chunk
+                .iter()
+                .map(|&i| train_benign[i].iter().map(String::as_str).collect())
+                .collect();
+            let slices: Vec<&[&str]> = refs.iter().map(|v| v.as_slice()).collect();
+            let mini = encoder.encode_batch_categorical(&slices);
+            ae.fit_epoch(&mini);
+        }
         if epoch % 5 == 0 || epoch == 1 {
-            let tr = ae.reconstruction_accuracy(&batch_train);
-            println!("{epoch:>6}  {tr:>12.4}");
+            let ben = ae.reconstruction_accuracy(&batch_test_ben);
+            let atk = ae.reconstruction_accuracy(&batch_test_atk);
+            println!("{epoch:>6}  {ben:>12.4}  {atk:>12.4}  {:>8.4}", ben - atk);
         }
     }
 
@@ -661,29 +693,52 @@ fn run_coalesced(
 
     println!(
         "config: n_features={nf}  n_clauses={n_clauses} (shared)  \
-         threshold={threshold}  s={s}"
+         threshold={threshold}  s={s}  mini_batch={MINI_BATCH_SIZE}"
     );
     println!(
         "train on {} benign events (unsupervised, no labels)\n",
         train_benign.len()
     );
 
-    let train_refs: Vec<Vec<&str>> = train_benign
+    let te_ben_refs: Vec<Vec<&str>> = test_benign
         .iter()
         .map(|t| t.iter().map(String::as_str).collect())
         .collect();
-    let train_slices: Vec<&[&str]> = train_refs.iter().map(|v| v.as_slice()).collect();
-    let batch_train = encoder.encode_batch_categorical(&train_slices);
+    let te_ben_slices: Vec<&[&str]> = te_ben_refs.iter().map(|v| v.as_slice()).collect();
+    let batch_test_ben = encoder.encode_batch_categorical(&te_ben_slices);
+
+    let te_atk_refs: Vec<Vec<&str>> = test_attack
+        .iter()
+        .map(|t| t.iter().map(String::as_str).collect())
+        .collect();
+    let te_atk_slices: Vec<&[&str]> = te_atk_refs.iter().map(|v| v.as_slice()).collect();
+    let batch_test_atk = encoder.encode_batch_categorical(&te_atk_slices);
 
     let mut ae =
         TMCoalescedAutoEncoder::with_config(nf, n_clauses, threshold, s, 8, true, 42);
+    let mut shuffle_rng = Rng::new(0xDEAD_BEEF);
 
-    println!("{:>6}  {:>12}", "Epoch", "Train recon");
+    println!("{:>6}  {:>12}  {:>12}  {:>8}", "Epoch", "Ben recon", "Atk recon", "Gap");
+    let n_train = train_benign.len();
     for epoch in 1..=30 {
-        ae.fit_epoch(&batch_train);
+        let mut order: Vec<usize> = (0..n_train).collect();
+        for i in (1..n_train).rev() {
+            let j = shuffle_rng.below(i + 1);
+            order.swap(i, j);
+        }
+        for chunk in order.chunks(MINI_BATCH_SIZE) {
+            let refs: Vec<Vec<&str>> = chunk
+                .iter()
+                .map(|&i| train_benign[i].iter().map(String::as_str).collect())
+                .collect();
+            let slices: Vec<&[&str]> = refs.iter().map(|v| v.as_slice()).collect();
+            let mini = encoder.encode_batch_categorical(&slices);
+            ae.fit_epoch(&mini);
+        }
         if epoch % 5 == 0 || epoch == 1 {
-            let tr = ae.reconstruction_accuracy(&batch_train);
-            println!("{epoch:>6}  {tr:>12.4}");
+            let ben = ae.reconstruction_accuracy(&batch_test_ben);
+            let atk = ae.reconstruction_accuracy(&batch_test_atk);
+            println!("{epoch:>6}  {ben:>12.4}  {atk:>12.4}  {:>8.4}", ben - atk);
         }
     }
 
