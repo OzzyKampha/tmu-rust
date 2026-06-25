@@ -53,8 +53,8 @@ fn main() {
 
     let xtr = load_u8("data/cmp_conv2d_X_train.bin", 5000, n_features);
     let ytr = load_u32_as_usize("data/cmp_conv2d_y_train.bin", 5000);
-    let xte = load_u8("data/cmp_conv2d_X_test.bin",  1000, n_features);
-    let yte = load_u32_as_usize("data/cmp_conv2d_y_test.bin",  1000);
+    let xte = load_u8("data/cmp_conv2d_X_test.bin", 1000, n_features);
+    let yte = load_u32_as_usize("data/cmp_conv2d_y_test.bin", 1000);
 
     let tr: Vec<&[u8]> = xtr.iter().map(|v| v.as_slice()).collect();
     let te: Vec<&[u8]> = xte.iter().map(|v| v.as_slice()).collect();
@@ -69,8 +69,8 @@ fn main() {
     println!("{:>5}  {:>10}  {:>10}", "epoch", "train acc", "test acc");
 
     let mut ctm = ConvolutionalTsetlinMachine::with_config_2d(
-        2, INPUT_ROWS, INPUT_COLS, PATCH_ROWS, PATCH_COLS, STRIDE,
-        CLAUSES, THRESHOLD, S, 8, true, 42,
+        2, INPUT_ROWS, INPUT_COLS, PATCH_ROWS, PATCH_COLS, STRIDE, CLAUSES, THRESHOLD, S, 8, true,
+        42,
     );
 
     for epoch in 1..=EPOCHS {
@@ -91,13 +91,17 @@ fn main() {
     let mut shown = 0;
     for j in (0..CLAUSES).step_by(2) {
         let rule = ctm.clause_rule(0, j);
-        if rule.is_empty() { continue; }
+        if rule.is_empty() {
+            continue;
+        }
         let features: Vec<String> = rule
             .iter()
             .map(|&(f, neg)| format!("{}px{}", if neg { "¬" } else { "" }, f))
             .collect();
         println!("  clause {:>3}  {}", j, features.join(" ∧ "));
         shown += 1;
-        if shown >= 4 { break; }
+        if shown >= 4 {
+            break;
+        }
     }
 }

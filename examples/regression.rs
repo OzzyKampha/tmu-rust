@@ -36,8 +36,8 @@ fn load_f64(path: &str, n: usize) -> Vec<f64> {
 fn main() {
     let xtr = load_u8("data/cmp_regressor_X_train.bin", 5000, N_FEATURES);
     let ytr = load_f64("data/cmp_regressor_y_train.bin", 5000);
-    let xte = load_u8("data/cmp_regressor_X_test.bin",  1000, N_FEATURES);
-    let yte = load_f64("data/cmp_regressor_y_test.bin",  1000);
+    let xte = load_u8("data/cmp_regressor_X_test.bin", 1000, N_FEATURES);
+    let yte = load_f64("data/cmp_regressor_y_test.bin", 1000);
 
     let encoder = Encoder::for_binary(N_FEATURES);
     let xtr_r: Vec<&[u8]> = xtr.iter().map(|v| v.as_slice()).collect();
@@ -47,7 +47,9 @@ fn main() {
 
     let mut tm = TMRegressor::with_config(N_FEATURES, N_CLAUSES, THRESHOLD, S, 8, true, 42);
 
-    println!("Training TMRegressor: {N_FEATURES} features, {N_CLAUSES} clauses, T={THRESHOLD}, s={S}");
+    println!(
+        "Training TMRegressor: {N_FEATURES} features, {N_CLAUSES} clauses, T={THRESHOLD}, s={S}"
+    );
     println!("Target: count of 1s in features 0..4, scaled to [0, {THRESHOLD}]");
     println!("(shared data: data/cmp_regressor_*.bin — identical to Python side)");
     println!("{:>5}  {:>10}  {:>10}", "epoch", "train MAE", "test MAE");
@@ -74,8 +76,14 @@ fn main() {
     for (i, (p, t)) in preds.iter().zip(&yte[..10]).enumerate() {
         println!(
             "{:>6.1}  {:>8.1}  {:>+8.1}  {}",
-            t, p, p - t,
-            xte[i][0..5].iter().map(|b| b.to_string()).collect::<Vec<_>>().join("")
+            t,
+            p,
+            p - t,
+            xte[i][0..5]
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join("")
         );
     }
 }

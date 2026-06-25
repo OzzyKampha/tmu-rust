@@ -145,7 +145,15 @@ fn apply_one_clause_conv(
             *w = (*w + 1).min(wmax);
         }
         type_i_update_bytes(
-            ta, n_literals, fired_under, boost, lit_b, inv_b, keep_b, active_b, max_state,
+            ta,
+            n_literals,
+            fired_under,
+            boost,
+            lit_b,
+            inv_b,
+            keep_b,
+            active_b,
+            max_state,
         );
     } else {
         // Type II: only runs when clause fires on at least one patch.
@@ -175,8 +183,16 @@ impl ConvolutionalTsetlinMachine {
         s: f64,
     ) -> Self {
         Self::with_config(
-            n_classes, n_input_features, kernel_size, stride,
-            clauses_per_class, threshold, s, 8, true, 42,
+            n_classes,
+            n_input_features,
+            kernel_size,
+            stride,
+            clauses_per_class,
+            threshold,
+            s,
+            8,
+            true,
+            42,
         )
     }
 
@@ -198,8 +214,18 @@ impl ConvolutionalTsetlinMachine {
         s: f64,
     ) -> Self {
         Self::with_config_2d(
-            n_classes, input_rows, input_cols, patch_rows, patch_cols, stride,
-            clauses_per_class, threshold, s, 8, true, 42,
+            n_classes,
+            input_rows,
+            input_cols,
+            patch_rows,
+            patch_cols,
+            stride,
+            clauses_per_class,
+            threshold,
+            s,
+            8,
+            true,
+            42,
         )
     }
 
@@ -226,7 +252,10 @@ impl ConvolutionalTsetlinMachine {
         assert!((2..=8).contains(&state_bits));
 
         let n_patches = (n_input_features - kernel_size) / stride + 1;
-        assert!(n_patches >= 1, "kernel_size and stride must yield at least 1 patch");
+        assert!(
+            n_patches >= 1,
+            "kernel_size and stride must yield at least 1 patch"
+        );
 
         let state_bits = state_bits as usize;
         let n_literals = 2 * kernel_size;
@@ -247,7 +276,11 @@ impl ConvolutionalTsetlinMachine {
         for cj in 0..n_clauses {
             let tb = cj * n_literals;
             for l in 0..n_literals {
-                ta[tb + l] = if rng.next_u64() & 1 == 0 { half - 1 } else { half };
+                ta[tb + l] = if rng.next_u64() & 1 == 0 {
+                    half - 1
+                } else {
+                    half
+                };
             }
             rebuild_include(
                 &ta[tb..tb + n_literals],
@@ -358,7 +391,11 @@ impl ConvolutionalTsetlinMachine {
         for cj in 0..n_clauses {
             let tb = cj * n_literals;
             for l in 0..n_literals {
-                ta[tb + l] = if rng.next_u64() & 1 == 0 { half - 1 } else { half };
+                ta[tb + l] = if rng.next_u64() & 1 == 0 {
+                    half - 1
+                } else {
+                    half
+                };
             }
             rebuild_include(
                 &ta[tb..tb + n_literals],
@@ -437,16 +474,36 @@ impl ConvolutionalTsetlinMachine {
 
     // ---- accessors -----------------------------------------------------------
 
-    pub fn n_classes(&self) -> usize { self.n_classes }
-    pub fn n_input_features(&self) -> usize { self.n_input_features }
-    pub fn kernel_size(&self) -> usize { self.kernel_size }
-    pub fn stride(&self) -> usize { self.stride }
-    pub fn n_patches(&self) -> usize { self.n_patches }
-    pub fn clauses_per_class(&self) -> usize { self.clauses_per_class }
-    pub fn patch_rows(&self) -> usize { self.patch_rows }
-    pub fn patch_cols(&self) -> usize { self.patch_cols }
-    pub fn input_rows(&self) -> usize { self.input_rows }
-    pub fn input_cols(&self) -> usize { self.input_cols }
+    pub fn n_classes(&self) -> usize {
+        self.n_classes
+    }
+    pub fn n_input_features(&self) -> usize {
+        self.n_input_features
+    }
+    pub fn kernel_size(&self) -> usize {
+        self.kernel_size
+    }
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+    pub fn n_patches(&self) -> usize {
+        self.n_patches
+    }
+    pub fn clauses_per_class(&self) -> usize {
+        self.clauses_per_class
+    }
+    pub fn patch_rows(&self) -> usize {
+        self.patch_rows
+    }
+    pub fn patch_cols(&self) -> usize {
+        self.patch_cols
+    }
+    pub fn input_rows(&self) -> usize {
+        self.input_rows
+    }
+    pub fn input_cols(&self) -> usize {
+        self.input_cols
+    }
 
     // ---- patch packing -------------------------------------------------------
 
@@ -505,10 +562,19 @@ impl ConvolutionalTsetlinMachine {
                 let clause_inc = &inc[cj * words..(cj + 1) * words];
                 // OR semantics: fires if it fires on ANY patch position.
                 let fires = (0..self.n_patches).any(|p| {
-                    fire_predict(clause_inc, &patches_buf[p * words..(p + 1) * words], val, words)
+                    fire_predict(
+                        clause_inc,
+                        &patches_buf[p * words..(p + 1) * words],
+                        val,
+                        words,
+                    )
                 });
                 if fires {
-                    if j & 1 == 0 { sum += w; } else { sum -= w; }
+                    if j & 1 == 0 {
+                        sum += w;
+                    } else {
+                        sum -= w;
+                    }
                 }
             }
             *score = sum.clamp(-self.threshold, self.threshold);
@@ -524,7 +590,12 @@ impl ConvolutionalTsetlinMachine {
         self.pack_all_patches(x, &mut patches_buf);
         let mut scores = vec![0i32; self.n_classes];
         self.class_scores_from_patches(&patches_buf, &mut scores);
-        scores.iter().enumerate().max_by_key(|&(_, &v)| v).map(|(i, _)| i).unwrap()
+        scores
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, &v)| v)
+            .map(|(i, _)| i)
+            .unwrap()
     }
 
     /// Fill `out` with the clamped weighted clause sums for each class.
@@ -558,11 +629,21 @@ impl ConvolutionalTsetlinMachine {
             let clause_inc = &inc[cj * words..(cj + 1) * words];
             // OR semantics: fires if it fires on ANY patch.
             let fires = (0..self.n_patches).any(|p| {
-                clause_fire(clause_inc, &patches_buf[p * words..(p + 1) * words], val, words, lit_active)
+                clause_fire(
+                    clause_inc,
+                    &patches_buf[p * words..(p + 1) * words],
+                    val,
+                    words,
+                    lit_active,
+                )
             });
             if fires {
                 let w = self.weights[c * cps + j];
-                if j & 1 == 0 { sum += w; } else { sum -= w; }
+                if j & 1 == 0 {
+                    sum += w;
+                } else {
+                    sum -= w;
+                }
             }
         }
         sum.clamp(-self.threshold, self.threshold)
@@ -648,7 +729,13 @@ impl ConvolutionalTsetlinMachine {
                     // Find all patches where this clause fires (TMU: output_one_patches).
                     let firing: Vec<usize> = (0..n_patches)
                         .filter(|&pp| {
-                            clause_fire(inc_c, &patches_buf[pp * words..(pp + 1) * words], val, words, lit_active)
+                            clause_fire(
+                                inc_c,
+                                &patches_buf[pp * words..(pp + 1) * words],
+                                val,
+                                words,
+                                lit_active,
+                            )
                         })
                         .collect();
                     let fires = !firing.is_empty();
@@ -658,11 +745,14 @@ impl ConvolutionalTsetlinMachine {
                     } else {
                         0
                     };
-                    let lit_b = expand_bits_to_bytes(&patches_buf[p_idx * words..(p_idx + 1) * words], n_literals);
+                    let lit_b = expand_bits_to_bytes(
+                        &patches_buf[p_idx * words..(p_idx + 1) * words],
+                        n_literals,
+                    );
                     apply_one_clause_conv(
-                        j, ta_c, inc_c, w, rng_c, target, p, &drop_mask, val,
-                        words, &lit_b, &inv_b, &keep_b, &active_b, n_literals, boost, wmax,
-                        max_inc, half, max_state, fires,
+                        j, ta_c, inc_c, w, rng_c, target, p, &drop_mask, val, words, &lit_b,
+                        &inv_b, &keep_b, &active_b, n_literals, boost, wmax, max_inc, half,
+                        max_state, fires,
                     );
                 });
             return;
@@ -676,7 +766,13 @@ impl ConvolutionalTsetlinMachine {
                 let clause_inc_j = &class_inc[j * words..(j + 1) * words];
                 let firing: Vec<usize> = (0..n_patches)
                     .filter(|&pp| {
-                        clause_fire(clause_inc_j, &patches_buf[pp * words..(pp + 1) * words], val, words, lit_active)
+                        clause_fire(
+                            clause_inc_j,
+                            &patches_buf[pp * words..(pp + 1) * words],
+                            val,
+                            words,
+                            lit_active,
+                        )
                     })
                     .collect();
                 fires = !firing.is_empty();
@@ -687,7 +783,8 @@ impl ConvolutionalTsetlinMachine {
                     0
                 };
             }
-            let lit_b = expand_bits_to_bytes(&patches_buf[p_idx * words..(p_idx + 1) * words], n_literals);
+            let lit_b =
+                expand_bits_to_bytes(&patches_buf[p_idx * words..(p_idx + 1) * words], n_literals);
             apply_one_clause_conv(
                 j,
                 &mut class_ta[j * n_literals..(j + 1) * n_literals],
@@ -772,7 +869,11 @@ impl ConvolutionalTsetlinMachine {
     /// Fraction of correctly predicted samples.
     pub fn accuracy(&self, xs: &[&[u8]], ys: &[usize]) -> f64 {
         assert_eq!(xs.len(), ys.len());
-        let correct = xs.iter().zip(ys).filter(|(&x, &y)| self.predict(x) == y).count();
+        let correct = xs
+            .iter()
+            .zip(ys)
+            .filter(|(&x, &y)| self.predict(x) == y)
+            .count();
         correct as f64 / xs.len() as f64
     }
 
@@ -814,7 +915,9 @@ mod tests {
         let mut xs = Vec::with_capacity(n);
         let mut ys = Vec::with_capacity(n);
         for _ in 0..n {
-            let f: Vec<u8> = (0..n_features).map(|_| (rng.next_u64() & 1) as u8).collect();
+            let f: Vec<u8> = (0..n_features)
+                .map(|_| (rng.next_u64() & 1) as u8)
+                .collect();
             let y = (f[0] ^ f[1]) as usize;
             ys.push(y);
             xs.push(f);
@@ -876,19 +979,26 @@ mod tests {
         let (xte, yte) = make_xor_sequence(800, 4, 2);
         let tr = as_slices(&xtr);
         let te = as_slices(&xte);
-        let mut ctm = ConvolutionalTsetlinMachine::with_config(2, 4, 2, 1, 60, 50, 3.5, 8, true, 42);
+        let mut ctm =
+            ConvolutionalTsetlinMachine::with_config(2, 4, 2, 1, 60, 50, 3.5, 8, true, 42);
         for _ in 0..40 {
             ctm.fit_epoch(&tr, &ytr);
         }
         let acc = ctm.accuracy(&te, &yte);
-        assert!(acc > 0.65, "accuracy {acc:.3} should exceed 65% for learnable XOR in 3-patch setup");
+        assert!(
+            acc > 0.65,
+            "accuracy {acc:.3} should exceed 65% for learnable XOR in 3-patch setup"
+        );
     }
 
     #[test]
     fn convolutional_clause_rule_feature_indices_in_range() {
         let ctm = ConvolutionalTsetlinMachine::new(2, 12, 4, 2, 8, 20, 3.0);
         for rule_feat in ctm.clause_rule(0, 0).iter().map(|&(f, _)| f) {
-            assert!(rule_feat < ctm.kernel_size(), "feature index out of patch range");
+            assert!(
+                rule_feat < ctm.kernel_size(),
+                "feature index out of patch range"
+            );
         }
     }
 
@@ -903,7 +1013,12 @@ mod tests {
         let mut out = vec![0i32; 2];
         for x in &xs[..20] {
             ctm.scores(x, &mut out);
-            let argmax = out.iter().enumerate().max_by_key(|&(_, &v)| v).map(|(i, _)| i).unwrap();
+            let argmax = out
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, &v)| v)
+                .map(|(i, _)| i)
+                .unwrap();
             assert_eq!(argmax, ctm.predict(x));
         }
     }

@@ -34,7 +34,9 @@ pub struct TMCompositeClassifier {
 impl TMCompositeClassifier {
     /// Create an empty composite classifier.  Add constituents with [`add`](Self::add).
     pub fn new() -> Self {
-        TMCompositeClassifier { classifiers: Vec::new() }
+        TMCompositeClassifier {
+            classifiers: Vec::new(),
+        }
     }
 
     /// Add a `TsetlinMachine` to the ensemble.
@@ -81,7 +83,10 @@ impl TMCompositeClassifier {
     // ---- inference -----------------------------------------------------------
 
     fn assert_nonempty(&self) {
-        assert!(!self.classifiers.is_empty(), "TMCompositeClassifier has no constituent models");
+        assert!(
+            !self.classifiers.is_empty(),
+            "TMCompositeClassifier has no constituent models"
+        );
     }
 
     /// Sum class scores from all constituents and return the argmax class.
@@ -96,7 +101,12 @@ impl TMCompositeClassifier {
                 combined[c] += s;
             }
         }
-        combined.iter().enumerate().max_by_key(|&(_, &v)| v).map(|(i, _)| i).unwrap()
+        combined
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, &v)| v)
+            .map(|(i, _)| i)
+            .unwrap()
     }
 
     /// Fill `out` with the combined (summed) class scores from all constituents.
@@ -234,14 +244,19 @@ mod tests {
         let mut composite = TMCompositeClassifier::new();
         // Three small models that together can solve XOR
         for seed in [10u64, 20, 30] {
-            composite.add(TsetlinMachine::with_config(2, 12, 6, 10, 3.9, 8, true, seed));
+            composite.add(TsetlinMachine::with_config(
+                2, 12, 6, 10, 3.9, 8, true, seed,
+            ));
         }
 
         for _ in 0..20 {
             composite.fit_epoch(&btr, &ytr);
         }
         let acc = composite.accuracy(&bte, &yte);
-        assert!(acc > 0.75, "ensemble accuracy {acc:.3} should beat chance significantly");
+        assert!(
+            acc > 0.75,
+            "ensemble accuracy {acc:.3} should beat chance significantly"
+        );
     }
 
     #[test]
@@ -258,9 +273,15 @@ mod tests {
         let words = batch.words;
         let mut buf = vec![0i32; 2];
         for (i, &_y) in (0..xs.len()).zip(vec![0usize; xs.len()].iter()) {
-            let sample = crate::encoder::EncodedSample(batch.data[i * words..(i + 1) * words].to_vec());
+            let sample =
+                crate::encoder::EncodedSample(batch.data[i * words..(i + 1) * words].to_vec());
             c.scores(&sample, &mut buf);
-            let argmax = buf.iter().enumerate().max_by_key(|&(_, &v)| v).map(|(j, _)| j).unwrap();
+            let argmax = buf
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, &v)| v)
+                .map(|(j, _)| j)
+                .unwrap();
             assert_eq!(argmax, c.predict(&sample));
         }
     }

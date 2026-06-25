@@ -42,8 +42,8 @@ fn load_u32_as_usize(path: &str, n: usize) -> Vec<usize> {
 fn main() {
     let xtr = load_u8("data/cmp_composite_X_train.bin", 5000, N_FEATURES);
     let ytr = load_u32_as_usize("data/cmp_composite_y_train.bin", 5000);
-    let xte = load_u8("data/cmp_composite_X_test.bin",  1000, N_FEATURES);
-    let yte = load_u32_as_usize("data/cmp_composite_y_test.bin",  1000);
+    let xte = load_u8("data/cmp_composite_X_test.bin", 1000, N_FEATURES);
+    let yte = load_u32_as_usize("data/cmp_composite_y_test.bin", 1000);
 
     let enc = Encoder::for_binary(N_FEATURES);
     let btr = enc.encode_batch(&xtr.iter().map(|v| v.as_slice()).collect::<Vec<_>>());
@@ -53,13 +53,27 @@ fn main() {
     let mut composite = TMCompositeClassifier::new();
     for seed in [10u64, 20, 30] {
         composite.add(TsetlinMachine::with_config(
-            N_CLASSES, N_FEATURES, CLAUSES_EACH, THRESHOLD, S, 8, true, seed,
+            N_CLASSES,
+            N_FEATURES,
+            CLAUSES_EACH,
+            THRESHOLD,
+            S,
+            8,
+            true,
+            seed,
         ));
     }
 
     // Single model: 60 clauses/class (same total budget)
     let mut single = TsetlinMachine::with_config(
-        N_CLASSES, N_FEATURES, TOTAL_CLAUSES, THRESHOLD, S, 8, true, 42,
+        N_CLASSES,
+        N_FEATURES,
+        TOTAL_CLAUSES,
+        THRESHOLD,
+        S,
+        8,
+        true,
+        42,
     );
 
     println!("(shared data: data/cmp_composite_*.bin — identical to Python side)");
@@ -67,7 +81,10 @@ fn main() {
         "Comparison: composite (3×{CLAUSES_EACH} clauses/class) vs \
          single ({TOTAL_CLAUSES} clauses/class)"
     );
-    println!("{:>5}  {:>14}  {:>14}", "epoch", "composite acc", "single acc");
+    println!(
+        "{:>5}  {:>14}  {:>14}",
+        "epoch", "composite acc", "single acc"
+    );
 
     for epoch in 1..=EPOCHS {
         composite.fit_epoch(&btr, &ytr);

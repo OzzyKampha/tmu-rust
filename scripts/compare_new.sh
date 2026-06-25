@@ -87,7 +87,7 @@ RUN_PYTHON() {
     echo "───────────────────────────────────────────────────────────"
     echo "  Python TMU: $flag"
     echo "───────────────────────────────────────────────────────────"
-    python3 scripts/compare_new_models.py "$flag"
+    python3 scripts/compare_all.py "$flag"
 }
 
 # ── TMRegressor ────────────────────────────────────────────────────────────────

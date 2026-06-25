@@ -23,6 +23,7 @@ use crate::rng::Rng;
 ///   if the clause fires; `update_p = ((pred − y) / T)²`.
 /// - When `pred > y` (push down): Type II to fired clauses only, decrement weight;
 ///   same `update_p`.
+///
 /// Clause polarity is learned through weight dynamics, not hardcoded by index.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -113,7 +114,17 @@ fn apply_one_clause(
         if fired_under {
             *w = (*w + 1).min(wmax);
         }
-        type_i_update_bytes(ta, n_literals, fired_under, boost, lit_b, inv_b, keep_b, active_b, max_state);
+        type_i_update_bytes(
+            ta,
+            n_literals,
+            fired_under,
+            boost,
+            lit_b,
+            inv_b,
+            keep_b,
+            active_b,
+            max_state,
+        );
     } else {
         // Type II — only applies when the clause fires.
         if !fired {
@@ -285,7 +296,9 @@ impl TMRegressor {
         let packed = batch.data.as_slice();
         let n = batch.n;
         let w = self.words;
-        (0..n).map(|i| self.predict_lit(&packed[i * w..(i + 1) * w])).collect()
+        (0..n)
+            .map(|i| self.predict_lit(&packed[i * w..(i + 1) * w]))
+            .collect()
     }
 
     // ---- training ------------------------------------------------------------
@@ -365,9 +378,28 @@ impl TMRegressor {
                 .enumerate()
                 .for_each(|(j, (((ta_j, inc_j), w), rng_j))| {
                     apply_one_clause(
-                        j, ta_j, inc_j, w, rng_j, push_up, update_p, &drop_mask, lit, val, &lit_active,
-                        words, &lit_b, &inv_b, &keep_b, &active_b, n_literals, boost, wmax,
-                        max_inc, half, max_state,
+                        j,
+                        ta_j,
+                        inc_j,
+                        w,
+                        rng_j,
+                        push_up,
+                        update_p,
+                        &drop_mask,
+                        lit,
+                        val,
+                        &lit_active,
+                        words,
+                        &lit_b,
+                        &inv_b,
+                        &keep_b,
+                        &active_b,
+                        n_literals,
+                        boost,
+                        wmax,
+                        max_inc,
+                        half,
+                        max_state,
                     );
                 });
             return;
@@ -485,13 +517,20 @@ mod tests {
     use crate::encoder::Encoder;
     use crate::rng::Rng;
 
-    fn make_count_dataset(n: usize, n_features: usize, threshold: i32, seed: u64) -> (Vec<Vec<u8>>, Vec<f64>) {
+    fn make_count_dataset(
+        n: usize,
+        n_features: usize,
+        threshold: i32,
+        seed: u64,
+    ) -> (Vec<Vec<u8>>, Vec<f64>) {
         let mut rng = Rng::new(seed);
         let mut xs = Vec::with_capacity(n);
         let mut ys = Vec::with_capacity(n);
         let scale = threshold as f64 / n_features as f64;
         for _ in 0..n {
-            let f: Vec<u8> = (0..n_features).map(|_| (rng.next_u64() & 1) as u8).collect();
+            let f: Vec<u8> = (0..n_features)
+                .map(|_| (rng.next_u64() & 1) as u8)
+                .collect();
             let count = f.iter().map(|&b| b as usize).sum::<usize>();
             ys.push(count as f64 * scale);
             xs.push(f);
@@ -531,7 +570,10 @@ mod tests {
             tm.fit_epoch(&batch, &ys);
         }
         let mae = tm.mae(&batch, &ys);
-        assert!(mae < 50.0, "MAE {mae} should improve beyond random baseline");
+        assert!(
+            mae < 50.0,
+            "MAE {mae} should improve beyond random baseline"
+        );
     }
 
     #[test]
@@ -547,7 +589,10 @@ mod tests {
         }
         let mae = tm.mae(&bte, &yte);
         // Loose bound: the count function is learnable; random baseline ≈ T/3 ≈ 33
-        assert!(mae < 25.0, "MAE {mae:.2} should be well below random baseline");
+        assert!(
+            mae < 25.0,
+            "MAE {mae:.2} should be well below random baseline"
+        );
     }
 
     #[test]
