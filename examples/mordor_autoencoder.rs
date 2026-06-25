@@ -25,8 +25,12 @@
 mod shared;
 use shared::{basename, hive_of};
 
-use std::{collections::HashSet, fs, path::Path};
+use std::{collections::HashMap, collections::HashSet, fs, path::Path};
 use tmu_rs::{Encoder, Rng, TMAutoEncoder, TMCoalescedAutoEncoder};
+
+// Autoencoder memory = n_features² × clauses_per_output bytes.
+// 16K raw features → 21 GB.  Cap to top-N by frequency to keep it < 100 MB.
+const MAX_VOCAB: usize = 1024;
 
 // ── dataset discovery ─────────────────────────────────────────────────────────
 
@@ -808,18 +812,50 @@ fn main() {
         attack.len()
     );
 
-    // Build vocabulary from ALL events so attack tokens are representable.
-    let all_refs: Vec<Vec<&str>> = all_events
+    // Count token frequencies across ALL events to find the most informative features.
+    // The autoencoder's memory scales as O(n_features²), so we must cap the vocabulary.
+    let mut freq: HashMap<String, usize> = HashMap::new();
+    for (tokens, _) in &all_events {
+        for tok in tokens {
+            *freq.entry(tok.clone()).or_insert(0) += 1;
+        }
+    }
+    let mut freq_vec: Vec<(String, usize)> = freq.into_iter().collect();
+    freq_vec.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let top_tokens: HashSet<String> = freq_vec
         .iter()
-        .map(|(t, _)| t.iter().map(String::as_str).collect())
+        .take(MAX_VOCAB)
+        .map(|(t, _)| t.clone())
+        .collect();
+    println!("top-{MAX_VOCAB} vocabulary tokens selected (raw vocab: {})", freq_vec.len());
+
+    // Filter every event's token list to the top-K set.
+    // Unknown tokens map to the encoder's per-column <UNK> sentinel automatically.
+    let filter_tokens = |tokens: &[String]| -> Vec<String> {
+        tokens
+            .iter()
+            .filter(|t| top_tokens.contains(*t))
+            .cloned()
+            .collect()
+    };
+
+    let train_benign_f: Vec<Vec<String>> = train_benign.iter().map(|t| filter_tokens(t)).collect();
+    let test_benign_f: Vec<Vec<String>> = test_benign.iter().map(|t| filter_tokens(t)).collect();
+    let attack_f: Vec<Vec<String>> = attack.iter().map(|t| filter_tokens(t)).collect();
+
+    // Build encoder from top-K filtered tokens across all events.
+    let all_filtered: Vec<Vec<String>> = all_events
+        .iter()
+        .map(|(t, _)| filter_tokens(t))
+        .collect();
+    let all_refs: Vec<Vec<&str>> = all_filtered
+        .iter()
+        .map(|t| t.iter().map(String::as_str).collect())
         .collect();
     let all_slices: Vec<&[&str]> = all_refs.iter().map(|v| v.as_slice()).collect();
     let encoder = Encoder::fit_categorical(&all_slices);
-    println!(
-        "vocabulary: {} ECS features\n",
-        encoder.n_features()
-    );
+    println!("encoder vocabulary: {} features\n", encoder.n_features());
 
-    run_vanilla(&encoder, &train_benign, &test_benign, &attack);
-    run_coalesced(&encoder, &train_benign, &test_benign, &attack);
+    run_vanilla(&encoder, &train_benign_f, &test_benign_f, &attack_f);
+    run_coalesced(&encoder, &train_benign_f, &test_benign_f, &attack_f);
 }
