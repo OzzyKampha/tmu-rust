@@ -11,7 +11,8 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | `TMClassifier` | ✅ Ported | Weighted multiclass; full training + inference API |
 | `TMCoalesced` | ✅ Ported | Shared clause bank + signed per-class weight matrix; focused negative sampling |
 | `TMRegressor` | ❌ Not ported | Requires continuous-output learning rule |
-| `TMAutoEncoder` | ❌ Not ported | Unsupervised; different clause update logic |
+| `TMAutoEncoder` | ✅ Ported | Unsupervised; dedicated per-output clause banks |
+| `TMCoalescedAutoEncoder` | ✅ Ported | Coalesced variant: shared clause bank + signed per-output weights |
 | `TMCompositeClassifier` | ❌ Not ported | Hybrid architecture |
 | Convolutional TM | ❌ Not ported | Requires receptive-field clause structure |
 
@@ -76,6 +77,6 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | `IMDbTextCategorizationDemo` | `imdb` | ✅ Validated | 2000 clauses, T=80, s=10.0 |
 | Convolutional demos | — | ❌ Not ported | Requires `ConvolutionalTM` |
 | Regression demos | — | ❌ Not ported | Requires `TMRegressor` |
-| Autoencoder demos | — | ❌ Not ported | Requires `TMAutoEncoder` |
+| Autoencoder demos | `autoencoder`, `coalesced_autoencoder` | ✅ Ported | `TMAutoEncoder` (vanilla) + `TMCoalescedAutoEncoder` (shared-bank) |
 | Coalesced demo | `coalesced` | ✅ Validated | 4-class shared-bank demo; 100% accuracy |
 

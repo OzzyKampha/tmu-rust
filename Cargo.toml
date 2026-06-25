@@ -100,6 +100,10 @@ path = "examples/autoencoder.rs"
 name = "bench_autoencoder" # TMAutoEncoder: throughput + accuracy benchmark vs Python TMU
 path = "examples/bench_autoencoder.rs"
 
+[[example]]
+name = "coalesced_autoencoder" # TMCoalescedAutoEncoder: shared clause bank reconstruction demo
+path = "examples/coalesced_autoencoder.rs"
+
 [[bench]]
 name = "throughput"
 path = "benches/throughput.rs"
