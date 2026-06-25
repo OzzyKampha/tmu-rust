@@ -5,5 +5,5 @@
 pub mod autoencoder;
 pub mod classification;
 
-pub use autoencoder::TMAutoEncoder;
+pub use autoencoder::{TMAutoEncoder, TMCoalescedAutoEncoder};
 pub use classification::{CoalescedTsetlinMachine, TsetlinMachine};
