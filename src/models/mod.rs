@@ -7,5 +7,7 @@ pub mod classification;
 pub mod regression;
 
 pub use autoencoder::{TMAutoEncoder, TMCoalescedAutoEncoder};
-pub use classification::{CoalescedTsetlinMachine, TsetlinMachine};
+pub use classification::{
+    CoalescedTsetlinMachine, ConvolutionalTsetlinMachine, TMCompositeClassifier, TsetlinMachine,
+};
 pub use regression::TMRegressor;

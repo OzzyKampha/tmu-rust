@@ -108,6 +108,14 @@ path = "examples/coalesced_autoencoder.rs"
 name = "regression"           # TMRegressor: continuous output from binary features
 path = "examples/regression.rs"
 
+[[example]]
+name = "convolutional"        # ConvolutionalTM: receptive-field clauses over 1D input
+path = "examples/convolutional.rs"
+
+[[example]]
+name = "composite"            # TMCompositeClassifier: ensemble of TsetlinMachines
+path = "examples/composite.rs"
+
 [[bench]]
 name = "throughput"
 path = "benches/throughput.rs"

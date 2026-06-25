@@ -13,8 +13,8 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | `TMRegressor` | ✅ Ported | Continuous-output weighted clauses; feedback probability driven by current prediction vs target |
 | `TMAutoEncoder` | ✅ Ported | Unsupervised; dedicated per-output clause banks |
 | `TMCoalescedAutoEncoder` | ✅ Ported | Coalesced variant: shared clause bank + signed per-output weights |
-| `TMCompositeClassifier` | ❌ Not ported | Hybrid architecture |
-| Convolutional TM | ❌ Not ported | Requires receptive-field clause structure |
+| `TMCompositeClassifier` | ✅ Ported | Ensemble of `TsetlinMachine` models; class scores summed at inference |
+| Convolutional TM | ✅ Ported | 1-D receptive-field clauses; weight tying across patch positions |
 
 ---
 
@@ -68,6 +68,46 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 
 ---
 
+## ConvolutionalTM features
+
+| Feature | Status | Notes |
+|---|---|---|
+| 1-D receptive-field clauses | ✅ | Kernel slides over consecutive feature positions; `kernel_size` features per patch |
+| Patch extraction | ✅ | `pack_patch()` extracts and bit-packs any contiguous window of the input |
+| Multi-patch inference | ✅ | Clause votes summed over all `n_patches` positions |
+| Weight tying (training) | ✅ | Each clause update uses one random patch per sample; same weights applied everywhere |
+| Weighted clauses | ✅ | Integer weights per clause, >= 1; max weight = threshold |
+| Type Ia / Ib feedback | ✅ | Reuses `type_i_update_bytes` from clause bank |
+| Type II feedback | ✅ | Reuses `type_ii_update_bytes` from clause bank |
+| Boost true positives | ✅ | `boost_true_positive` option |
+| Literal dropout | ✅ | `literal_drop_p` builder |
+| Clause dropout | ✅ | `clause_drop_p` builder |
+| Max included literals | ✅ | `max_included_literals` Type Ia guard |
+| Configurable TA state bits | ✅ | 2–8 bits per counter |
+| Clause rule extraction | ✅ | `clause_rule(class, clause)` returns patch-relative feature indices |
+| Batch prediction | ✅ | `predict_batch()`, `accuracy()` |
+| Multi-threaded training | ✅ | `--features parallel` (Rayon), clause-parallel feedback |
+| Save / load | ✅ | `serde` feature; file tag `TAG_CONVOLUTIONAL = 7` |
+| 2-D (image) convolution | ❌ Not ported | TMU also supports 2-D kernels; pre-flatten rows as a workaround |
+| GPU / CUDA acceleration | ❌ Not planned | |
+
+---
+
+## TMCompositeClassifier features
+
+| Feature | Status | Notes |
+|---|---|---|
+| Constituent model ensemble | ✅ | Owns `Vec<TsetlinMachine>`; add models with `.add()` |
+| Score aggregation | ✅ | Class scores summed across all constituents; argmax → predicted class |
+| Independent training | ✅ | `fit_epoch()` trains each constituent in turn on the same batch |
+| Constituent validation | ✅ | Panics if a newly added model has a different `n_classes()` |
+| `len()` / `is_empty()` | ✅ | Query constituent count |
+| Batch prediction | ✅ | `predict_batch()`, `accuracy()` |
+| Save / load | ✅ | `serde` feature; file tag `TAG_COMPOSITE = 8` |
+| Mixed constituent types | ❌ Not ported | TMU allows heterogeneous ensembles; Rust variant holds only `TsetlinMachine` for now |
+
+---
+
 ## TMCoalesced features
 
 | Feature | Status | Notes |
@@ -98,7 +138,8 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | `BreastCancerDemo` | `breast_cancer` | ✅ Validated | ~99–100% test accuracy |
 | `MNISTDemo` / `MNISTDemoWeightedClauses` | `mnist` | ✅ Validated | ~93% (2000 clauses, T=50, s=10.0) |
 | `IMDbTextCategorizationDemo` | `imdb` | ✅ Validated | 2000 clauses, T=80, s=10.0 |
-| Convolutional demos | — | ❌ Not ported | Requires `ConvolutionalTM` |
+| Convolutional demo | `convolutional` | ✅ Ported | 4 features, kernel=2, stride=1 (3 patches); learns XOR of features 0,1 despite 2 noisy patches; ~77% test accuracy |
+| Composite demo | `composite` | ✅ Ported | 3×20-clause ensemble vs 60-clause single model on 4-class XOR |
 | Regression demo | `regression` | ✅ Ported | Continuous target (count function scaled to `[0, T]`); MAE + RMSE metrics |
 | Autoencoder demos | `autoencoder`, `coalesced_autoencoder` | ✅ Ported | `TMAutoEncoder` (vanilla) + `TMCoalescedAutoEncoder` (shared-bank) |
 | Coalesced demo | `coalesced` | ✅ Validated | 4-class shared-bank demo; 100% accuracy |
