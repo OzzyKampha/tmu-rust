@@ -1,7 +1,7 @@
 //! Save / load demo — train a TM on XOR, persist it to disk, reload, and verify
 //! that the reloaded model predicts identically and can keep training.
 //!
-//! `cargo run --release --features serde --example save_load`
+//! `cargo run --release --example save_load`
 
 use tmu_rs::{Encoder, Rng, SaveLoad, TsetlinMachine};
 

@@ -20,7 +20,7 @@ criterion = "0.5"
 serde_json = "1"  # examples/sysmon_windows.rs: parse real Mordor NDJSON logs
 
 [features]
-default = []
+default = ["serde"]
 parallel = ["dep:rayon"]
 # Enable `save`/`load` for models and the encoder (serde + bincode).
 serde = ["dep:serde", "dep:bincode"]
