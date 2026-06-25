@@ -13,16 +13,17 @@ use crate::rng::Rng;
 
 /// A weighted Tsetlin Machine for continuous-output regression.
 ///
-/// Clauses are split by parity: even-indexed clauses are **positive** (add to the
-/// vote sum), odd-indexed are **negative** (subtract).  The prediction is the
-/// weighted vote sum clamped to `[0, threshold]`, returned as `f64`.
+/// All clauses start with weight +1 and contribute `weight[j] * fires(j, x)` to
+/// the vote sum.  The prediction is `clamp(sum, 0, threshold)` returned as `f64`.
+/// Weights are in `[0, threshold]` — they floor at 0 (never go negative).
 ///
 /// Training targets must be in `[0.0, threshold as f64]`.  The feedback rule
-/// mirrors TMU's `TMRegressor`: a positive clause is reinforced (Type I) with
-/// probability `(T − v) / (2T)` when `y ≥ v`, or suppressed (Type II) with
-/// probability `v / (2T)` when `y < v`; negative clauses receive the symmetric
-/// treatment.  The probabilities steer the prediction toward the target while
-/// respecting the absorbing-state boundaries.
+/// matches TMU's `TMRegressor` (vanilla_regressor.py):
+/// - When `pred < y` (push up): Type I to all active clauses, increment weight
+///   if the clause fires; `update_p = ((pred − y) / T)²`.
+/// - When `pred > y` (push down): Type II to fired clauses only, decrement weight;
+///   same `update_p`.
+/// Clause polarity is learned through weight dynamics, not hardcoded by index.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TMRegressor {
@@ -62,11 +63,13 @@ impl crate::serial::SaveLoad for TMRegressor {
     const TAG: u8 = crate::serial::TAG_REGRESSOR;
 }
 
-/// Per-clause feedback kernel (identical logic to the classifier variant).
+/// Per-clause feedback kernel — matches TMU's vanilla_regressor.py.
 ///
-/// `target = 1` means "push the output up" (reinforce positive clause / suppress
-/// negative clause); `target = 0` means "push the output down".  `p` is the
-/// feedback probability for this step.
+/// `push_up=true`  (pred < target): Type I to every active clause; increment weight if fired.
+/// `push_up=false` (pred > target): Type II only to fired clauses; decrement weight.
+///
+/// `update_p = ((pred - target) / T)²` — squared relative error, same for all clauses.
+/// Weights may go negative (their sign is learned, not hardcoded by clause index).
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn apply_one_clause(
@@ -75,8 +78,8 @@ fn apply_one_clause(
     inc: &mut [u64],
     w: &mut i32,
     rng: &mut Rng,
-    target: u8,
-    p: f64,
+    push_up: bool,
+    update_p: f64,
     drop_mask: &[bool],
     lit: &[u64],
     val: &[u64],
@@ -96,13 +99,12 @@ fn apply_one_clause(
     if !drop_mask.is_empty() && drop_mask[j] {
         return;
     }
-    if rng.next_f64() > p {
+    if rng.next_f64() > update_p {
         return;
     }
-    let positive = j & 1 == 0;
-    if (target == 1) == positive {
-        // Type I: reinforce clause that moves the output in the desired direction.
-        let fired = clause_fire(inc, lit, val, words, lit_active);
+    let fired = clause_fire(inc, lit, val, words, lit_active);
+    if push_up {
+        // Type I (Ia if fired and under literal limit, Ib otherwise).
         let under_limit = max_inc == usize::MAX || {
             let n: u32 = (0..words).map(|k| (inc[k] & val[k]).count_ones()).sum();
             (n as usize) < max_inc
@@ -111,15 +113,13 @@ fn apply_one_clause(
         if fired_under {
             *w = (*w + 1).min(wmax);
         }
-        type_i_update_bytes(
-            ta, n_literals, fired_under, boost, lit_b, inv_b, keep_b, active_b, max_state,
-        );
+        type_i_update_bytes(ta, n_literals, fired_under, boost, lit_b, inv_b, keep_b, active_b, max_state);
     } else {
-        // Type II: suppress clause that moves the output in the wrong direction.
-        if !clause_fire(inc, lit, val, words, lit_active) {
+        // Type II — only applies when the clause fires.
+        if !fired {
             return;
         }
-        *w = (*w - 1).max(1);
+        *w = (*w - 1).max(0); // TMU uses neg_weights=False: floor is 0, not negative
         type_ii_update_bytes(ta, n_literals, lit_b, active_b, half, max_state);
     }
     rebuild_include(ta, inc, val, words, n_literals, half);
@@ -133,7 +133,7 @@ impl TMRegressor {
 
     /// Create a regressor with full configuration.
     ///
-    /// * `n_clauses` — total clause count (must be even, >= 2); half are positive, half negative.
+    /// * `n_clauses` — total clause count (>= 2).
     /// * `threshold` — output clamped to `[0, threshold]`; training targets should be in this range.
     /// * `s` — specificity (> 1.0).
     /// * `state_bits` — TA counter precision (2–8 bits).
@@ -149,7 +149,7 @@ impl TMRegressor {
         seed: u64,
     ) -> Self {
         assert!(n_features >= 1);
-        assert!(n_clauses >= 2 && n_clauses.is_multiple_of(2), "n_clauses must be even and >= 2");
+        assert!(n_clauses >= 2, "n_clauses must be >= 2");
         assert!(threshold >= 1);
         assert!(s > 1.0);
         assert!((2..=8).contains(&state_bits), "state_bits must be in 2..=8");
@@ -157,7 +157,7 @@ impl TMRegressor {
         let state_bits = state_bits as usize;
         let n_literals = 2 * n_features;
         let words = words_for(n_literals);
-        let mut rng = Rng::new(seed);
+        let rng = Rng::new(seed);
 
         let mut valid = vec![0u64; words];
         for l in 0..n_literals {
@@ -172,7 +172,7 @@ impl TMRegressor {
         for cj in 0..n_clauses {
             let tb = cj * n_literals;
             for l in 0..n_literals {
-                ta[tb + l] = if rng.next_u64() & 1 == 0 { half - 1 } else { half };
+                ta[tb + l] = half - 1; // all start in exclude state (matches TMU)
             }
             rebuild_include(
                 &ta[tb..tb + n_literals],
@@ -267,12 +267,7 @@ impl TMRegressor {
         let mut sum = 0i32;
         for j in 0..self.n_clauses {
             if fire_predict(&inc[j * words..(j + 1) * words], lit, val, words) {
-                let w = self.weights[j];
-                if j & 1 == 0 {
-                    sum += w;
-                } else {
-                    sum -= w;
-                }
+                sum += self.weights[j]; // weights may be negative (learned polarity)
             }
         }
         sum.clamp(0, self.threshold) as f64
@@ -301,13 +296,17 @@ impl TMRegressor {
         let v = self.predict_lit(lit);
         let t = self.threshold as f64;
 
-        // target=1 → push output up (reinforce positive, suppress negative)
-        // target=0 → push output down (suppress positive, reinforce negative)
-        let (target, p) = if y >= v {
-            (1u8, (t - v) / (2.0 * t))
-        } else {
-            (0u8, v / (2.0 * t))
-        };
+        // Squared relative error (matches TMU vanilla_regressor.py: update_p = (error/T)^2).
+        // Larger error → higher probability of feedback; no update when prediction is exact.
+        let err = (v - y) / t;
+        let update_p = (err * err).min(1.0);
+        if update_p < f64::EPSILON {
+            return;
+        }
+
+        // push_up=true  → pred < target: Type I to all clauses, increment weights of fired clauses
+        // push_up=false → pred > target: Type II to fired clauses only, decrement their weights
+        let push_up = y > v;
 
         let n_literals = self.n_literals;
         let words = self.words;
@@ -366,7 +365,7 @@ impl TMRegressor {
                 .enumerate()
                 .for_each(|(j, (((ta_j, inc_j), w), rng_j))| {
                     apply_one_clause(
-                        j, ta_j, inc_j, w, rng_j, target, p, &drop_mask, lit, val, &lit_active,
+                        j, ta_j, inc_j, w, rng_j, push_up, update_p, &drop_mask, lit, val, &lit_active,
                         words, &lit_b, &inv_b, &keep_b, &active_b, n_literals, boost, wmax,
                         max_inc, half, max_state,
                     );
@@ -381,8 +380,8 @@ impl TMRegressor {
                 &mut include[j * words..(j + 1) * words],
                 &mut weights[j],
                 &mut rngs[j],
-                target,
-                p,
+                push_up,
+                update_p,
                 &drop_mask,
                 lit,
                 val,
