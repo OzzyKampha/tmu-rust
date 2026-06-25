@@ -1,6 +1,7 @@
 /// SplitMix64 — extremely fast non-cryptographic PRNG, suitable for the
 /// high-frequency RNG calls in the TM inner training loop.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Rng(u64);
 
 impl Rng {
@@ -30,18 +31,5 @@ impl Rng {
     #[inline(always)]
     pub fn below(&mut self, n: usize) -> usize {
         (self.next_u64() % n as u64) as usize
-    }
-
-    /// Raw internal state word. Used by serialisation to restore the exact
-    /// stream position (so a reloaded model resumes identically).
-    pub(crate) fn state(&self) -> u64 {
-        self.0
-    }
-
-    /// Reconstruct an RNG from a raw state word produced by [`Rng::state`].
-    /// Unlike [`Rng::new`], this does **not** mix the value, so the stream
-    /// continues exactly where it left off.
-    pub(crate) fn from_state(state: u64) -> Self {
-        Rng(state)
     }
 }

@@ -3,6 +3,7 @@
 /// For each feature, `n_thresholds` evenly-spaced quantile cut points are computed from the
 /// training set. `transform_row` maps each value to 1 if it exceeds the threshold, else 0.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Booleanizer {
     thresholds: Vec<Vec<f64>>,
 }
@@ -55,17 +56,5 @@ impl Booleanizer {
             "bit index {bit} out of range (total bits: {})",
             self.n_output_features()
         );
-    }
-
-    /// Per-feature quantile thresholds (used by [`Encoder`] serialisation).
-    ///
-    /// [`Encoder`]: crate::Encoder
-    pub(crate) fn thresholds(&self) -> &[Vec<f64>] {
-        &self.thresholds
-    }
-
-    /// Reconstruct a booleanizer from previously-saved thresholds.
-    pub(crate) fn from_thresholds(thresholds: Vec<Vec<f64>>) -> Self {
-        Booleanizer { thresholds }
     }
 }

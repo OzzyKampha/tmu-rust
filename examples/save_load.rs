@@ -1,9 +1,9 @@
 //! Save / load demo — train a TM on XOR, persist it to disk, reload, and verify
 //! that the reloaded model predicts identically and can keep training.
 //!
-//! `cargo run --release --example save_load`
+//! `cargo run --release --features serde --example save_load`
 
-use tmu_rs::{Encoder, Rng, TsetlinMachine};
+use tmu_rs::{Encoder, Rng, SaveLoad, TsetlinMachine};
 
 /// Generate `n` noise-free 2-bit XOR samples.
 fn make(n: usize, seed: u64) -> (Vec<Vec<u8>>, Vec<usize>) {

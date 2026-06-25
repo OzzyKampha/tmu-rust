@@ -10,10 +10,6 @@ use crate::clause_bank::dense::{
 };
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
-use crate::serial;
-use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::Path;
 
 /// A weighted multiclass Tsetlin Machine with u8 per-TA counters (matches TMU's 8-bit states).
 ///
@@ -21,6 +17,7 @@ use std::path::Path;
 /// as a separate `Vec<u64>` for O(words) fire checks.  Optional clause-level parallelism
 /// via `--features parallel`.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TsetlinMachine {
     n_classes: usize,
     n_features: usize,
@@ -68,6 +65,11 @@ pub struct TsetlinMachine {
     /// `class_weights[c]` multiplies the feedback probability for class `c`.
     /// Defaults to `1.0` for all classes (no reweighting).
     class_weights: Vec<f64>,
+}
+
+#[cfg(feature = "serde")]
+impl crate::serial::SaveLoad for TsetlinMachine {
+    const TAG: u8 = crate::serial::TAG_VANILLA;
 }
 
 /// Per-clause feedback kernel shared by the sequential and parallel training paths.
@@ -321,152 +323,6 @@ impl TsetlinMachine {
         );
         self.class_weights = weights;
         self
-    }
-
-    // ── persistence ────────────────────────────────────────────────────────
-
-    /// Serialise the fully-trained model to `path` (little-endian binary).
-    ///
-    /// The saved file captures all learned state (TA counters and clause
-    /// weights) **and** every RNG stream, so a model reloaded with
-    /// [`TsetlinMachine::load`] produces bit-identical predictions and can
-    /// continue training (`fit_epoch` / `fit_one`) deterministically — exactly
-    /// as if it had never been written out.
-    pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let mut w = BufWriter::new(File::create(path)?);
-        self.write_to(&mut w)?;
-        w.flush()
-    }
-
-    /// Load a model previously written by [`TsetlinMachine::save`].
-    ///
-    /// Reconstructs the struct field-by-field — it never re-seeds RNGs or
-    /// re-randomises TA counters — so the returned model resumes exactly where
-    /// the saved one left off.
-    pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
-        let mut r = BufReader::new(File::open(path)?);
-        Self::read_from(&mut r)
-    }
-
-    /// Write the model to any [`Write`] sink (used by [`save`](Self::save); also
-    /// handy for in-memory round-trips and tests).
-    pub(crate) fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        serial::write_header(w, serial::TAG_VANILLA)?;
-        serial::w_usize(w, self.n_classes)?;
-        serial::w_usize(w, self.n_features)?;
-        serial::w_usize(w, self.clauses_per_class)?;
-        serial::w_i32(w, self.threshold)?;
-        serial::w_f64(w, self.s)?;
-        serial::w_bool(w, self.boost_true_positive)?;
-        serial::w_usize(w, self.max_included_literals)?;
-        serial::w_f64(w, self.clause_drop_p)?;
-        serial::w_f64(w, self.literal_drop_p)?;
-        serial::w_u8(w, self.half)?;
-        serial::w_u8(w, self.max_state)?;
-        serial::w_vec_u8(w, &self.ta)?;
-        serial::w_vec_i32(w, &self.weights)?;
-        serial::w_vec_f64(w, &self.class_weights)?;
-        serial::w_u64(w, self.rng.state())?;
-        serial::w_u64(w, self.literal_rng.state())?;
-        serial::w_rngs(w, &self.rngs)?;
-        serial::w_rngs(w, &self.class_rngs)?;
-        Ok(())
-    }
-
-    /// Read a model from any [`Read`] source (used by [`load`](Self::load)).
-    pub(crate) fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
-        serial::read_header(r, serial::TAG_VANILLA)?;
-        let n_classes = serial::r_usize(r)?;
-        let n_features = serial::r_usize(r)?;
-        let clauses_per_class = serial::r_usize(r)?;
-        let threshold = serial::r_i32(r)?;
-        let s = serial::r_f64(r)?;
-        let boost_true_positive = serial::r_bool(r)?;
-        let max_included_literals = serial::r_usize(r)?;
-        let clause_drop_p = serial::r_f64(r)?;
-        let literal_drop_p = serial::r_f64(r)?;
-        let half = serial::r_u8(r)?;
-        let max_state = serial::r_u8(r)?;
-        let ta = serial::r_vec_u8(r)?;
-        let weights = serial::r_vec_i32(r)?;
-        let class_weights = serial::r_vec_f64(r)?;
-        let rng = Rng::from_state(serial::r_u64(r)?);
-        let literal_rng = Rng::from_state(serial::r_u64(r)?);
-        let rngs = serial::r_rngs(r)?;
-        let class_rngs = serial::r_rngs(r)?;
-
-        // ── recompute derived buffers (kept out of the file for compactness) ──
-        let n_literals = 2 * n_features;
-        let words = words_for(n_literals);
-        let n_clauses = n_classes * clauses_per_class;
-
-        // Validate the persisted vectors against the geometry implied by config,
-        // so a truncated or mismatched file fails loudly instead of panicking
-        // later in a hot loop.
-        if ta.len() != n_clauses * n_literals {
-            return Err(serial::bad("ta length does not match model geometry"));
-        }
-        if weights.len() != n_clauses {
-            return Err(serial::bad("weights length does not match model geometry"));
-        }
-        if class_weights.len() != n_classes {
-            return Err(serial::bad("class_weights length does not match n_classes"));
-        }
-        if rngs.len() != n_clauses {
-            return Err(serial::bad(
-                "per-clause RNG count does not match model geometry",
-            ));
-        }
-        if class_rngs.len() != n_classes {
-            return Err(serial::bad("per-class RNG count does not match n_classes"));
-        }
-
-        let mut valid = vec![0u64; words];
-        for l in 0..n_literals {
-            valid[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
-        }
-
-        let mut include = vec![0u64; n_clauses * words];
-        for cj in 0..n_clauses {
-            let tb = cj * n_literals;
-            rebuild_include(
-                &ta[tb..tb + n_literals],
-                &mut include[cj * words..(cj + 1) * words],
-                &valid,
-                words,
-                n_literals,
-                half,
-            );
-        }
-
-        Ok(TsetlinMachine {
-            n_classes,
-            n_features,
-            n_literals,
-            words,
-            clauses_per_class,
-            threshold,
-            s,
-            boost_true_positive,
-            max_included_literals,
-            clause_drop_p,
-            literal_drop_p,
-            literal_rng,
-            dig_lit_active: digits_of(1.0 - literal_drop_p, MASK_BITS),
-            ta,
-            include,
-            half,
-            max_state,
-            weights,
-            rngs,
-            class_rngs,
-            valid,
-            dig_inv: digits_of(1.0 / s, MASK_BITS),
-            dig_keep: digits_of((s - 1.0) / s, MASK_BITS),
-            literals: vec![0u64; words],
-            rng,
-            class_weights,
-        })
     }
 
     // ---- dimensions / accessors ------------------------------------------
@@ -1932,8 +1788,12 @@ mod tests {
         }
     }
 
-    // ---- save / load ---------------------------------------------------------
+    // ---- save / load (requires the `serde` feature) --------------------------
 
+    #[cfg(feature = "serde")]
+    use crate::serial::{self, SaveLoad};
+
+    #[cfg(feature = "serde")]
     #[test]
     fn save_load_roundtrip_predicts_identically() {
         let (xtr, ytr) = make_xor(2000, 0.1, 1);
@@ -1960,6 +1820,7 @@ mod tests {
         assert_eq!(tm.accuracy(&bte, &yte), loaded.accuracy(&bte, &yte));
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn save_load_resumes_training_without_reinit() {
         let (xtr, ytr) = make_xor(2000, 0.1, 3);
@@ -1989,6 +1850,7 @@ mod tests {
         assert_eq!(tm.accuracy(&bte, &yte), loaded.accuracy(&bte, &yte));
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn save_load_via_file_path() {
         let (xtr, ytr) = make_xor(500, 0.0, 5);
@@ -2008,6 +1870,7 @@ mod tests {
         assert_eq!(tm.predict_batch(&bte), loaded.predict_batch(&bte));
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn load_rejects_corrupt_data() {
         // Empty / truncated input.

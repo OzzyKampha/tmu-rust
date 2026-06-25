@@ -11,18 +11,9 @@
 //! [`TsetlinMachine`]: crate::TsetlinMachine
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::Path;
 
 use crate::booleanizer::Booleanizer;
 use crate::clause_bank::dense::{pack, words_for};
-use crate::serial;
-
-/// Encoder-kind sub-tags written inside a serialised [`Encoder`].
-const KIND_BINARY: u8 = 0;
-const KIND_NUMERIC: u8 = 1;
-const KIND_CATEGORICAL: u8 = 2;
 
 // ── output types ─────────────────────────────────────────────────────────────
 
@@ -93,6 +84,7 @@ impl EncodedBatch {
 
 // ── encoder kind ─────────────────────────────────────────────────────────────
 
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 enum EncoderKind {
     Binary,
     Numeric {
@@ -114,10 +106,16 @@ enum EncoderKind {
 ///
 /// Train the encoder once on your training set, then use it to encode both
 /// train and test data before passing to the TM.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Encoder {
     kind: EncoderKind,
     n_features: usize,
     words: usize,
+}
+
+#[cfg(feature = "serde")]
+impl crate::serial::SaveLoad for Encoder {
+    const TAG: u8 = crate::serial::TAG_ENCODER;
 }
 
 impl Encoder {
@@ -236,128 +234,6 @@ impl Encoder {
         }
     }
 
-    // ── persistence ────────────────────────────────────────────────────────
-
-    /// Serialise the (fitted) encoder to `path` (little-endian binary).
-    ///
-    /// Captures everything needed to reproduce identical encodings: the
-    /// numeric booleanizer thresholds or the categorical vocabulary, as
-    /// applicable.  Pair with [`Encoder::load`] so a saved model and its
-    /// encoder can be reloaded together.
-    pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let mut w = BufWriter::new(File::create(path)?);
-        self.write_to(&mut w)?;
-        w.flush()
-    }
-
-    /// Load an encoder previously written by [`Encoder::save`].
-    pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
-        let mut r = BufReader::new(File::open(path)?);
-        Self::read_from(&mut r)
-    }
-
-    /// Write the encoder to any [`Write`] sink.
-    pub(crate) fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        serial::write_header(w, serial::TAG_ENCODER)?;
-        match &self.kind {
-            EncoderKind::Binary => {
-                serial::w_u8(w, KIND_BINARY)?;
-                serial::w_usize(w, self.n_features)?;
-            }
-            EncoderKind::Numeric { booleanizer } => {
-                serial::w_u8(w, KIND_NUMERIC)?;
-                let thresholds = booleanizer.thresholds();
-                serial::w_usize(w, thresholds.len())?;
-                for thr in thresholds {
-                    serial::w_vec_f64(w, thr)?;
-                }
-            }
-            EncoderKind::Categorical {
-                index,
-                known_columns,
-                ..
-            } => {
-                serial::w_u8(w, KIND_CATEGORICAL)?;
-                serial::w_usize(w, index.len())?;
-                for tok in index {
-                    serial::w_str(w, tok)?;
-                }
-                serial::w_usize(w, known_columns.len())?;
-                for (col, &bit) in known_columns {
-                    serial::w_str(w, col)?;
-                    serial::w_usize(w, bit)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Read an encoder from any [`Read`] source.
-    pub(crate) fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
-        serial::read_header(r, serial::TAG_ENCODER)?;
-        let sub_tag = serial::r_u8(r)?;
-        match sub_tag {
-            KIND_BINARY => {
-                let n_features = serial::r_usize(r)?;
-                if n_features < 1 {
-                    return Err(serial::bad("binary encoder n_features must be >= 1"));
-                }
-                Ok(Self {
-                    kind: EncoderKind::Binary,
-                    n_features,
-                    words: words_for(2 * n_features),
-                })
-            }
-            KIND_NUMERIC => {
-                let n_raw = serial::r_usize(r)?;
-                let mut thresholds = Vec::with_capacity(n_raw);
-                for _ in 0..n_raw {
-                    thresholds.push(serial::r_vec_f64(r)?);
-                }
-                let booleanizer = Booleanizer::from_thresholds(thresholds);
-                let n_features = booleanizer.n_output_features();
-                Ok(Self {
-                    kind: EncoderKind::Numeric { booleanizer },
-                    n_features,
-                    words: words_for(2 * n_features),
-                })
-            }
-            KIND_CATEGORICAL => {
-                let n_index = serial::r_usize(r)?;
-                let mut index = Vec::with_capacity(n_index);
-                for _ in 0..n_index {
-                    index.push(serial::r_str(r)?);
-                }
-                let n_cols = serial::r_usize(r)?;
-                let mut known_columns = HashMap::with_capacity(n_cols);
-                for _ in 0..n_cols {
-                    let col = serial::r_str(r)?;
-                    let bit = serial::r_usize(r)?;
-                    known_columns.insert(col, bit);
-                }
-                let vocab: HashMap<String, usize> = index
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| (s.clone(), i))
-                    .collect();
-                let n_features = index.len();
-                if n_features < 1 {
-                    return Err(serial::bad("categorical encoder vocabulary is empty"));
-                }
-                Ok(Self {
-                    kind: EncoderKind::Categorical {
-                        vocab,
-                        index,
-                        known_columns,
-                    },
-                    n_features,
-                    words: words_for(2 * n_features),
-                })
-            }
-            other => Err(serial::bad(format!("unknown encoder kind tag {other}"))),
-        }
-    }
-
     // ── single-sample encode ──────────────────────────────────────────────────
 
     /// Encode a binary (`0`/`1`) feature vector.
@@ -466,9 +342,10 @@ impl Encoder {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "serde"))]
 mod tests {
     use super::*;
+    use crate::serial::{self, SaveLoad};
 
     fn roundtrip(e: &Encoder) -> Encoder {
         let mut buf = Vec::new();
@@ -531,10 +408,13 @@ mod tests {
     fn load_rejects_corrupt_data() {
         assert!(Encoder::read_from(&mut [].as_slice()).is_err());
         assert!(Encoder::read_from(&mut b"XXXXjunkjunk".as_slice()).is_err());
-        // Right header/tag but an unknown encoder-kind sub-tag.
+        // Valid header/tag but a truncated (empty) bincode payload.
         let mut buf = Vec::new();
         serial::write_header(&mut buf, serial::TAG_ENCODER).unwrap();
-        serial::w_u8(&mut buf, 99).unwrap();
+        assert!(Encoder::read_from(&mut buf.as_slice()).is_err());
+        // Right magic/version but the wrong artifact type.
+        let mut buf = Vec::new();
+        serial::write_header(&mut buf, serial::TAG_VANILLA).unwrap();
         assert!(Encoder::read_from(&mut buf.as_slice()).is_err());
     }
 }
