@@ -85,9 +85,16 @@ impl crate::serial::SaveLoad for ConvolutionalTsetlinMachine {
     const TAG: u8 = crate::serial::TAG_CONVOLUTIONAL;
 }
 
+/// Apply TA feedback for one clause of a ConvolutionalTM.
+///
+/// Differs from the vanilla-classifier helper in that `fires` is pre-computed
+/// by OR-ing the clause output across all patch positions (matching TMU's
+/// `cb_calculate_clause_output_feedback` semantics).  The caller selects a patch
+/// from among the FIRING patches (or any patch for the Ib-only path) and expands
+/// its features into `lit_b` before calling this function.
 #[allow(clippy::too_many_arguments)]
 #[inline]
-fn apply_one_clause(
+fn apply_one_clause_conv(
     j: usize,
     ta: &mut [u8],
     inc: &mut [u64],
@@ -96,9 +103,7 @@ fn apply_one_clause(
     target: u8,
     p: f64,
     drop_mask: &[bool],
-    lit: &[u64],
     val: &[u64],
-    lit_active: &[u64],
     words: usize,
     lit_b: &[u8],
     inv_b: &[u8],
@@ -110,6 +115,7 @@ fn apply_one_clause(
     max_inc: usize,
     half: u8,
     max_state: u8,
+    fires: bool,
 ) {
     if !drop_mask.is_empty() && drop_mask[j] {
         return;
@@ -119,12 +125,12 @@ fn apply_one_clause(
     }
     let positive = j & 1 == 0;
     if (target == 1) == positive {
-        let fired = clause_fire(inc, lit, val, words, lit_active);
+        // Type Ia / Ib: `fires` is the OR across all patches (TMU semantics).
         let under_limit = max_inc == usize::MAX || {
             let n: u32 = (0..words).map(|k| (inc[k] & val[k]).count_ones()).sum();
             (n as usize) < max_inc
         };
-        let fired_under = fired && under_limit;
+        let fired_under = fires && under_limit;
         if fired_under {
             *w = (*w + 1).min(wmax);
         }
@@ -132,7 +138,8 @@ fn apply_one_clause(
             ta, n_literals, fired_under, boost, lit_b, inv_b, keep_b, active_b, max_state,
         );
     } else {
-        if !clause_fire(inc, lit, val, words, lit_active) {
+        // Type II: only runs when clause fires on at least one patch.
+        if !fires {
             return;
         }
         *w = (*w - 1).max(1);
@@ -319,6 +326,10 @@ impl ConvolutionalTsetlinMachine {
     ///
     /// `patches_buf` is a flat row-major array of packed patches
     /// (`n_patches * words` elements).
+    ///
+    /// Matches TMU's `cb_calculate_clause_output_predict`: a clause contributes
+    /// its weight **once** if it fires on **any** patch (OR across positions),
+    /// not once per firing patch.
     fn class_scores_from_patches(&self, patches_buf: &[u64], out: &mut [i32]) {
         let cps = self.clauses_per_class;
         let words = self.words;
@@ -331,12 +342,12 @@ impl ConvolutionalTsetlinMachine {
             for (j, &w) in cw.iter().enumerate() {
                 let cj = c * cps + j;
                 let clause_inc = &inc[cj * words..(cj + 1) * words];
-                // Sum over all patch positions.
-                for p in 0..self.n_patches {
-                    let patch = &patches_buf[p * words..(p + 1) * words];
-                    if fire_predict(clause_inc, patch, val, words) {
-                        if j & 1 == 0 { sum += w; } else { sum -= w; }
-                    }
+                // OR semantics: fires if it fires on ANY patch position.
+                let fires = (0..self.n_patches).any(|p| {
+                    fire_predict(clause_inc, &patches_buf[p * words..(p + 1) * words], val, words)
+                });
+                if fires {
+                    if j & 1 == 0 { sum += w; } else { sum -= w; }
                 }
             }
             *score = sum.clamp(-self.threshold, self.threshold);
@@ -373,8 +384,8 @@ impl ConvolutionalTsetlinMachine {
 
     /// Compute the training-mode clause sum for class `c` over all patches.
     ///
-    /// Uses `clause_fire` (respects literal dropout mask `lit_active`) and sums
-    /// across all `n_patches` patch positions.
+    /// Matches TMU's `cb_calculate_clause_output_update`: OR semantics —
+    /// a clause counts once in the sum if it fires on ANY patch position.
     fn class_sum_train(&self, c: usize, patches_buf: &[u64], lit_active: &[u64]) -> i32 {
         let cps = self.clauses_per_class;
         let words = self.words;
@@ -384,12 +395,13 @@ impl ConvolutionalTsetlinMachine {
         for j in 0..cps {
             let cj = c * cps + j;
             let clause_inc = &inc[cj * words..(cj + 1) * words];
-            for p in 0..self.n_patches {
-                let patch = &patches_buf[p * words..(p + 1) * words];
-                if clause_fire(clause_inc, patch, val, words, lit_active) {
-                    let w = self.weights[c * cps + j];
-                    if j & 1 == 0 { sum += w; } else { sum -= w; }
-                }
+            // OR semantics: fires if it fires on ANY patch.
+            let fires = (0..self.n_patches).any(|p| {
+                clause_fire(clause_inc, &patches_buf[p * words..(p + 1) * words], val, words, lit_active)
+            });
+            if fires {
+                let w = self.weights[c * cps + j];
+                if j & 1 == 0 { sum += w; } else { sum -= w; }
             }
         }
         sum.clamp(-self.threshold, self.threshold)
@@ -397,8 +409,10 @@ impl ConvolutionalTsetlinMachine {
 
     /// Apply feedback to all clauses of class `c`.
     ///
-    /// Each clause picks a random patch for its TA update, implementing weight
-    /// tying: the same clause weights govern all patch positions.
+    /// Matches TMU's `cb_calculate_clause_output_feedback` + `cb_type_i/ii_feedback`:
+    /// for each clause, first collect all patches where it fires (OR scan), then pick
+    /// ONE of those firing patches for the TA update.  If no patch fires the clause
+    /// receives only Type Ib feedback (which does not use patch features).
     fn update_class(
         &mut self,
         c: usize,
@@ -470,25 +484,50 @@ impl ConvolutionalTsetlinMachine {
                 .zip(class_rng.par_iter_mut())
                 .enumerate()
                 .for_each(|(j, (((ta_c, inc_c), w), rng_c))| {
-                    // Each clause picks a random patch (per-clause RNG).
-                    let p_idx = rng_c.below(n_patches);
-                    let patch = &patches_buf[p_idx * words..(p_idx + 1) * words];
-                    let lit_b = expand_bits_to_bytes(patch, n_literals);
-                    apply_one_clause(
-                        j, ta_c, inc_c, w, rng_c, target, p, &drop_mask, patch, val, lit_active,
+                    // Find all patches where this clause fires (TMU: output_one_patches).
+                    let mut firing: Vec<usize> = (0..n_patches)
+                        .filter(|&pp| {
+                            clause_fire(inc_c, &patches_buf[pp * words..(pp + 1) * words], val, words, lit_active)
+                        })
+                        .collect();
+                    let fires = !firing.is_empty();
+                    // Pick a random firing patch; for Ib any patch is fine (Xi unused).
+                    let p_idx = if fires {
+                        firing[rng_c.below(firing.len())]
+                    } else {
+                        0
+                    };
+                    let lit_b = expand_bits_to_bytes(&patches_buf[p_idx * words..(p_idx + 1) * words], n_literals);
+                    apply_one_clause_conv(
+                        j, ta_c, inc_c, w, rng_c, target, p, &drop_mask, val,
                         words, &lit_b, &inv_b, &keep_b, &active_b, n_literals, boost, wmax,
-                        max_inc, half, max_state,
+                        max_inc, half, max_state, fires,
                     );
                 });
             return;
         }
 
         for j in 0..cps {
-            // Each clause picks a random patch for feedback.
-            let p_idx = class_rng[j].below(n_patches);
-            let patch = &patches_buf[p_idx * words..(p_idx + 1) * words];
-            let lit_b = expand_bits_to_bytes(patch, n_literals);
-            apply_one_clause(
+            // Find all patches where this clause fires (TMU: output_one_patches).
+            let fires;
+            let p_idx;
+            {
+                let clause_inc_j = &class_inc[j * words..(j + 1) * words];
+                let firing: Vec<usize> = (0..n_patches)
+                    .filter(|&pp| {
+                        clause_fire(clause_inc_j, &patches_buf[pp * words..(pp + 1) * words], val, words, lit_active)
+                    })
+                    .collect();
+                fires = !firing.is_empty();
+                // Pick a random firing patch; for Ib any patch is fine (Xi unused).
+                p_idx = if fires {
+                    firing[class_rng[j].below(firing.len())]
+                } else {
+                    0
+                };
+            }
+            let lit_b = expand_bits_to_bytes(&patches_buf[p_idx * words..(p_idx + 1) * words], n_literals);
+            apply_one_clause_conv(
                 j,
                 &mut class_ta[j * n_literals..(j + 1) * n_literals],
                 &mut class_inc[j * words..(j + 1) * words],
@@ -497,9 +536,7 @@ impl ConvolutionalTsetlinMachine {
                 target,
                 p,
                 &drop_mask,
-                patch,
                 val,
-                lit_active,
                 words,
                 &lit_b,
                 &inv_b,
@@ -511,6 +548,7 @@ impl ConvolutionalTsetlinMachine {
                 max_inc,
                 half,
                 max_state,
+                fires,
             );
         }
     }
