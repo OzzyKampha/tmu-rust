@@ -1,6 +1,6 @@
 [package]
 name = "tmu-rs"
-version = "0.9.1"
+version = "1.0.0"
 edition = "2021"
 description = "Bit-packed weighted multiclass Tsetlin Machine in Rust, with bit-parallel/multi-threaded training, a fast booleanizer, and ports of the TMU classification demos."
 license = "MIT"
@@ -103,6 +103,22 @@ path = "examples/bench_autoencoder.rs"
 [[example]]
 name = "coalesced_autoencoder" # TMCoalescedAutoEncoder: shared clause bank reconstruction demo
 path = "examples/coalesced_autoencoder.rs"
+
+[[example]]
+name = "regression"           # TMRegressor: continuous output from binary features
+path = "examples/regression.rs"
+
+[[example]]
+name = "convolutional"        # ConvolutionalTM: receptive-field clauses over 1D input
+path = "examples/convolutional.rs"
+
+[[example]]
+name = "convolutional_2d"     # ConvolutionalTM: 2-D patch sliding over 2×4 images
+path = "examples/convolutional_2d.rs"
+
+[[example]]
+name = "composite"            # TMCompositeClassifier: ensemble of TsetlinMachines
+path = "examples/composite.rs"
 
 [[bench]]
 name = "throughput"

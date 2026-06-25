@@ -2,7 +2,7 @@
 
 A Rust port of the [cair/tmu](https://github.com/cair/tmu) Tsetlin Machine library.
 
-Implements a bit-packed, weighted multiclass Tsetlin Machine with bit-parallel and multi-threaded training, a fast booleanizer, and ports of the TMU classification demos.
+Implements five Tsetlin Machine variants — multiclass classifier, regressor, convolutional (1-D and 2-D), autoencoder, and composite classifier — with bit-packed clause banks, bit-parallel training, optional Rayon multi-threading, and a fast type-safe booleanizer.
 
 For a full breakdown of what has been ported and what is missing, see [PORTING_STATUS.md](PORTING_STATUS.md). For a Python vs Rust throughput and accuracy comparison, see [BENCHMARKS.md](BENCHMARKS.md).
 
@@ -17,7 +17,7 @@ Add to your project's `Cargo.toml`:
 tmu-rs = { git = "https://github.com/ozzykampha/tmu-rust" }
 
 # Optional: pin to a specific tag for reproducible builds
-# tmu-rs = { git = "https://github.com/ozzykampha/tmu-rust", tag = "v0.7.0" }
+# tmu-rs = { git = "https://github.com/ozzykampha/tmu-rust", tag = "v1.0.0" }
 
 # Optional: enable multi-threaded training
 # tmu-rs = { git = "https://github.com/ozzykampha/tmu-rust", features = ["parallel"] }
@@ -48,14 +48,19 @@ let accuracy = tm.accuracy(&test_x, &test_y);
 ## Features
 
 - Bit-packed clause bank for cache-efficient inference and training
-- Weighted multiclass classification (`TMClassifier`)
-- Coalesced multiclass classification (`TMCoalescedClassifier`) — one shared clause bank with signed per-class weights
+- **Five model types**:
+  - `TMClassifier` — weighted multiclass classification
+  - `TMCoalescedClassifier` — one shared clause bank with signed per-class weights
+  - `TMRegressor` — continuous output from binary features
+  - `ConvolutionalTsetlinMachine` — 1-D and 2-D sliding-window clause banks (weight-tied patches)
+  - `TMCompositeClassifier` — ensemble of per-class Tsetlin Machines with independent clause banks
+  - `TMAutoEncoder` — binary reconstruction via positive-only clause banks
 - Optional multi-threaded training via [Rayon](https://github.com/rayon-rs/rayon) (`--features parallel`)
 - AVX2 fast paths for clause update loops with runtime dispatch — u8 TA counters processed 32-wide (4× smaller working set vs u32; scalar fallback on non-AVX2 targets)
 - Type-safe `Encoder` for binary, numeric (quantile booleanization), and categorical inputs
 - Fast booleanizer for continuous-valued inputs
 - Save/load trained models and encoders to disk via the `SaveLoad` trait (on by default through the `serde` feature) — serde + bincode preserve all learned state **and** RNG streams, so a reloaded model predicts identically and can resume training deterministically. Build with `--no-default-features` for a dependency-free build without save/load
-- Ports of the core TMU classification demos
+- Ports of the core TMU demos including classification, regression, convolution, autoencoder, and composite
 
 ---
 
@@ -91,7 +96,9 @@ AVX2 fast paths are also activated at runtime automatically when the CPU support
 
 ## Examples
 
-The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) multiclass `TMClassifier` (and `TMCoalescedClassifier`) demos with matching hyperparameters (e.g. MNIST: 2000 clauses, T=50, s=10.0; IMDb: 2000 clauses, T=80, s=10.0). Convolutional, regression, autoencoder, and composite variants are not included as they rely on machine types not yet ported. See [PORTING_STATUS.md](PORTING_STATUS.md) for the full status.
+The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) demos with matching hyperparameters (e.g. MNIST: 2000 clauses, T=50, s=10.0; IMDb: 2000 clauses, T=80, s=10.0). See [PORTING_STATUS.md](PORTING_STATUS.md) for the full status.
+
+**Classification demos**
 
 | TMU demo | Example | Data required | Command |
 |---|---|---|---|
@@ -102,16 +109,30 @@ The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) multiclass 
 | `BreastCancerDemo` | `breast_cancer` | scikit-learn | see [Data preparation](#data-preparation) |
 | `MNISTDemo` / `MNISTDemoWeightedClauses` | `mnist` | MNIST | see [Data preparation](#data-preparation) |
 | `IMDbTextCategorizationDemo` | `imdb` | Keras IMDb | see [Data preparation](#data-preparation) |
-| *(extra)* | `save_load` | — | `cargo run --release --example save_load` |
-| *(extra)* | `ndr_flows` | — | `cargo run --release --example ndr_flows` |
-| *(extra)* | `bench_training` | — | `cargo run --release --example bench_training` |
-| *(extra)* | `absorb_timing` | — | `cargo run --release --example absorb_timing` |
 
-`ndr_flows` is not part of TMU — it is a synthetic network-flow detection example demonstrating the booleanizer and interpretable rule extraction.
+**New model types** (run `python scripts/gen_shared_data.py` once first to generate shared data)
 
-`bench_training` measures training throughput (sequential vs parallel) at IMDB-scale clause counts using a synthetic dataset — no download required. Compare with and without `--features parallel`.
+| Model | Example | Command |
+|---|---|---|
+| `TMRegressor` | `regression` | `cargo run --release --example regression` |
+| `ConvolutionalTM` 1-D | `convolutional` | `cargo run --release --example convolutional` |
+| `ConvolutionalTM` 2-D | `convolutional_2d` | `cargo run --release --example convolutional_2d` |
+| `TMCompositeClassifier` | `composite` | `cargo run --release --example composite` |
+| `TMAutoEncoder` | `autoencoder` | `cargo run --release --example autoencoder` |
+| `TMCoalescedAutoEncoder` | `coalesced_autoencoder` | `cargo run --release --example coalesced_autoencoder` |
 
-`absorb_timing` trains on a synthetic XOR dataset at various `state_bits` settings and prints per-epoch accuracy alongside absorbing-state fractions.
+**Extras**
+
+| Example | Description |
+|---|---|
+| `save_load` | Train → save → load → predict/resume round-trip |
+| `ndr_flows` | Synthetic network-flow detection (booleanizer + rule extraction) |
+| `sysmon` / `sysmon_windows` / `sysmon_mordor` | Sysmon event classification |
+| `bench_training` | Training throughput benchmark (sequential vs parallel, IMDB-scale) |
+| `bench_autoencoder` | AutoEncoder throughput + accuracy vs Python TMU |
+| `absorb_timing` | Per-epoch accuracy and absorbing-state fraction at various `state_bits` |
+
+`bench_training` uses a synthetic dataset — no download required. Compare with and without `--features parallel`.
 
 ---
 
@@ -138,21 +159,41 @@ python scripts/prepare_imdb.py
 cargo run --release --features parallel --example imdb
 ```
 
+**Regression / Convolutional / Composite shared data** (requires `numpy`):
+```sh
+pip install numpy
+python scripts/gen_shared_data.py        # writes 14 binary files to data/
+cargo run --release --example regression
+cargo run --release --example convolutional
+cargo run --release --example convolutional_2d
+cargo run --release --example composite
+```
+
 ---
 
 ## Project structure
 
 ```
 src/
-  encoder.rs           # Type-safe Encoder (binary / numeric / categorical)
-  booleanizer.rs       # Quantile booleanization (used by Encoder)
-  clause_bank/         # Bit-packed clause storage and update logic
-  models/              # TMClassifier and supporting types
-  rng.rs               # Fast RNG
-examples/              # Demo programs (ports of TMU + extras)
-benches/               # Criterion throughput benchmarks
-scripts/               # Python data preparation scripts
-data/tmu/              # cair/tmu submodule (reference implementation)
+  encoder.rs              # Type-safe Encoder (binary / numeric / categorical)
+  booleanizer.rs          # Quantile booleanization (used by Encoder)
+  clause_bank/            # Bit-packed clause storage and update logic
+  models/
+    classification/
+      vanilla_classifier.rs      # TMClassifier
+      coalesced_classifier.rs    # TMCoalescedClassifier
+      convolutional_classifier.rs # ConvolutionalTsetlinMachine (1-D and 2-D)
+      composite_classifier.rs    # TMCompositeClassifier
+    regression/
+      vanilla_regressor.rs       # TMRegressor
+    autoencoder/
+      vanilla_autoencoder.rs     # TMAutoEncoder
+      coalesced_autoencoder.rs   # TMCoalescedAutoEncoder
+  rng.rs                  # Fast SplitMix64 RNG
+examples/               # Demo programs (ports of TMU + extras)
+benches/                # Criterion throughput benchmarks
+scripts/                # Python data preparation and comparison scripts
+data/tmu/               # cair/tmu submodule (reference implementation)
 ```
 
 ---
