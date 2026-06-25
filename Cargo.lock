@@ -480,7 +480,7 @@ dependencies = [
 
 [[package]]
 name = "tmu-rs"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "bincode",
  "criterion",

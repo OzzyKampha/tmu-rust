@@ -24,6 +24,7 @@ use crate::rng::Rng;
 /// Feature masking is applied during training: when updating output bit `o`, literals `o`
 /// and `o + n_features` are excluded from the active set to prevent trivial self-prediction.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TMCoalescedAutoEncoder {
     n_features: usize,
     n_literals: usize,
@@ -59,6 +60,11 @@ pub struct TMCoalescedAutoEncoder {
 
     literals: Vec<u64>,
     rng: Rng,
+}
+
+#[cfg(feature = "serde")]
+impl crate::serial::SaveLoad for TMCoalescedAutoEncoder {
+    const TAG: u8 = crate::serial::TAG_COALESCED_AUTOENCODER;
 }
 
 /// Per-clause feedback + weight-update kernel — identical to the one in
@@ -747,5 +753,89 @@ mod tests {
                 assert!(b == 0 || b == 1, "reconstruction bits must be 0 or 1");
             }
         }
+    }
+
+    // ---- save / load (requires the `serde` feature) --------------------------
+
+    #[cfg(feature = "serde")]
+    use crate::serial::{self, SaveLoad};
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn save_load_roundtrip_reconstructs_identically() {
+        let xs = make_mirrored(2000, 6, 1);
+        let e = enc(12);
+        let batch = e.encode_batch(&as_slices(&xs));
+
+        let mut ae = TMCoalescedAutoEncoder::with_config(12, 20, 15, 3.9, 8, true, 42);
+        for _ in 0..15 {
+            ae.fit_epoch(&batch);
+        }
+
+        let mut buf = Vec::new();
+        ae.write_to(&mut buf).unwrap();
+        let loaded = TMCoalescedAutoEncoder::read_from(&mut buf.as_slice()).unwrap();
+
+        let test = e.encode_batch(&as_slices(&make_mirrored(500, 6, 2)));
+        assert_eq!(ae.reconstruct_batch(&test), loaded.reconstruct_batch(&test));
+        assert_eq!(
+            ae.reconstruction_accuracy(&test),
+            loaded.reconstruction_accuracy(&test)
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn save_load_resumes_training_without_reinit() {
+        let xs = make_mirrored(2000, 6, 3);
+        let e = enc(12);
+        let batch = e.encode_batch(&as_slices(&xs));
+
+        let mut ae = TMCoalescedAutoEncoder::with_config(12, 20, 15, 3.9, 8, true, 42);
+        for _ in 0..10 {
+            ae.fit_epoch(&batch);
+        }
+
+        let mut buf = Vec::new();
+        ae.write_to(&mut buf).unwrap();
+        let mut loaded = TMCoalescedAutoEncoder::read_from(&mut buf.as_slice()).unwrap();
+
+        for _ in 0..10 {
+            ae.fit_epoch(&batch);
+            loaded.fit_epoch(&batch);
+        }
+
+        assert_eq!(ae.ta, loaded.ta, "TA counters diverged after resume");
+        assert_eq!(ae.weights, loaded.weights, "weights diverged after resume");
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn save_load_via_file_path() {
+        let xs = make_mirrored(500, 6, 5);
+        let e = enc(12);
+        let batch = e.encode_batch(&as_slices(&xs));
+        let mut ae = TMCoalescedAutoEncoder::with_config(12, 10, 10, 3.0, 8, true, 42);
+        ae.fit_epoch(&batch);
+
+        let mut path = std::env::temp_dir();
+        path.push("tmu_rs_coalesced_ae_roundtrip.tmrs");
+        ae.save(&path).unwrap();
+        let loaded = TMCoalescedAutoEncoder::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let test = e.encode_batch(&as_slices(&make_mirrored(200, 6, 6)));
+        assert_eq!(ae.reconstruct_batch(&test), loaded.reconstruct_batch(&test));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn load_rejects_corrupt_data() {
+        assert!(TMCoalescedAutoEncoder::read_from(&mut [].as_slice()).is_err());
+        assert!(TMCoalescedAutoEncoder::read_from(&mut b"XXXXjunkjunk".as_slice()).is_err());
+        // Right magic/version but the wrong artifact type.
+        let mut buf = Vec::new();
+        serial::write_header(&mut buf, serial::TAG_VANILLA).unwrap();
+        assert!(TMCoalescedAutoEncoder::read_from(&mut buf.as_slice()).is_err());
     }
 }
