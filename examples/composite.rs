@@ -5,41 +5,45 @@
 //!
 //! The dataset is a noisy 4-class XOR problem:
 //!   y = 2*(x[0]^x[1]) + (x[2]^x[3])  ∈ {0, 1, 2, 3}
+//! (5% label noise in training, clean test set)
 //!
-//! The composite is compared against a single model with the same total
-//! clause budget to demonstrate the ensemble benefit.
+//! Loads shared data from data/cmp_composite_*.bin (run scripts/gen_shared_data.py
+//! once to create those files) so Rust and Python train on identical samples.
 //!
 //! `cargo run --release --example composite`
 
-use tmu_rs::{Encoder, Rng, TMCompositeClassifier, TsetlinMachine};
+use tmu_rs::{Encoder, TMCompositeClassifier, TsetlinMachine};
 
 const N_FEATURES: usize = 8;
 const N_CLASSES: usize = 4;
-const CLAUSES_EACH: usize = 20;   // per constituent model
-const TOTAL_CLAUSES: usize = 60;  // single model with same budget
+const CLAUSES_EACH: usize = 20;
+const TOTAL_CLAUSES: usize = 60;
 const THRESHOLD: i32 = 20;
 const S: f64 = 3.9;
 const EPOCHS: usize = 30;
 
-fn make(n: usize, noise: f64, seed: u64) -> (Vec<Vec<u8>>, Vec<usize>) {
-    let mut rng = Rng::new(seed);
-    let mut xs = Vec::with_capacity(n);
-    let mut ys = Vec::with_capacity(n);
-    for _ in 0..n {
-        let f: Vec<u8> = (0..N_FEATURES).map(|_| (rng.next_u64() & 1) as u8).collect();
-        let mut y = 2 * (f[0] ^ f[1]) as usize + (f[2] ^ f[3]) as usize;
-        if rng.next_f64() < noise {
-            y = rng.below(N_CLASSES);
-        }
-        xs.push(f);
-        ys.push(y);
-    }
-    (xs, ys)
+fn load_u8(path: &str, n: usize, d: usize) -> Vec<Vec<u8>> {
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|_| panic!("Missing {path} — run: python scripts/gen_shared_data.py"));
+    assert_eq!(bytes.len(), n * d, "unexpected file size in {path}");
+    bytes.chunks_exact(d).map(|r| r.to_vec()).collect()
+}
+
+fn load_u32_as_usize(path: &str, n: usize) -> Vec<usize> {
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|_| panic!("Missing {path} — run: python scripts/gen_shared_data.py"));
+    assert_eq!(bytes.len(), n * 4, "unexpected file size in {path}");
+    bytes
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+        .collect()
 }
 
 fn main() {
-    let (xtr, ytr) = make(5000, 0.05, 1);
-    let (xte, yte) = make(1000, 0.0, 2);
+    let xtr = load_u8("data/cmp_composite_X_train.bin", 5000, N_FEATURES);
+    let ytr = load_u32_as_usize("data/cmp_composite_y_train.bin", 5000);
+    let xte = load_u8("data/cmp_composite_X_test.bin",  1000, N_FEATURES);
+    let yte = load_u32_as_usize("data/cmp_composite_y_test.bin",  1000);
 
     let enc = Encoder::for_binary(N_FEATURES);
     let btr = enc.encode_batch(&xtr.iter().map(|v| v.as_slice()).collect::<Vec<_>>());
@@ -58,6 +62,7 @@ fn main() {
         N_CLASSES, N_FEATURES, TOTAL_CLAUSES, THRESHOLD, S, 8, true, 42,
     );
 
+    println!("(shared data: data/cmp_composite_*.bin — identical to Python side)");
     println!(
         "Comparison: composite (3×{CLAUSES_EACH} clauses/class) vs \
          single ({TOTAL_CLAUSES} clauses/class)"

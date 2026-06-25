@@ -9,8 +9,8 @@
 //! random patch is chosen per clause per sample for feedback, implementing
 //! weight tying across spatial positions.
 //!
-//! Only 1-D receptive fields (sequences / flat feature vectors) are supported
-//! in this port.  2-D (image) inputs can be handled by pre-flattening rows.
+//! Both 1-D (sequence) and 2-D (image) receptive fields are supported.
+//! Use `with_config` for 1-D; `with_config_2d` for image patches.
 
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::PARALLEL_MIN;
@@ -25,8 +25,9 @@ use crate::rng::Rng;
 /// ## Layout
 ///
 /// Given `n_input_features` input features, `kernel_size`, and `stride`:
-/// - `n_patches = (n_input_features − kernel_size) / stride + 1` patch positions
-/// - Each clause has `n_literals = 2 * kernel_size` literals (one positive + one negated per patch feature)
+/// - **1-D**: `n_patches = (n_input_features − kernel_size) / stride + 1`
+/// - **2-D**: `n_patches = n_patch_rows × n_patch_cols` where each axis uses the same formula
+/// - Each clause has `n_literals = 2 * patch_size` literals (one positive + one negated per pixel)
 /// - Clause weight tying: the same clause fires at every position; votes are summed
 ///
 /// ## Training
@@ -40,8 +41,11 @@ use crate::rng::Rng;
 /// ```rust,no_run
 /// use tmu_rs::ConvolutionalTsetlinMachine;
 ///
-/// // 16 features, kernel=4, stride=2  →  7 patch positions
+/// // 1-D: 16 features, kernel=4, stride=2  →  7 patch positions
 /// let mut ctm = ConvolutionalTsetlinMachine::new(2, 16, 4, 2, 20, 100, 3.9);
+///
+/// // 2-D: 28×28 image, 10×10 patch, stride=2
+/// let mut ctm2d = ConvolutionalTsetlinMachine::new_2d(2, 28, 28, 10, 10, 2, 20, 100, 3.9);
 /// ```
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -53,6 +57,12 @@ pub struct ConvolutionalTsetlinMachine {
     n_patches: usize,
     n_literals: usize,
     words: usize,
+    // 2-D convolution fields (patch_rows == 1 means 1-D mode)
+    patch_rows: usize,
+    patch_cols: usize,
+    input_rows: usize,
+    input_cols: usize,
+    n_patch_cols: usize, // patch positions along the column axis
     clauses_per_class: usize,
     threshold: i32,
     s: f64,
@@ -149,7 +159,7 @@ fn apply_one_clause_conv(
 }
 
 impl ConvolutionalTsetlinMachine {
-    /// Create a convolutional TM with default settings: 8 state bits, boost enabled, seed 42.
+    /// Create a 1-D convolutional TM with default settings: 8 state bits, boost enabled, seed 42.
     ///
     /// * `n_input_features` — total number of input features.
     /// * `kernel_size` — width of each receptive field patch; must be ≤ `n_input_features`.
@@ -165,16 +175,31 @@ impl ConvolutionalTsetlinMachine {
         s: f64,
     ) -> Self {
         Self::with_config(
-            n_classes,
-            n_input_features,
-            kernel_size,
-            stride,
-            clauses_per_class,
-            threshold,
-            s,
-            8,
-            true,
-            42,
+            n_classes, n_input_features, kernel_size, stride,
+            clauses_per_class, threshold, s, 8, true, 42,
+        )
+    }
+
+    /// Create a 2-D convolutional TM with default settings: 8 state bits, boost enabled, seed 42.
+    ///
+    /// * `input_rows`, `input_cols` — image dimensions (flattened row-major input).
+    /// * `patch_rows`, `patch_cols` — patch (receptive field) dimensions.
+    /// * `stride` — step between patches along both axes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_2d(
+        n_classes: usize,
+        input_rows: usize,
+        input_cols: usize,
+        patch_rows: usize,
+        patch_cols: usize,
+        stride: usize,
+        clauses_per_class: usize,
+        threshold: i32,
+        s: f64,
+    ) -> Self {
+        Self::with_config_2d(
+            n_classes, input_rows, input_cols, patch_rows, patch_cols, stride,
+            clauses_per_class, threshold, s, 8, true, 42,
         )
     }
 
@@ -250,6 +275,122 @@ impl ConvolutionalTsetlinMachine {
             n_patches,
             n_literals,
             words,
+            // 1-D defaults for the 2-D fields
+            patch_rows: 1,
+            patch_cols: kernel_size,
+            input_rows: 1,
+            input_cols: n_input_features,
+            n_patch_cols: n_patches,
+            clauses_per_class,
+            threshold,
+            s,
+            boost_true_positive,
+            max_included_literals: usize::MAX,
+            clause_drop_p: 0.0,
+            literal_drop_p: 0.0,
+            literal_rng,
+            dig_lit_active: digits_of(1.0, MASK_BITS),
+            ta,
+            include,
+            half,
+            max_state,
+            weights: vec![1i32; n_clauses],
+            rngs,
+            class_rngs,
+            valid,
+            dig_inv: digits_of(1.0 / s, MASK_BITS),
+            dig_keep: digits_of((s - 1.0) / s, MASK_BITS),
+            rng,
+        }
+    }
+
+    /// Create a 2-D convolutional TM with full configuration.
+    ///
+    /// The input is a flattened `input_rows × input_cols` binary image (row-major).
+    /// Patches are `patch_rows × patch_cols` rectangles sliding with the given `stride`
+    /// along both the row and column axes, matching TMU's `patch_dim=(H,W)` semantics.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_config_2d(
+        n_classes: usize,
+        input_rows: usize,
+        input_cols: usize,
+        patch_rows: usize,
+        patch_cols: usize,
+        stride: usize,
+        clauses_per_class: usize,
+        threshold: i32,
+        s: f64,
+        state_bits: u8,
+        boost_true_positive: bool,
+        seed: u64,
+    ) -> Self {
+        assert!(n_classes >= 2);
+        assert!(patch_rows >= 1 && patch_rows <= input_rows);
+        assert!(patch_cols >= 1 && patch_cols <= input_cols);
+        assert!(stride >= 1);
+        assert!(clauses_per_class >= 2 && clauses_per_class.is_multiple_of(2));
+        assert!(threshold >= 1);
+        assert!(s > 1.0);
+        assert!((2..=8).contains(&state_bits));
+
+        let n_patch_rows = (input_rows - patch_rows) / stride + 1;
+        let n_patch_cols = (input_cols - patch_cols) / stride + 1;
+        let n_patches = n_patch_rows * n_patch_cols;
+        assert!(n_patches >= 1);
+
+        let patch_size = patch_rows * patch_cols;
+        let state_bits = state_bits as usize;
+        let n_literals = 2 * patch_size;
+        let words = words_for(n_literals);
+        let n_clauses = n_classes * clauses_per_class;
+        let mut rng = Rng::new(seed);
+
+        let mut valid = vec![0u64; words];
+        for l in 0..n_literals {
+            valid[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
+        }
+
+        let half = 1u8 << (state_bits - 1);
+        let max_state = ((1u16 << state_bits) - 1) as u8;
+
+        let mut ta = vec![0u8; n_clauses * n_literals];
+        let mut include = vec![0u64; n_clauses * words];
+        for cj in 0..n_clauses {
+            let tb = cj * n_literals;
+            for l in 0..n_literals {
+                ta[tb + l] = if rng.next_u64() & 1 == 0 { half - 1 } else { half };
+            }
+            rebuild_include(
+                &ta[tb..tb + n_literals],
+                &mut include[cj * words..(cj + 1) * words],
+                &valid,
+                words,
+                n_literals,
+                half,
+            );
+        }
+
+        let rngs = (0..n_clauses)
+            .map(|i| Rng::new(seed ^ (i as u64).wrapping_add(1).wrapping_mul(GOLDEN)))
+            .collect();
+        let class_rngs = (0..n_classes)
+            .map(|c| Rng::new(seed ^ (c as u64 + n_clauses as u64 + 1).wrapping_mul(GOLDEN)))
+            .collect();
+        let literal_rng = Rng::new(seed ^ 0x4C49_5445_5241_4C21u64);
+
+        ConvolutionalTsetlinMachine {
+            n_classes,
+            n_input_features: input_rows * input_cols,
+            kernel_size: patch_cols,
+            stride,
+            n_patches,
+            n_literals,
+            words,
+            patch_rows,
+            patch_cols,
+            input_rows,
+            input_cols,
+            n_patch_cols,
             clauses_per_class,
             threshold,
             s,
@@ -302,13 +443,33 @@ impl ConvolutionalTsetlinMachine {
     pub fn stride(&self) -> usize { self.stride }
     pub fn n_patches(&self) -> usize { self.n_patches }
     pub fn clauses_per_class(&self) -> usize { self.clauses_per_class }
+    pub fn patch_rows(&self) -> usize { self.patch_rows }
+    pub fn patch_cols(&self) -> usize { self.patch_cols }
+    pub fn input_rows(&self) -> usize { self.input_rows }
+    pub fn input_cols(&self) -> usize { self.input_cols }
 
     // ---- patch packing -------------------------------------------------------
 
     /// Pack patch `p_idx` from a raw feature vector into `out`.
+    ///
+    /// For 1-D (`patch_rows == 1`): extracts `kernel_size` consecutive bytes at offset `p_idx * stride`.
+    /// For 2-D: extracts a `patch_rows × patch_cols` rectangle from the flattened image, then packs it.
     fn pack_patch(&self, x: &[u8], p_idx: usize, out: &mut [u64]) {
-        let start = p_idx * self.stride;
-        pack(&x[start..start + self.kernel_size], self.kernel_size, out);
+        if self.patch_rows == 1 {
+            let start = p_idx * self.stride;
+            pack(&x[start..start + self.patch_cols], self.patch_cols, out);
+        } else {
+            let r = (p_idx / self.n_patch_cols) * self.stride;
+            let c = (p_idx % self.n_patch_cols) * self.stride;
+            let patch_size = self.patch_rows * self.patch_cols;
+            let mut flat = vec![0u8; patch_size];
+            for pr in 0..self.patch_rows {
+                let row_start = (r + pr) * self.input_cols + c;
+                flat[pr * self.patch_cols..(pr + 1) * self.patch_cols]
+                    .copy_from_slice(&x[row_start..row_start + self.patch_cols]);
+            }
+            pack(&flat, patch_size, out);
+        }
     }
 
     /// Pack all patches from `x` into a pre-allocated flat buffer
@@ -485,7 +646,7 @@ impl ConvolutionalTsetlinMachine {
                 .enumerate()
                 .for_each(|(j, (((ta_c, inc_c), w), rng_c))| {
                     // Find all patches where this clause fires (TMU: output_one_patches).
-                    let mut firing: Vec<usize> = (0..n_patches)
+                    let firing: Vec<usize> = (0..n_patches)
                         .filter(|&pp| {
                             clause_fire(inc_c, &patches_buf[pp * words..(pp + 1) * words], val, words, lit_active)
                         })
@@ -620,17 +781,18 @@ impl ConvolutionalTsetlinMachine {
     /// Return the included literals for clause `clause` of `class`
     /// as `(patch_feature_index, is_negated)` pairs.
     ///
-    /// Indices are relative to the patch (`0..kernel_size`).
+    /// Indices are relative to the patch (`0..patch_rows*patch_cols`).
     pub fn clause_rule(&self, class: usize, clause: usize) -> Vec<(usize, bool)> {
+        let patch_features = self.patch_rows * self.patch_cols;
         let cj = class * self.clauses_per_class + clause;
         let inc = &self.include[cj * self.words..(cj + 1) * self.words];
         let mut rule = Vec::new();
         for l in 0..self.n_literals {
             if (inc[l / WORD_BITS] >> (l % WORD_BITS)) & 1 != 0 {
-                if l < self.kernel_size {
+                if l < patch_features {
                     rule.push((l, false));
                 } else {
-                    rule.push((l - self.kernel_size, true));
+                    rule.push((l - patch_features, true));
                 }
             }
         }

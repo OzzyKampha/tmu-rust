@@ -113,6 +113,10 @@ name = "convolutional"        # ConvolutionalTM: receptive-field clauses over 1D
 path = "examples/convolutional.rs"
 
 [[example]]
+name = "convolutional_2d"     # ConvolutionalTM: 2-D patch sliding over 2×4 images
+path = "examples/convolutional_2d.rs"
+
+[[example]]
 name = "composite"            # TMCompositeClassifier: ensemble of TsetlinMachines
 path = "examples/composite.rs"
 

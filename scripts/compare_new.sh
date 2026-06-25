@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# compare_new.sh — Rust tmu-rs vs Python TMU for the three new model types.
+# compare_new.sh — Rust tmu-rs vs Python TMU for the four new model types.
 #
-# Runs the Rust examples (regression, convolutional, composite) and then the
-# matching Python TMU implementations so you can compare accuracy side-by-side.
+# Runs the Rust examples and then the matching Python TMU implementations
+# so you can compare accuracy side-by-side.
+#
+# IMPORTANT: Run once before comparing:
+#   python scripts/gen_shared_data.py
+# This writes shared binary data to data/cmp_*.bin so that both Rust and
+# Python train and evaluate on bit-identical samples.
 #
 # Usage:
-#   bash scripts/compare_new.sh                  # all three models
+#   bash scripts/compare_new.sh                  # all four models
 #   bash scripts/compare_new.sh --regressor      # TMRegressor only
-#   bash scripts/compare_new.sh --conv           # ConvolutionalTM only
+#   bash scripts/compare_new.sh --conv           # ConvolutionalTM 1-D only
+#   bash scripts/compare_new.sh --conv2d         # ConvolutionalTM 2-D only
 #   bash scripts/compare_new.sh --composite      # TMCompositeClassifier only
 #   bash scripts/compare_new.sh --rust-only      # skip Python (no TMU needed)
 #   bash scripts/compare_new.sh --python-only    # skip Rust build
@@ -21,26 +27,27 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # ── flags ──────────────────────────────────────────────────────────────────────
-DO_REGRESSOR=0; DO_CONV=0; DO_COMPOSITE=0; ALL=1
+DO_REGRESSOR=0; DO_CONV=0; DO_CONV2D=0; DO_COMPOSITE=0; ALL=1
 RUST_ONLY=0; PYTHON_ONLY=0; NATIVE=0; PARALLEL=0
 
 for arg in "$@"; do
     case "$arg" in
         --regressor)   DO_REGRESSOR=1; ALL=0 ;;
         --conv)        DO_CONV=1;      ALL=0 ;;
+        --conv2d)      DO_CONV2D=1;    ALL=0 ;;
         --composite)   DO_COMPOSITE=1; ALL=0 ;;
         --rust-only)   RUST_ONLY=1 ;;
         --python-only) PYTHON_ONLY=1 ;;
         --native)      NATIVE=1 ;;
         --parallel)    PARALLEL=1 ;;
         -h|--help)
-            sed -n '2,20p' "$0"; exit 0 ;;
+            sed -n '2,26p' "$0"; exit 0 ;;
         *) echo "Unknown flag: $arg" >&2; exit 1 ;;
     esac
 done
 
 if [[ $ALL -eq 1 ]]; then
-    DO_REGRESSOR=1; DO_CONV=1; DO_COMPOSITE=1
+    DO_REGRESSOR=1; DO_CONV=1; DO_CONV2D=1; DO_COMPOSITE=1
 fi
 
 # ── build ──────────────────────────────────────────────────────────────────────
@@ -59,6 +66,7 @@ if [[ $PYTHON_ONLY -eq 0 ]]; then
     RUSTFLAGS="$RUSTFLAGS_EXTRA" cargo build --release $FEATURES_FLAG \
         --example regression \
         --example convolutional \
+        --example convolutional_2d \
         --example composite \
         2>&1 | grep -E "^(error|warning\[)" || true
 fi
@@ -86,29 +94,40 @@ RUN_PYTHON() {
 if [[ $DO_REGRESSOR -eq 1 ]]; then
     echo ""
     echo "═══════════════════════════════════════════════════════════"
-    echo "  1 / 3  TMRegressor"
+    echo "  1 / 4  TMRegressor"
     echo "═══════════════════════════════════════════════════════════"
 
     [[ $PYTHON_ONLY -eq 0 ]] && RUN_RUST regression
     [[ $RUST_ONLY   -eq 0 ]] && RUN_PYTHON --regressor
 fi
 
-# ── ConvolutionalTM ───────────────────────────────────────────────────────────
+# ── ConvolutionalTM 1-D ───────────────────────────────────────────────────────
 if [[ $DO_CONV -eq 1 ]]; then
     echo ""
     echo "═══════════════════════════════════════════════════════════"
-    echo "  2 / 3  ConvolutionalTM"
+    echo "  2 / 4  ConvolutionalTM 1-D"
     echo "═══════════════════════════════════════════════════════════"
 
     [[ $PYTHON_ONLY -eq 0 ]] && RUN_RUST convolutional
     [[ $RUST_ONLY   -eq 0 ]] && RUN_PYTHON --conv
 fi
 
+# ── ConvolutionalTM 2-D ───────────────────────────────────────────────────────
+if [[ $DO_CONV2D -eq 1 ]]; then
+    echo ""
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  3 / 4  ConvolutionalTM 2-D"
+    echo "═══════════════════════════════════════════════════════════"
+
+    [[ $PYTHON_ONLY -eq 0 ]] && RUN_RUST convolutional_2d
+    [[ $RUST_ONLY   -eq 0 ]] && RUN_PYTHON --conv2d
+fi
+
 # ── TMCompositeClassifier ─────────────────────────────────────────────────────
 if [[ $DO_COMPOSITE -eq 1 ]]; then
     echo ""
     echo "═══════════════════════════════════════════════════════════"
-    echo "  3 / 3  TMCompositeClassifier"
+    echo "  4 / 4  TMCompositeClassifier"
     echo "═══════════════════════════════════════════════════════════"
 
     [[ $PYTHON_ONLY -eq 0 ]] && RUN_RUST composite
