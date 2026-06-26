@@ -120,6 +120,10 @@ path = "examples/convolutional_2d.rs"
 name = "composite"            # TMCompositeClassifier: ensemble of TsetlinMachines
 path = "examples/composite.rs"
 
+[[example]]
+name = "mordor_autoencoder"   # TMAutoEncoder + TMCoalescedAutoEncoder: unsupervised anomaly detection on Mordor Sysmon events
+path = "examples/mordor_autoencoder.rs"
+
 [[bench]]
 name = "throughput"
 path = "benches/throughput.rs"

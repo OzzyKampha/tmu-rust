@@ -9,10 +9,11 @@
 //!    JSON is included (except high-cardinality noise like GUIDs/PIDs/timestamps).
 //!    Paths → basename + `file.path::<dir>` location tokens.
 //!    CommandLine/ParentCommandLine → word-level `process.args::<token>` tokens.
-//! 3. Labels each event using a within-trace heuristic: primary image in ATTACK_PROCS
-//!    → label 1; background OS processes → label 0.
-//! 4. Shuffles, 80/20 train/test split, trains a TM, reports accuracy every 5 epochs.
-//! 5. Prints the vocabulary, top attack/benign rules, and per-sample clause explanations.
+//! 3. Labels every event in a file with the file's ATT&CK tactic (from the Mordor
+//!    directory structure: execution/, credential_access/, etc.) — these ARE the
+//!    Mordor dataset labels.  No per-event heuristics needed.
+//! 4. Trains an 8-class TM (one class per tactic), 80/20 split, per-epoch accuracy.
+//! 5. Reports per-tactic accuracy and top discriminating clause rules.
 //!
 //! ## Run
 //! ```text
@@ -23,8 +24,10 @@
 mod shared;
 use shared::{basename, hive_of};
 
-use std::{collections::HashSet, fs, path::Path};
-use tmu_rs::{Encoder, Rng, TsetlinMachine};
+use std::{collections::HashMap, fs, io::Write, path::Path};
+use tmu_rs::{CoalescedTsetlinMachine, Encoder, Rng};
+
+const MINI_BATCH_SIZE: usize = 4096;
 
 // ── dataset discovery ─────────────────────────────────────────────────────────
 
@@ -41,52 +44,23 @@ const TACTIC_DIRS: &[&str] = &[
     "collection",
 ];
 
-// ── attack heuristic ──────────────────────────────────────────────────────────
+// ── tactic map: ZIP stem → tactic index, persisted between runs ──────────────
 
-const ATTACK_PROCS: &[&str] = &[
-    // Execution
-    "SharpView.exe",
-    "powershell.exe",
-    "netsh.exe",
-    "wscript.exe",
-    "python.exe",
-    "whoami.exe",
-    "cmd.exe",
-    "mshta.exe",
-    "vbc.exe",
-    "vbscript.dll",
-    // Credential access
-    "mimikatz.exe",
-    "mimilib.dll",
-    "Rubeus.exe",
-    "kekeo.exe",
-    "SharpDPAPI.exe",
-    "SharpDump.exe",
-    "procdump.exe",
-    "procdump64.exe",
-    "wce.exe",
-    "fgdump.exe",
-    // Defense evasion / execution via LOLBins rarely seen in benign traces
-    "regsvcs.exe",
-    "regasm.exe",
-    "msbuild.exe",
-    "cmstp.exe",
-    "odbcconf.exe",
-    "cscript.exe",
-    "msiexec.exe",
-    // Lateral movement
-    "PsExec.exe",
-    "PsExec64.exe",
-    "psexesvc.exe",
-    "wmic.exe",
-    // Persistence helpers
-    "schtasks.exe",
-    "at.exe",
-    // C2 / misc
-    "ncat.exe",
-    "nc.exe",
-    "nmap.exe",
-];
+const TACTIC_MAP_FILE: &str = "mordor_data/tactic_map.json";
+
+fn load_tactic_map() -> HashMap<String, usize> {
+    fs::read_to_string(TACTIC_MAP_FILE)
+        .ok()
+        .and_then(|s| serde_json::from_str::<HashMap<String, usize>>(&s).ok())
+        .unwrap_or_default()
+}
+
+fn file_tactic_idx(json_name: &str, map: &HashMap<String, usize>) -> usize {
+    map.iter()
+        .find(|(stem, _)| json_name.starts_with(stem.as_str()))
+        .map(|(_, &idx)| idx)
+        .unwrap_or(0)
+}
 
 // ── field skip list (GUIDs, PIDs, timestamps, raw hashes, stack traces) ───────
 
@@ -294,17 +268,11 @@ fn event_to_tokens(v: &serde_json::Value, eid: u32) -> Vec<String> {
     t
 }
 
-// ── labeling heuristic ────────────────────────────────────────────────────────
-
-fn is_attack(v: &serde_json::Value, eid: u32) -> bool {
-    let img_field = if eid == 10 { "SourceImage" } else { "Image" };
-    let base = basename(v[img_field].as_str().unwrap_or(""));
-    ATTACK_PROCS.iter().any(|p| base.eq_ignore_ascii_case(p))
-}
-
 // ── parse one NDJSON file ──────────────────────────────────────────────────────
 
-fn parse_file(path: &str) -> std::io::Result<Vec<(Vec<String>, usize)>> {
+// All events in a file receive the file's tactic index as the label.
+// This uses the Mordor dataset's own labels (tactic directory structure).
+fn parse_file(path: &str, tactic_idx: usize) -> std::io::Result<Vec<(Vec<String>, usize)>> {
     let text = fs::read_to_string(path)?;
     let mut events = Vec::new();
     for line in text.lines() {
@@ -319,8 +287,7 @@ fn parse_file(path: &str) -> std::io::Result<Vec<(Vec<String>, usize)>> {
             continue;
         }
         let eid = v["EventID"].as_u64().unwrap_or(0) as u32;
-        let label = usize::from(is_attack(&v, eid));
-        events.push((event_to_tokens(&v, eid), label));
+        events.push((event_to_tokens(&v, eid), tactic_idx));
     }
     Ok(events)
 }
@@ -328,8 +295,11 @@ fn parse_file(path: &str) -> std::io::Result<Vec<(Vec<String>, usize)>> {
 // ── dynamic discovery + download ──────────────────────────────────────────────
 
 fn discover_and_download() {
+    // Load any existing tactic map from previous runs.
+    let mut tactic_map: HashMap<String, usize> = load_tactic_map();
+
     fs::create_dir_all(DATA_DIR).expect("could not create mordor_data/");
-    for tactic in TACTIC_DIRS {
+    for (tactic_idx, tactic) in TACTIC_DIRS.iter().enumerate() {
         let api_url = format!(
             "https://api.github.com/repos/OTRF/Security-Datasets/contents/datasets/atomic/windows/{tactic}/host"
         );
@@ -357,6 +327,9 @@ fn discover_and_download() {
                 continue;
             }
             let stem = name.trim_end_matches(".zip");
+            // Record this scenario's tactic even if already downloaded.
+            tactic_map.entry(stem.to_string()).or_insert(tactic_idx);
+
             let url = entry["download_url"].as_str().unwrap_or("");
             if url.is_empty() {
                 continue;
@@ -387,28 +360,37 @@ fn discover_and_download() {
             }
         }
     }
+
+    // Persist the tactic map so file parsing can look up each scenario's tactic.
+    if let Ok(json) = serde_json::to_string_pretty(&tactic_map) {
+        let _ = fs::write(TACTIC_MAP_FILE, json);
+    }
 }
 
 // ── recursive JSON file collection ────────────────────────────────────────────
 
-fn collect_json_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+fn collect_json_files(
+    dir: &Path,
+    tactic_map: &HashMap<String, usize>,
+    out: &mut Vec<(std::path::PathBuf, usize)>,
+) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            // skip macOS resource-fork artifact directories
             if path.file_name().and_then(|n| n.to_str()) == Some("__MACOSX") {
                 continue;
             }
-            collect_json_files(&path, out);
+            collect_json_files(&path, tactic_map, out);
         } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
-            // skip macOS resource-fork files (start with "._")
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !name.starts_with("._") {
-                out.push(path);
+            if name.starts_with("._") || name == "tactic_map.json" {
+                continue;
             }
+            let tactic_idx = file_tactic_idx(name, tactic_map);
+            out.push((path, tactic_idx));
         }
     }
 }
@@ -416,34 +398,49 @@ fn collect_json_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 // ── main ───────────────────────────────────────────────────────────────────────
 
 fn main() {
+    println!("Mordor Tactic Classifier — 8-class ATT&CK tactic prediction from Sysmon events\n");
+    println!("Downloading / verifying Mordor datasets…");
     discover_and_download();
 
-    let mut json_files = Vec::new();
-    collect_json_files(Path::new(DATA_DIR), &mut json_files);
-    json_files.sort();
+    let tactic_map = load_tactic_map();
+    if tactic_map.is_empty() {
+        eprintln!("WARN: tactic map is empty — re-run to let the API populate it");
+    }
+
+    let mut json_files: Vec<(std::path::PathBuf, usize)> = Vec::new();
+    collect_json_files(Path::new(DATA_DIR), &tactic_map, &mut json_files);
+    json_files.sort_by_key(|(p, _)| p.clone());
 
     let mut all_events: Vec<(Vec<String>, usize)> = Vec::new();
-    for path in &json_files {
-        match parse_file(path.to_str().unwrap()) {
+    for (path, tactic_idx) in &json_files {
+        match parse_file(path.to_str().unwrap(), *tactic_idx) {
             Ok(evs) => {
-                println!(
-                    "  {} → {} Sysmon events",
-                    path.file_name().unwrap().to_str().unwrap(),
-                    evs.len()
-                );
+                let n = evs.len();
+                if n > 0 {
+                    let tactic = TACTIC_DIRS.get(*tactic_idx).unwrap_or(&"?");
+                    println!(
+                        "  [{tactic}] {} → {n} events",
+                        path.file_name().unwrap().to_str().unwrap()
+                    );
+                }
                 all_events.extend(evs);
             }
             Err(e) => eprintln!("  WARN: {e}"),
         }
     }
 
-    let n_attack = all_events.iter().filter(|(_, y)| *y == 1).count();
-    let n_benign = all_events.iter().filter(|(_, y)| *y == 0).count();
-    println!("\n{n_attack} attack events (label 1)  ← real attack-tool activity");
-    println!("{n_benign} benign events (label 0)  ← real background OS activity\n");
+    println!();
+    let mut tactic_counts = vec![0usize; TACTIC_DIRS.len()];
+    for (_, y) in &all_events {
+        tactic_counts[*y] += 1;
+    }
+    for (i, tactic) in TACTIC_DIRS.iter().enumerate() {
+        println!("  {i}  {:<25}  {} events", tactic, tactic_counts[i]);
+    }
+    println!("     {:<25}  {} total\n", "", all_events.len());
 
-    if n_attack == 0 || n_benign == 0 {
-        eprintln!("ERROR: one class is empty — check ATTACK_PROCS or dataset contents");
+    if all_events.is_empty() {
+        eprintln!("ERROR: no events loaded — check dataset contents");
         std::process::exit(1);
     }
 
@@ -478,209 +475,305 @@ fn main() {
         encoder.n_features(),
     );
 
-    let train_x = encoder.encode_batch_categorical(&tr_refs);
     let test_x = encoder.encode_batch_categorical(&te_refs);
 
-    let mut tm = TsetlinMachine::with_config(2, encoder.n_features(), 80, 50, 5.0, 8, true, 42);
-    for epoch in 1..=50 {
+    let n_tactics = TACTIC_DIRS.len();
+    let n_train = tr_inner.len();
+
+    // Build per-class index lists and print counts.
+    let mut class_indices: Vec<Vec<usize>> = vec![Vec::new(); n_tactics];
+    for (i, &y) in train_y.iter().enumerate() {
+        class_indices[y].push(i);
+    }
+    println!("class training counts (balanced sampling per mini-batch):");
+    for (i, tactic) in TACTIC_DIRS.iter().enumerate() {
+        println!("  {i}  {tactic:<25}  train_count={:>6}", class_indices[i].len());
+    }
+    println!();
+
+    // CoalescedTsetlinMachine: n_clauses shared across all classes.
+    let mut tm = CoalescedTsetlinMachine::with_config(
+        n_tactics, encoder.n_features(), 256, 50, 5.0, 8, true, 42,
+    );
+    let mut shuffle_rng = Rng::new(0xDEAD_BEEF);
+
+    // Each mini-batch draws MINI_BATCH_SIZE/n_tactics samples per class (with
+    // replacement for small classes), guaranteeing perfectly balanced batches.
+    let per_class = MINI_BATCH_SIZE / n_tactics;
+    let n_batches = n_train.div_ceil(MINI_BATCH_SIZE);
+
+    for epoch in 1..=10 {
         let t0 = std::time::Instant::now();
-        tm.fit_epoch(&train_x, &train_y);
+        // Shuffle each class's index list independently.
+        for ci in 0..n_tactics {
+            let len = class_indices[ci].len();
+            for i in (1..len).rev() {
+                let j = shuffle_rng.below(i + 1);
+                class_indices[ci].swap(i, j);
+            }
+        }
+        for b in 0..n_batches {
+            let bt0 = std::time::Instant::now();
+            // Sample per_class items from each class (wrap around for small classes).
+            let mut batch: Vec<usize> = Vec::with_capacity(MINI_BATCH_SIZE);
+            for ci in 0..n_tactics {
+                let ci_len = class_indices[ci].len();
+                for k in 0..per_class {
+                    batch.push(class_indices[ci][(b * per_class + k) % ci_len]);
+                }
+            }
+            // Shuffle within batch to mix classes.
+            for i in (1..batch.len()).rev() {
+                let j = shuffle_rng.below(i + 1);
+                batch.swap(i, j);
+            }
+            let slices: Vec<&[&str]> = batch.iter().map(|&i| tr_inner[i].as_slice()).collect();
+            let mini_x = encoder.encode_batch_categorical(&slices);
+            let mini_y: Vec<usize> = batch.iter().map(|&i| train_y[i]).collect();
+            tm.fit_epoch(&mini_x, &mini_y);
+            let evps = batch.len() as f64 / bt0.elapsed().as_secs_f64();
+            if b % 10 == 9 || b + 1 == n_batches {
+                println!(
+                    "  epoch {epoch:>2}  batch {:>3}/{n_batches}  {evps:>7.0} ev/s",
+                    b + 1
+                );
+                let _ = std::io::stdout().flush();
+            }
+        }
         let elapsed = t0.elapsed();
-        if epoch % 5 == 0 || epoch == 1 {
-            let tr_acc = tm.accuracy(&train_x, &train_y) * 100.0;
-            let te_acc = tm.accuracy(&test_x, &test_y) * 100.0;
-            println!(
-                "epoch {epoch:>2}  train={tr_acc:.2}%  test={te_acc:.2}%  ({:.1}s)",
-                elapsed.as_secs_f32()
-            );
-        }
+        let te_acc = tm.accuracy(&test_x, &test_y) * 100.0;
+        println!(
+            "epoch {epoch:>2}  test={te_acc:.2}%  ({:.1}s total)\n",
+            elapsed.as_secs_f32()
+        );
     }
 
-    // Vocabulary printout.
-    println!("\n--- vocabulary ({} features) ---", encoder.n_features());
-    for bit in 0..encoder.n_features() {
-        let tok = encoder.vocab_token(bit);
-        if !tok.contains("<UNK>") && !tok.contains("<OOV>") {
-            println!("  {bit:>4}  {tok}");
-        }
-    }
-    let n_sentinel = (0..encoder.n_features())
-        .filter(|&b| {
-            let t = encoder.vocab_token(b);
-            t.contains("<UNK>") || t.contains("<OOV>")
-        })
-        .count();
-    println!("  … plus {n_sentinel} <UNK>/<OOV> sentinels");
+    // Inference speed on pre-encoded test set (no tokenization cost).
+    let infer_t0 = std::time::Instant::now();
+    let _ = tm.accuracy(&test_x, &test_y);
+    let infer_bulk_us = infer_t0.elapsed().as_secs_f64() * 1e6 / test_y.len() as f64;
 
-    // Top-5 rules per class: one compact line each, ranked by weight.
-    // Prefer clauses referencing process/args/file tokens (more interpretable).
+    // Per-tactic accuracy — encode + predict from raw tokens (full pipeline latency).
+    println!("\n--- per-tactic test accuracy ---");
+    let fullpipe_t0 = std::time::Instant::now();
+    for (class, tactic) in TACTIC_DIRS.iter().enumerate() {
+        let indices: Vec<usize> = test_y
+            .iter()
+            .enumerate()
+            .filter(|(_, &y)| y == class)
+            .map(|(i, _)| i)
+            .collect();
+        if indices.is_empty() {
+            continue;
+        }
+        let correct = indices.iter().filter(|&&i| {
+            let s = encoder.encode_one_categorical(&te_inner[i]);
+            tm.predict(&s) == class
+        }).count();
+        println!(
+            "  {class}  {:<25}  {correct}/{} ({:.1}%)",
+            tactic,
+            indices.len(),
+            correct as f64 / indices.len() as f64 * 100.0
+        );
+    }
+    let fullpipe_us = fullpipe_t0.elapsed().as_secs_f64() * 1e6 / test_y.len() as f64;
+
+    println!(
+        "\ninference speed ({} test events):",
+        test_y.len()
+    );
+    println!(
+        "  pre-encoded predict:  {:.2}µs/event  ({:.0} ev/s)",
+        infer_bulk_us, 1e6 / infer_bulk_us
+    );
+    println!(
+        "  encode + predict:     {:.2}µs/event  ({:.0} ev/s)",
+        fullpipe_us, 1e6 / fullpipe_us
+    );
+
     let meaningful_prefixes = [
-        "process.name",
-        "process.args",
-        "process.parent",
-        "dll.name",
-        "file.name",
-        "file.path",
-        "target.process",
-        "source.process",
-        "dns.question",
-        "destination.",
+        "process.name", "process.args", "process.parent",
+        "dll.name", "file.name", "file.path",
+        "target.process", "source.process",
+        "dns.question", "destination.",
+        "network.", "registry.",
     ];
 
-    for (class, label) in [(1usize, "attack"), (0, "benign")] {
-        println!("\n--- top {} rules (class {}) ---", label, class);
-        let mut ranked: Vec<usize> = (0..tm.clauses_per_class())
-            .filter(|&c| tm.clause_is_positive(c))
-            .filter(|&c| tm.clause_rule(class, c).iter().any(|&(_, neg)| !neg))
+    // ── clause statistics ─────────────────────────────────────────────────────
+
+    println!("\n━━━ clause statistics ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+
+    // Per-class: pos/neg clause counts, mean & max weight.
+    println!("{:<25}  {:>10}  {:>10}  {:>9}  {:>6}", "tactic", "pos_clauses", "neg_clauses", "mean_w_pos", "max_w");
+    for (class, tactic) in TACTIC_DIRS.iter().enumerate() {
+        let pos: Vec<i32> = (0..tm.n_clauses())
+            .filter_map(|c| { let w = tm.clause_weight(class, c); if w > 0 { Some(w) } else { None } })
             .collect();
-        // Sort: most positive literals first, then has-meaningful-token, then weight
+        let neg_cnt = (0..tm.n_clauses()).filter(|&c| tm.clause_weight(class, c) < 0).count();
+        let mean_w = if pos.is_empty() { 0.0 } else { pos.iter().sum::<i32>() as f64 / pos.len() as f64 };
+        let max_w  = pos.iter().copied().max().unwrap_or(0);
+        println!("{:<25}  {:>10}  {:>10}  {:>9.1}  {:>6}", tactic, pos.len(), neg_cnt, mean_w, max_w);
+    }
+
+    // Literal count histogram across all clauses.
+    println!("\nliteral count histogram ({} total clauses):", tm.n_clauses());
+    let buckets: &[(usize, usize)] = &[(1,5),(6,15),(16,30),(31,60),(61,120),(121,300),(301,1000),(1001,usize::MAX)];
+    for &(lo, hi) in buckets {
+        let cnt = (0..tm.n_clauses()).filter(|&c| { let n = tm.clause_rule(c).len(); n >= lo && n <= hi }).count();
+        let pct = cnt as f64 / tm.n_clauses() as f64 * 100.0;
+        let label = if hi == usize::MAX { format!("{}+", lo) } else { format!("{}-{}", lo, hi) };
+        println!("  {:>9}  {:>3}  {:>4.0}%  {}", label, cnt, pct, "█".repeat((pct / 3.0) as usize));
+    }
+
+    // Top-20 most frequent positive literal tokens across all positively-weighted clauses.
+    let mut token_freq: HashMap<usize, usize> = HashMap::new();
+    let mut token_class_set: HashMap<usize, u8> = HashMap::new(); // bitmask of classes
+    for class in 0..TACTIC_DIRS.len() {
+        for c in 0..tm.n_clauses() {
+            if tm.clause_weight(class, c) > 0 {
+                for &(feat, neg) in tm.clause_rule(c).iter() {
+                    if !neg {
+                        *token_freq.entry(feat).or_insert(0) += 1;
+                        *token_class_set.entry(feat).or_insert(0) |= 1 << class;
+                    }
+                }
+            }
+        }
+    }
+    let mut freq_vec: Vec<(usize, usize)> = token_freq.into_iter().collect();
+    freq_vec.sort_by(|a, b| b.1.cmp(&a.1));
+
+    println!("\ntop-20 most common positive literal tokens (all classes × clauses):");
+    println!("  {:>5}  {:>6}  token", "count", "n_cls");
+    for &(feat, count) in freq_vec.iter().take(20) {
+        let n_cls = token_class_set[&feat].count_ones();
+        println!("  {:>5}  {:>6}  {}", count, n_cls, encoder.vocab_token(feat));
+    }
+
+    // Top attack-relevant tokens (meaningful prefix only).
+    let atk_tokens: Vec<_> = freq_vec.iter()
+        .filter(|&&(feat, _)| meaningful_prefixes.iter().any(|p| encoder.vocab_token(feat).starts_with(p)))
+        .take(20)
+        .collect();
+    println!("\ntop-20 attack-relevant positive literal tokens:");
+    println!("  {:>5}  {:>6}  token", "count", "n_cls");
+    for &&(feat, count) in &atk_tokens {
+        let n_cls = token_class_set[&feat].count_ones();
+        println!("  {:>5}  {:>6}  {}", count, n_cls, encoder.vocab_token(feat));
+    }
+
+    // Class-exclusive tokens: appear in positive clauses of exactly one class.
+    println!("\nclass-exclusive tokens (positive in exactly 1 class's clauses):");
+    for (class, tactic) in TACTIC_DIRS.iter().enumerate() {
+        let excl: Vec<_> = freq_vec.iter()
+            .filter(|&&(feat, _)| token_class_set[&feat] == (1u8 << class))
+            .take(5)
+            .collect();
+        if excl.is_empty() { continue; }
+        print!("  {tactic:<25}");
+        for &&(feat, _) in &excl {
+            print!("  {}", encoder.vocab_token(feat));
+        }
+        println!();
+    }
+
+    // ── top-5 rules per tactic with annotations ───────────────────────────────
+
+    println!("\n━━━ top rules per tactic (annotated) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+
+    for (class, tactic) in TACTIC_DIRS.iter().enumerate() {
+        let n_class = test_y.iter().filter(|&&y| y == class).count();
+        if n_class == 0 { continue; }
+        println!("── {tactic} (class {class}) ──");
+
+        let mut ranked: Vec<usize> = Vec::new();
+        for &max_lits in &[30usize, 60, 120, 300, usize::MAX] {
+            ranked = (0..tm.n_clauses())
+                .filter(|&c| tm.clause_weight(class, c) > 0)
+                .filter(|&c| {
+                    let r = tm.clause_rule(c);
+                    r.iter().any(|&(_, neg)| !neg) && r.len() <= max_lits
+                })
+                .collect();
+            if ranked.len() >= 5 { break; }
+        }
         ranked.sort_by(|&a, &b| {
-            let pa = tm
-                .clause_rule(class, a)
-                .iter()
-                .filter(|&&(_, neg)| !neg)
-                .count();
-            let pb = tm
-                .clause_rule(class, b)
-                .iter()
-                .filter(|&&(_, neg)| !neg)
-                .count();
-            let ma = tm.clause_rule(class, a).iter().any(|&(f, neg)| {
-                !neg && meaningful_prefixes
-                    .iter()
-                    .any(|p| encoder.vocab_token(f).starts_with(p))
+            let wa = tm.clause_weight(class, a);
+            let wb = tm.clause_weight(class, b);
+            let la = tm.clause_rule(a).len();
+            let lb = tm.clause_rule(b).len();
+            let ma = tm.clause_rule(a).iter().any(|&(f, neg)| {
+                !neg && meaningful_prefixes.iter().any(|p| encoder.vocab_token(f).starts_with(p))
             });
-            let mb = tm.clause_rule(class, b).iter().any(|&(f, neg)| {
-                !neg && meaningful_prefixes
-                    .iter()
-                    .any(|p| encoder.vocab_token(f).starts_with(p))
+            let mb = tm.clause_rule(b).iter().any(|&(f, neg)| {
+                !neg && meaningful_prefixes.iter().any(|p| encoder.vocab_token(f).starts_with(p))
             });
-            pb.cmp(&pa)
-                .then(mb.cmp(&ma))
-                .then(tm.clause_weight(class, b).cmp(&tm.clause_weight(class, a)))
+            mb.cmp(&ma).then(wb.cmp(&wa)).then(la.cmp(&lb))
         });
+
         for (rank, &c) in ranked.iter().take(5).enumerate() {
-            let rule = tm.clause_rule(class, c);
+            let rule = tm.clause_rule(c);
             let w = tm.clause_weight(class, c);
             let pos: Vec<_> = rule.iter().filter(|&&(_, neg)| !neg).collect();
             let neg_count = rule.len() - pos.len();
-            let literals: Vec<String> = pos
-                .iter()
+            let tokens: Vec<String> = pos.iter()
                 .map(|&&(feat, _)| encoder.vocab_token(feat).to_string())
                 .collect();
-            let neg_suffix = if neg_count > 0 {
-                format!("  (+ {neg_count} NOT)")
-            } else {
-                String::new()
-            };
-            println!(
-                "  [{}] w={}  {}{}",
-                rank + 1,
-                w,
-                literals.join("  "),
-                neg_suffix
-            );
-        }
-    }
-
-    // Per-sample clause explanation.
-    // For each class: (a) pick the first correct test sample and show its top firing
-    // clauses by weight; (b) search all test samples of that class for the one whose
-    // best multi-literal (≥2 positive literals) firing clause has the most literals.
-    let firing_clauses = |class: usize, toks: &[String]| -> Vec<(i32, Vec<String>)> {
-        let token_set: HashSet<&str> = toks.iter().map(String::as_str).collect();
-        let mut out: Vec<(i32, Vec<String>)> = vec![];
-        for c in 0..tm.clauses_per_class() {
-            if !tm.clause_is_positive(c) {
-                continue;
-            }
-            let rule = tm.clause_rule(class, c);
-            if rule.is_empty() {
-                continue;
-            }
-            let fires = rule.iter().all(|&(feat, is_neg)| {
-                let present = token_set.contains(encoder.vocab_token(feat));
-                if is_neg {
-                    !present
+            let neg_sfx = if neg_count > 0 { format!(" (+ {neg_count} NOT)") } else { String::new() };
+            println!("  [{}] w={w}{neg_sfx}", rank + 1);
+            for tok in &tokens {
+                let note = explain_token(tok);
+                if note.is_empty() {
+                    println!("       {tok}");
                 } else {
-                    present
+                    println!("       {tok:<55}  ← {note}");
                 }
-            });
-            if fires {
-                let pos_lits: Vec<String> = rule
-                    .iter()
-                    .filter(|&&(_, neg)| !neg)
-                    .map(|&(f, _)| encoder.vocab_token(f).to_string())
-                    .collect();
-                if pos_lits.is_empty() {
-                    continue;
-                }
-                out.push((tm.clause_weight(class, c), pos_lits));
             }
         }
-        out.sort_by(|a, b| b.0.cmp(&a.0));
-        out
-    };
-
-    for (class, label) in [(1usize, "attack"), (0, "benign")] {
-        // Representative sample: first correct prediction for this class
-        let Some(idx) = test_y
-            .iter()
-            .enumerate()
-            .filter(|&(i, &y)| {
-                if y != class {
-                    return false;
-                }
-                let s = encoder.encode_one_categorical(&te_inner[i]);
-                tm.predict(&s) == class
-            })
-            .map(|(i, _)| i)
-            .next()
-        else {
-            continue;
-        };
-
-        let tokens: &[String] = test_tokens[idx];
-        let token_set: HashSet<&str> = tokens.iter().map(String::as_str).collect();
-        let sample = encoder.encode_one_categorical(&te_inner[idx]);
-        let pred = tm.predict(&sample);
-        let verdict = if pred == class { "correct" } else { "WRONG" };
-
-        println!(
-            "\n--- {} sample explanation (pred={}, {}) ---",
-            label, pred, verdict
-        );
-        let mut sorted_toks: Vec<&str> = token_set.iter().cloned().collect();
-        sorted_toks.sort();
-        println!("  tokens: {}", sorted_toks.join("  "));
-
-        let firing = firing_clauses(class, tokens);
-        if firing.is_empty() {
-            println!("  (no positive clauses fired)");
-        } else {
-            println!("  top firing clauses ({} total):", firing.len());
-            for (w, lits) in firing.iter().take(5) {
-                println!("    w={}  {}", w, lits.join("  "));
-            }
-        }
-
-        // Find the test sample (same class) whose best multi-literal firing clause
-        // has the most positive literals.
-        let best_multi = test_y
-            .iter()
-            .enumerate()
-            .filter(|&(_, &y)| y == class)
-            .filter_map(|(i, _)| {
-                firing_clauses(class, test_tokens[i])
-                    .into_iter()
-                    .filter(|(_, l)| l.len() >= 2)
-                    .max_by_key(|(_, l)| l.len())
-            })
-            .max_by_key(|(_, l)| l.len());
-
-        if let Some((w, lits)) = best_multi {
-            println!("  richest AND clause across all {} test samples:", label);
-            println!("    w={}  {}", w, lits.join("  "));
-        }
+        println!();
     }
+}
+
+fn explain_token(tok: &str) -> &'static str {
+    if tok.starts_with("event.id::1 ")  || tok == "event.id::1"  { return "Sysmon: process creation"; }
+    if tok.starts_with("event.id::3 ")  || tok == "event.id::3"  { return "Sysmon: network connection"; }
+    if tok.starts_with("event.id::7 ")  || tok == "event.id::7"  { return "Sysmon: image/DLL loaded"; }
+    if tok.starts_with("event.id::10")                           { return "Sysmon: process access (injection / cred dump)"; }
+    if tok.starts_with("event.id::11")                           { return "Sysmon: file created"; }
+    if tok.starts_with("event.id::12") || tok.starts_with("event.id::13") || tok.starts_with("event.id::14") {
+        return "Sysmon: registry create/set/delete";
+    }
+    if tok.starts_with("event.id::22")                           { return "Sysmon: DNS query"; }
+    if tok.starts_with("event.id::25")                           { return "Sysmon: process tampering"; }
+    if tok.starts_with("process.name::")                         { return "executing process binary"; }
+    if tok.starts_with("process.args::")                         { return "command-line argument token"; }
+    if tok.starts_with("process.parent.name::") || tok.starts_with("process.parent::") { return "parent process"; }
+    if tok.starts_with("target.process.name::")                  { return "victim process (accessed/injected)"; }
+    if tok.starts_with("source.process.name::")                  { return "accessor/injecting process"; }
+    if tok.starts_with("target.process.granted_access::")        { return "access rights requested (PROCESS_VM_READ etc.)"; }
+    if tok.starts_with("file.path::Temp") || tok.contains("::Temp") { return "staging in temp directory (common dropper)"; }
+    if tok.starts_with("file.path::System32")                    { return "system directory (legit or DLL hijack)"; }
+    if tok.starts_with("file.path::AppData")                     { return "user profile staging area"; }
+    if tok.starts_with("file.path::")                            { return "file location"; }
+    if tok.starts_with("file.name::")                            { return "file name"; }
+    if tok.starts_with("dll.name::")                             { return "DLL loaded"; }
+    if tok.starts_with("network.destination") || tok.starts_with("destination.") { return "outbound C2 / lateral target"; }
+    if tok.starts_with("dns.question::")                         { return "DNS lookup (C2 beacon / lateral)"; }
+    if tok.starts_with("registry.")                              { return "registry operation"; }
+    if tok.contains("::lsass")                                   { return "LSASS — credential store (high value target)"; }
+    if tok.contains("::mimikatz") || tok.contains("::mimi")      { return "Mimikatz credential dumper"; }
+    if tok.contains("::powershell") || tok.contains("::psh")     { return "PowerShell execution"; }
+    if tok.contains("::cmd.exe")                                 { return "Command prompt execution"; }
+    if tok.contains("::rundll32")                                { return "LOLBin: runs arbitrary DLLs"; }
+    if tok.contains("::regsvr32")                                { return "LOLBin: runs COM/SCT payloads"; }
+    if tok.contains("::mshta")                                   { return "LOLBin: runs HTML/VBS/JS"; }
+    if tok.contains("::wmic")                                    { return "WMI execution / lateral movement"; }
+    if tok.contains("::schtasks") || tok.contains("::at.exe")    { return "scheduled task (persistence)"; }
+    if tok.contains("::net.exe") || tok.contains("::net1.exe")   { return "domain/user enumeration"; }
+    if tok.contains("Signature::Microsoft Windows")              { return "Microsoft-signed binary (very common — not specific)"; }
+    if tok.contains("code_signature.status::Valid")              { return "valid code signature (most legit processes)"; }
+    if tok.contains("UserID::S-1-5-18")                         { return "SYSTEM account"; }
+    if tok.contains("UserID::S-1-5-19") || tok.contains("UserID::S-1-5-20") { return "LOCAL/NETWORK SERVICE account"; }
+    ""
 }
