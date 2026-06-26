@@ -83,122 +83,419 @@ pub fn explain_token(tok: &str) -> &'static str {
 
 pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
     match eid {
-        // EID 8 — CreateRemoteThread: classic process injection technique.
+        // ── EID 1 — ProcessCreate ────────────────────────────────────────────────
+        1 => {
+            let image   = basename(v["Image"].as_str().unwrap_or("")).to_lowercase();
+            let parent  = basename(v["ParentImage"].as_str().unwrap_or("")).to_lowercase();
+            let cmdline = v["CommandLine"].as_str().unwrap_or("").to_lowercase();
+            let img_path = v["Image"].as_str().unwrap_or("").to_lowercase();
+
+            // Known offensive tools — never legitimately present.
+            let attack_tool = matches!(image.as_str(),
+                "mimikatz.exe" | "rubeus.exe" | "sharpdpapi.exe" | "sharpdump.exe"
+                | "procdump.exe" | "procdump64.exe" | "wce.exe" | "fgdump.exe"
+                | "psexec.exe" | "psexec64.exe" | "psexesvc.exe" | "paexec.exe"
+                | "sharpview.exe" | "seatbelt.exe" | "bloodhound.exe" | "sharphound.exe"
+                | "ncat.exe" | "nc.exe" | "covenantgruntstager.exe"
+                | "lazagne.exe" | "pwdump.exe" | "pwdump6.exe" | "pwdump7.exe"
+                | "gsecdump.exe" | "cachedump.exe" | "winhex.exe"
+                | "adfind.exe" | "adrecon.exe" | "ldapdomaindump.exe"
+                | "kerbrute.exe" | "kekeo.exe" | "safetykatz.exe" | "sharpkatz.exe"
+                | "nanodump.exe" | "dumpert.exe" | "handlekatz.exe"
+                | "crackmapexec.exe" | "impacket-secretsdump.exe"
+                | "invoke-mimikatz.exe" | "invoke-ninjacopy.exe"
+                | "sharpchisel.exe" | "chisel.exe" | "ligolo.exe" | "rpivot.exe"
+                | "cobaltstrike.exe" | "beacon.exe" | "brute_ratel.exe" | "nighthawk.exe"
+                | "accesschk.exe" | "accesschk64.exe"
+            );
+
+            // Office macro → scripting host (T1566 phishing / T1059).
+            let office_to_script = matches!(parent.as_str(),
+                "winword.exe" | "excel.exe" | "powerpnt.exe" | "outlook.exe"
+                | "onenote.exe" | "msaccess.exe" | "mspub.exe" | "visio.exe"
+                | "eqnedt32.exe"
+            ) && matches!(image.as_str(),
+                "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe"
+                | "mshta.exe" | "regsvr32.exe" | "rundll32.exe" | "certutil.exe"
+                | "bitsadmin.exe" | "curl.exe" | "wget.exe" | "msiexec.exe"
+                | "installutil.exe" | "msbuild.exe"
+            );
+
+            // LOLBin parent → scripting child (living-off-the-land chains).
+            let lolbin_to_script = matches!(parent.as_str(),
+                "msbuild.exe" | "installutil.exe" | "regasm.exe" | "regsvcs.exe"
+                | "ieexec.exe" | "cmstp.exe" | "odbcconf.exe" | "xwizard.exe"
+                | "dnscmd.exe" | "esentutl.exe" | "certutil.exe" | "bitsadmin.exe"
+                | "msiexec.exe" | "regsvr32.exe" | "mshta.exe" | "wmic.exe"
+                | "hh.exe" | "pcalua.exe" | "syncappvpublishingserver.exe"
+                | "appsyncpublishingserver.exe" | "presentationhost.exe"
+                | "diskshadow.exe" | "msconfig.exe" | "wab.exe" | "extrac32.exe"
+            ) && matches!(image.as_str(),
+                "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe"
+                | "mshta.exe" | "regsvr32.exe" | "rundll32.exe"
+            );
+
+            // Scripting host → recon/discovery (T1087/T1069/T1016/T1057/T1083).
+            let script_to_recon = matches!(parent.as_str(),
+                "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe" | "mshta.exe"
+            ) && matches!(image.as_str(),
+                "whoami.exe" | "net.exe" | "net1.exe" | "nltest.exe" | "ipconfig.exe"
+                | "systeminfo.exe" | "tasklist.exe" | "arp.exe" | "nslookup.exe"
+                | "ping.exe" | "netstat.exe" | "query.exe" | "dsquery.exe" | "dsget.exe"
+                | "gpresult.exe" | "reg.exe" | "sc.exe" | "wmic.exe" | "schtasks.exe"
+                | "at.exe" | "attrib.exe" | "dir.exe" | "tree.exe"
+                | "nbtscan.exe" | "nmap.exe" | "masscan.exe" | "fsutil.exe"
+                | "auditpol.exe" | "bcdedit.exe" | "dnscmd.exe"
+                | "wevtutil.exe" | "vssadmin.exe" | "diskshadow.exe"
+            );
+
+            // System process → shell (injection artifact / process hollowing).
+            let system_spawns_shell = matches!(parent.as_str(),
+                "lsass.exe" | "spoolsv.exe" | "winlogon.exe" | "dllhost.exe"
+                | "taskhost.exe" | "taskhostw.exe" | "userinit.exe"
+            ) && matches!(image.as_str(),
+                "cmd.exe" | "powershell.exe" | "wscript.exe" | "cscript.exe"
+                | "mshta.exe" | "rundll32.exe" | "regsvr32.exe"
+            );
+
+            // Encoded / obfuscated PowerShell (T1059.001 / T1027).
+            let encoded_ps = image == "powershell.exe"
+                && (cmdline.contains("-encodedcommand")
+                    || cmdline.contains(" -enc ")
+                    || cmdline.contains(" -ec ")
+                    || cmdline.contains("-nop")
+                    || cmdline.contains("-bypass")
+                    || cmdline.contains("hidden")
+                    || cmdline.contains("iex(")
+                    || cmdline.contains("iex (")
+                    || cmdline.contains("invoke-expression")
+                    || cmdline.contains("downloadstring")
+                    || cmdline.contains("net.webclient")
+                    || cmdline.contains("bitstransfer")
+                    || cmdline.contains("start-bitstransfer")
+                    || cmdline.contains("webclient")
+                    || cmdline.contains("frombase64string"));
+
+            // Certutil used as downloader/decoder (T1140 / T1105).
+            let certutil_abuse = image == "certutil.exe"
+                && (cmdline.contains("-decode")
+                    || cmdline.contains("-decodehex")
+                    || cmdline.contains("-urlcache")
+                    || cmdline.contains("-verifyctl")
+                    || cmdline.contains("http"));
+
+            // Wscript/cscript running a file from a staging path.
+            let script_from_staging = matches!(image.as_str(), "wscript.exe" | "cscript.exe")
+                && (cmdline.contains("\\temp\\")
+                    || cmdline.contains("\\appdata\\")
+                    || cmdline.contains("\\public\\")
+                    || cmdline.contains("\\programdata\\")
+                    || cmdline.contains("\\downloads\\"));
+
+            // Executable launched directly from a staging/writable path.
+            let staged_exec = img_path.ends_with(".exe")
+                && (img_path.contains("\\temp\\")
+                    || img_path.contains("\\appdata\\local\\temp")
+                    || img_path.contains("\\users\\public\\")
+                    || img_path.contains("\\programdata\\")
+                    || img_path.contains("\\downloads\\"));
+
+            attack_tool
+                || office_to_script
+                || lolbin_to_script
+                || script_to_recon
+                || system_spawns_shell
+                || encoded_ps
+                || certutil_abuse
+                || script_from_staging
+                || staged_exec
+        }
+
+        // ── EID 2 — FileCreationTimeChanged: timestomping (T1070.006) ───────────
+        // Any timestamp manipulation is an anti-forensic indicator.
+        2 => true,
+
+        // ── EID 3 — NetworkConnect ───────────────────────────────────────────────
+        3 => {
+            let image = basename(v["Image"].as_str().unwrap_or("")).to_lowercase();
+            let initiated = v["Initiated"].as_str().unwrap_or("") == "true";
+            let dest_port: u16 = v["DestinationPort"].as_str().unwrap_or("0")
+                .parse().unwrap_or(0);
+            let dest_ip = v["DestinationIp"].as_str().unwrap_or("");
+
+            // LOLBins making outbound connections — staging / C2 (T1105 / T1071).
+            let lolbin = matches!(image.as_str(),
+                "mshta.exe" | "regsvr32.exe" | "wscript.exe" | "cscript.exe"
+                | "certutil.exe" | "bitsadmin.exe" | "wmic.exe" | "rundll32.exe"
+                | "odbcconf.exe" | "cmstp.exe" | "msbuild.exe" | "installutil.exe"
+                | "regasm.exe" | "regsvcs.exe" | "ieexec.exe" | "xwizard.exe"
+                | "dnscmd.exe" | "msiexec.exe" | "esentutl.exe" | "expand.exe"
+                | "extrac32.exe" | "hh.exe" | "makecab.exe" | "msdt.exe"
+                | "pcalua.exe" | "rpcping.exe" | "verclsid.exe" | "wab.exe"
+                | "wusa.exe" | "presentationhost.exe" | "diskshadow.exe"
+                | "bash.exe" | "forfiles.exe" | "appvlp.exe"
+            );
+
+            // PowerShell / cmd making non-standard-port outbound (C2 beaconing).
+            let ps_nonstandard = initiated
+                && matches!(image.as_str(), "powershell.exe" | "cmd.exe")
+                && !matches!(dest_port, 80 | 443 | 8080 | 8443 | 53 | 25 | 587 | 465);
+
+            // Any scripting host connecting to internal IPs (lateral movement staging).
+            let internal_lateral = initiated
+                && matches!(image.as_str(),
+                    "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe"
+                    | "mshta.exe" | "python.exe")
+                && (dest_ip.starts_with("10.")
+                    || dest_ip.starts_with("172.16.") || dest_ip.starts_with("172.17.")
+                    || dest_ip.starts_with("172.18.") || dest_ip.starts_with("172.19.")
+                    || dest_ip.starts_with("172.2")   || dest_ip.starts_with("172.3")
+                    || dest_ip.starts_with("192.168."));
+
+            (lolbin && initiated) || ps_nonstandard || internal_lateral
+        }
+
+        // ── EID 6 — DriverLoad: BYOVD / unsigned driver (T1068 / T1014) ─────────
+        6 => {
+            let img = v["ImageLoaded"].as_str().unwrap_or("").to_lowercase();
+            let sig_status = v["SignatureStatus"].as_str().unwrap_or("");
+            let signed = v["Signed"].as_str().unwrap_or("false");
+
+            // Known BYOVD (Bring Your Own Vulnerable Driver) names.
+            let byovd = img.contains("dbutil_2_3") || img.contains("mhyprot2")
+                || img.contains("gdrv.sys") || img.contains("asmmap")
+                || img.contains("rtcore64") || img.contains("zamguard")
+                || img.contains("ene_io")   || img.contains("physmem")
+                || img.contains("wfp_test") || img.contains("procexp");
+
+            // Unsigned driver or loaded from writable path (staging rootkit).
+            let unsigned = signed == "false" || sig_status != "Valid";
+            let suspicious_path = img.contains("\\temp\\")
+                || img.contains("\\appdata\\") || img.contains("\\users\\public\\")
+                || img.contains("\\programdata\\") || img.contains("\\downloads\\");
+
+            byovd || (unsigned && suspicious_path)
+        }
+
+        // ── EID 7 — ImageLoad: DLL side-loading / hijacking (T1574) ─────────────
+        7 => {
+            let img = v["ImageLoaded"].as_str().unwrap_or("").to_lowercase();
+            let sig_status = v["SignatureStatus"].as_str().unwrap_or("");
+            let signed = v["Signed"].as_str().unwrap_or("false");
+            let process = basename(v["Image"].as_str().unwrap_or("")).to_lowercase();
+
+            // Known attack / reflective-injection DLL names.
+            let known_bad = img.contains("mimilib") || img.contains("kiwi.dll")
+                || img.contains("sekurlsa")  || img.contains("wceaux.dll")
+                || img.contains("reflective") || img.contains("payload.dll")
+                || img.contains("beacon.dll") || img.contains("inject.dll")
+                || img.contains("cobaltstrike");
+
+            // DLL loaded from a staging / writable path (side-load / dropper).
+            let staged_dll = (img.ends_with(".dll") || img.ends_with(".ocx"))
+                && (img.contains("\\temp\\")
+                    || img.contains("\\appdata\\local\\temp")
+                    || img.contains("\\users\\public\\")
+                    || img.contains("\\programdata\\")
+                    || img.contains("\\downloads\\"));
+
+            // Unsigned DLL loaded into a high-value process.
+            let unsigned_in_sensitive = (signed == "false" || sig_status != "Valid")
+                && matches!(process.as_str(),
+                    "lsass.exe" | "winlogon.exe" | "csrss.exe" | "wininit.exe"
+                    | "services.exe" | "svchost.exe");
+
+            known_bad || staged_dll || unsigned_in_sensitive
+        }
+
+        // ── EID 8 — CreateRemoteThread: process injection (T1055) ────────────────
         8 => true,
 
-        // EID 9 — RawAccessRead: direct disk read bypassing the filesystem,
-        // used for credential theft (NTDS.dit, SAM) and volume shadow copy abuse.
+        // ── EID 9 — RawAccessRead: credential/volume-shadow theft (T1003) ────────
         9 => true,
 
-        // EID 10 — ProcessAccess: check both target process and access rights.
-        // Memory read/write/dup-handle on credential-store processes = credential dump.
+        // ── EID 10 — ProcessAccess: credential dump / token theft ────────────────
         10 => {
             let target = basename(v["TargetImage"].as_str().unwrap_or("")).to_lowercase();
             let access_str = v["GrantedAccess"].as_str().unwrap_or("0x0");
             let access = u64::from_str_radix(access_str.trim_start_matches("0x"), 16)
                 .unwrap_or(0);
-            let sensitive_target = matches!(
-                target.as_str(),
-                "lsass.exe" | "winlogon.exe" | "csrss.exe" | "wininit.exe" | "services.exe"
+
+            // Any access to lsass is suspicious (T1003.001).
+            if target == "lsass.exe" { return true; }
+
+            // Memory-read/write/dup-handle on other credential-store processes.
+            let sensitive_target = matches!(target.as_str(),
+                "winlogon.exe" | "csrss.exe" | "wininit.exe" | "services.exe"
+                | "explorer.exe" | "svchost.exe" | "spoolsv.exe"
+                | "taskhost.exe" | "taskhostw.exe" | "vaultcvc.exe"
+                | "msmpeng.exe" | "msseces.exe"
             );
-            // VM_READ(0x10) | VM_WRITE(0x20) | PROCESS_DUP_HANDLE(0x40)
-            // or any full-access mask
+            // VM_READ(0x10)|VM_WRITE(0x20)|DUP_HANDLE(0x40) or broad PROCESS_ALL_ACCESS
             let suspicious_access = access & 0x70 != 0 || access >= 0x1f0000;
+
             sensitive_target && suspicious_access
         }
 
-        // EID 11 — FileCreate: executable dropped in a staging location by a
-        // scripting host (T1059 Command and Scripting Interpreter).
+        // ── EID 11 — FileCreate: dropper / payload staging ───────────────────────
         11 => {
             let fname = v["TargetFilename"].as_str().unwrap_or("").to_lowercase();
             let image = basename(v["Image"].as_str().unwrap_or("")).to_lowercase();
-            let scripting = matches!(
-                image.as_str(),
+
+            // Broader set of scripting / LOLBin writers.
+            let scripting = matches!(image.as_str(),
                 "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe"
-                    | "mshta.exe" | "python.exe" | "wmic.exe"
+                | "mshta.exe" | "python.exe" | "wmic.exe" | "regsvr32.exe"
+                | "rundll32.exe" | "msbuild.exe" | "cmstp.exe" | "certutil.exe"
+                | "bitsadmin.exe" | "excel.exe" | "winword.exe" | "outlook.exe"
+                | "onenote.exe" | "msaccess.exe" | "curl.exe" | "expand.exe"
             );
+
             let staging = fname.contains("\\temp\\")
                 || fname.contains("\\appdata\\local\\temp")
+                || fname.contains("\\appdata\\roaming\\")
                 || fname.contains("\\public\\")
-                || fname.contains("\\programdata\\");
-            let executable = fname.ends_with(".exe")
-                || fname.ends_with(".dll")
-                || fname.ends_with(".ps1")
-                || fname.ends_with(".bat")
-                || fname.ends_with(".vbs")
-                || fname.ends_with(".js");
-            scripting && (staging || executable)
+                || fname.contains("\\programdata\\")
+                || fname.contains("\\downloads\\")
+                || fname.contains("\\users\\default\\");
+
+            // Executable / script extensions (T1027, T1105).
+            let executable = fname.ends_with(".exe") || fname.ends_with(".dll")
+                || fname.ends_with(".ps1")  || fname.ends_with(".bat")
+                || fname.ends_with(".vbs")  || fname.ends_with(".js")
+                || fname.ends_with(".hta")  || fname.ends_with(".jse")
+                || fname.ends_with(".wsf")  || fname.ends_with(".vbe")
+                || fname.ends_with(".scr")  || fname.ends_with(".pif")
+                || fname.ends_with(".cpl")  || fname.ends_with(".inf")
+                || fname.ends_with(".sys")  || fname.ends_with(".ocx")
+                || fname.ends_with(".xll"); // Excel add-in
+
+            // Memory-dump artefacts (credential theft).
+            let dump = (fname.ends_with(".dmp") || fname.ends_with(".mdmp"))
+                || (fname.ends_with(".bin")
+                    && (fname.contains("lsass") || fname.contains("ntds") || fname.contains("sam")));
+
+            scripting && (staging || executable) || dump
         }
 
-        // EID 12/13 — RegistryEvent: writes to persistence or defense-evasion keys.
+        // ── EID 12/13 — RegistryEvent: persistence / defence-evasion keys ────────
         12 | 13 => {
             let obj = v["TargetObject"].as_str().unwrap_or("").to_lowercase();
             obj.contains("\\run\\")
                 || obj.contains("\\runonce\\")
+                || obj.contains("\\runonceex\\")
                 || obj.contains("userinitmprlogonscript")
                 || obj.contains("\\currentversion\\winlogon")
                 || obj.contains("\\currentversion\\windows\\load")
                 || obj.contains("\\policies\\explorer\\run")
                 || obj.contains("\\securityproviders\\")
-                || obj.contains("minint")   // MinInt key disables event logging
+                || obj.contains("minint")
                 || (obj.contains("\\services\\") && obj.contains("\\start"))
                 || (obj.contains("\\eventlog\\") && obj.contains("\\start"))
+                || obj.contains("\\image file execution options\\") // debugger hijack T1546.012
+                || obj.contains("\\appcompatflags\\")               // shim T1546.011
+                || obj.contains("\\lsa\\")                          // LSA provider T1547.002
+                || obj.contains("\\safeboot\\")                     // safeboot bypass T1562
+                || obj.contains("\\sessionmanager\\")               // boot-execute T1547.006
+                || obj.contains("\\bootexecute")
+                || obj.contains("\\knowndlls\\")                    // DLL hijack T1574.001
+                || obj.contains("\\command processor\\autorun")     // cmd.exe autorun
+                || obj.contains("\\active setup\\")                 // active setup T1547.014
+                || obj.contains("\\browser helper objects\\")       // BHO T1176
+                || obj.contains("userinit")
+                || obj.contains("\\netsh\\")                        // netsh helper T1546.007
+                || obj.contains("\\print\\monitors\\")              // print monitor T1547.010
+                || obj.contains("\\print\\providers\\")
+                || obj.contains("\\terminal server\\")              // RDP backdoor
+                || obj.contains("\\wbem\\")                         // WMI persistence T1546.003
+                || obj.contains("\\environment\\comspec")           // ComSpec hijack
+                || obj.contains("\\policies\\system\\enablelua")    // UAC bypass
+                || obj.contains("\\disableantispy")
+                || obj.contains("\\audit\\")                        // audit policy tampering
         }
 
-        // EID 3 — NetworkConnect: outbound from LOLBins used for C2 staging.
-        3 => {
+        // ── EID 14 — RegistryKeyValueRename: hiding persistence keys ─────────────
+        14 => true,
+
+        // ── EID 15 — FileCreateStreamHash: ADS (alternate data stream) ───────────
+        // Zone.Identifier is benign (MOTW); anything else = hidden payload T1564.004.
+        15 => {
+            let fname = v["TargetFilename"].as_str().unwrap_or("").to_lowercase();
+            !fname.ends_with(":zone.identifier")
+        }
+
+        // ── EID 16 — Sysmon config change: defence evasion (T1562.001) ───────────
+        16 => true,
+
+        // ── EID 17/18 — PipeEvent: C2 named-pipe comms (T1071 / T1559) ───────────
+        17 | 18 => {
+            let pipe = v["PipeName"].as_str().unwrap_or("").to_lowercase();
             let image = basename(v["Image"].as_str().unwrap_or("")).to_lowercase();
-            let initiated = v["Initiated"].as_str().unwrap_or("") == "true";
-            let lolbin = matches!(
-                image.as_str(),
-                "mshta.exe" | "regsvr32.exe" | "wscript.exe" | "cscript.exe"
-                    | "certutil.exe" | "bitsadmin.exe" | "wmic.exe" | "rundll32.exe"
-                    | "odbcconf.exe" | "cmstp.exe"
-            );
-            lolbin && initiated
+
+            // Known Cobalt Strike / Metasploit / Covenant pipe patterns.
+            let known_c2_pipe = pipe.contains("postex_")  || pipe.contains("msse-")
+                || pipe.contains("status_")   || pipe.contains("msagent_")
+                || pipe.contains("ntsvcs-")   || pipe.contains("46a9e56")
+                || pipe.contains("583da945")  || pipe.contains("wkssvc-")
+                || pipe.contains("isapi_")    || pipe.contains("dce_pipe")
+                || pipe.contains("gruntstager") || pipe.contains("interprocess_")
+                || pipe.contains("atctl")     || pipe.contains("gecko_channel");
+
+            // Pipe created by a scripting / LOLBin process.
+            let suspicious_creator = matches!(image.as_str(),
+                "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe"
+                | "mshta.exe" | "rundll32.exe" | "regsvr32.exe" | "msbuild.exe");
+
+            known_c2_pipe || suspicious_creator
         }
 
-        // EID 1 — ProcessCreate: suspicious parent→child chains.
-        1 => {
-            let image = basename(v["Image"].as_str().unwrap_or("")).to_lowercase();
-            let parent = basename(v["ParentImage"].as_str().unwrap_or("")).to_lowercase();
-
-            // Dedicated offensive tools — never legitimately present.
-            let attack_tool = matches!(
-                image.as_str(),
-                "mimikatz.exe" | "rubeus.exe" | "sharpdpapi.exe" | "sharpdump.exe"
-                    | "procdump.exe" | "procdump64.exe" | "wce.exe" | "fgdump.exe"
-                    | "psexec.exe" | "psexec64.exe" | "psexesvc.exe" | "paexec.exe"
-                    | "sharpview.exe" | "seatbelt.exe" | "bloodhound.exe" | "sharphound.exe"
-                    | "ncat.exe" | "covenantgruntstager.exe"
-            );
-
-            // Office macro → scripting host (T1566 Phishing / T1059).
-            let office_to_script = matches!(
-                parent.as_str(),
-                "winword.exe" | "excel.exe" | "powerpnt.exe" | "outlook.exe" | "onenote.exe"
-            ) && matches!(
-                image.as_str(),
-                "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe"
-                    | "mshta.exe" | "regsvr32.exe" | "rundll32.exe"
-            );
-
-            // Scripting host → recon tools (T1087/T1069/T1016 Discovery).
-            let script_to_recon = matches!(
-                parent.as_str(),
-                "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe"
-            ) && matches!(
-                image.as_str(),
-                "whoami.exe" | "net.exe" | "net1.exe" | "nltest.exe" | "ipconfig.exe"
-                    | "systeminfo.exe" | "tasklist.exe" | "arp.exe" | "nslookup.exe"
-                    | "ping.exe" | "netstat.exe" | "query.exe" | "dsquery.exe"
-            );
-
-            attack_tool || office_to_script || script_to_recon
-        }
-
-        // EID 19/20/21 — WMI event subscription: persistence / lateral movement.
+        // ── EID 19/20/21 — WMI event subscriptions: persistence / LM ─────────────
         19 | 20 | 21 => true,
+
+        // ── EID 22 — DNSEvent: C2 beaconing / DNS tunnelling (T1071.004) ─────────
+        22 => {
+            let query = v["QueryName"].as_str().unwrap_or("").to_lowercase();
+            let image = basename(v["Image"].as_str().unwrap_or("")).to_lowercase();
+
+            // LOLBins or scripting hosts making DNS queries.
+            let suspicious_process = matches!(image.as_str(),
+                "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe"
+                | "mshta.exe" | "rundll32.exe" | "regsvr32.exe" | "certutil.exe"
+                | "bitsadmin.exe" | "wmic.exe" | "msbuild.exe" | "installutil.exe"
+            );
+
+            // Very long subdomain label or overall query → DNS tunnelling.
+            let dns_tunnel = query.len() > 60
+                || query.split('.').any(|part| part.len() > 40);
+
+            suspicious_process || dns_tunnel
+        }
+
+        // ── EID 23/26 — FileDelete: evidence destruction (T1070.004) ─────────────
+        23 | 26 => {
+            let fname = v["TargetFilename"].as_str().unwrap_or("").to_lowercase();
+            let image = basename(v["Image"].as_str().unwrap_or("")).to_lowercase();
+
+            // Event-log deletion (T1070.001).
+            let log_delete = fname.contains("\\winevt\\")
+                || fname.contains("\\windows\\logs\\")
+                || fname.ends_with(".evtx");
+
+            // Prefetch deletion (anti-forensics).
+            let prefetch = fname.contains("\\prefetch\\") && fname.ends_with(".pf");
+
+            // Scripting host deleting executables or dumps (cleanup).
+            let scripted = matches!(image.as_str(),
+                "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe")
+                && (fname.ends_with(".exe") || fname.ends_with(".dll")
+                    || fname.ends_with(".dmp") || fname.ends_with(".evtx")
+                    || fname.ends_with(".ps1") || fname.ends_with(".bat"));
+
+            log_delete || prefetch || scripted
+        }
+
+        // ── EID 25 — ProcessTampering: hollowing / herpaderping (T1055) ──────────
+        25 => true,
 
         _ => false,
     }
