@@ -493,7 +493,7 @@ fn main() {
 
     // CoalescedTsetlinMachine: n_clauses shared across all classes.
     let mut tm = CoalescedTsetlinMachine::with_config(
-        n_tactics, encoder.n_features(), 40, 50, 5.0, 8, true, 42,
+        n_tactics, encoder.n_features(), 256, 50, 5.0, 8, true, 42,
     );
     let mut shuffle_rng = Rng::new(0xDEAD_BEEF);
 
