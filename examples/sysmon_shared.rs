@@ -200,6 +200,108 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                     || img_path.contains("\\programdata\\")
                     || img_path.contains("\\downloads\\"));
 
+            // T1548.002 UAC bypass binaries — auto-elevate without prompt.
+            // These are abused to spawn a high-integrity shell without a UAC dialog.
+            let uac_bypass = matches!(image.as_str(),
+                "fodhelper.exe" | "eventvwr.exe" | "sdclt.exe" | "wsreset.exe"
+                | "computerdefaults.exe" | "slui.exe" | "cmstp.exe" | "dccw.exe"
+                | "mavinject.exe"  // T1218.013 — injects DLL into running process
+            );
+
+            // T1562.001 Impair Defenses — disable AV/EDR via service or cmdline.
+            let impair_defenses =
+                // sc.exe stop/delete on known security service names
+                (image == "sc.exe" && (
+                    cmdline.contains("windefend") || cmdline.contains("wdnissvc")
+                    || cmdline.contains("sense")   || cmdline.contains("msseces")
+                    || cmdline.contains("sfc")      || cmdline.contains("wscsvc")
+                    || cmdline.contains("securityhealthservice")
+                    || (cmdline.contains("stop") || cmdline.contains("delete"))))
+                // taskkill targeting AV/EDR processes
+                || (image == "taskkill.exe" && (
+                    cmdline.contains("msmpeng") || cmdline.contains("msseces")
+                    || cmdline.contains("mbam")   || cmdline.contains("avp.exe")
+                    || cmdline.contains("avgnt")  || cmdline.contains("eav_trial")))
+                // PowerShell disabling Windows Defender real-time protection
+                || (image == "powershell.exe" && (
+                    cmdline.contains("set-mppreference")
+                    || cmdline.contains("disablerealtimemonitoring")
+                    || cmdline.contains("disablebehaviormonitoring")
+                    || cmdline.contains("disableioavprotection")
+                    || cmdline.contains("add-mppreference -exclusion")))
+                // auditpol clearing audit policy (T1562.002)
+                || (image == "auditpol.exe" && (
+                    cmdline.contains("/set") && (
+                        cmdline.contains("success:disable")
+                        || cmdline.contains("failure:disable")
+                        || cmdline.contains("/clear"))));
+
+            // T1070.001 Clear Windows Event Logs — remove forensic evidence.
+            let clear_logs =
+                (image == "wevtutil.exe" && (
+                    cmdline.contains(" cl ") || cmdline.contains(" clear-log ")
+                    || cmdline.contains(" sl ") || cmdline.contains("/ms:0")))
+                || (image == "powershell.exe" && cmdline.contains("clear-eventlog"))
+                || (image == "powershell.exe" && cmdline.contains("remove-eventlog"))
+                || (image == "cmd.exe" && cmdline.contains("wevtutil") && cmdline.contains("cl "));
+
+            // T1490 Inhibit System Recovery — delete backups/shadow copies pre-ransomware.
+            let inhibit_recovery =
+                (image == "vssadmin.exe" && (
+                    cmdline.contains("delete") || cmdline.contains("shadows")))
+                || (image == "bcdedit.exe" && (
+                    cmdline.contains("recoveryenabled") || cmdline.contains("no")
+                    || cmdline.contains("bootstatuspolicy")
+                    || cmdline.contains("ignoreallfailures")))
+                || (image == "wbadmin.exe" && (
+                    cmdline.contains("delete") || cmdline.contains("catalog")
+                    || cmdline.contains("systemstatebackup")))
+                || (image == "powershell.exe" && (
+                    cmdline.contains("get-wmiobject win32_shadowcopy")
+                    || cmdline.contains(".delete()")));
+
+            // T1136.001 Create Local Account — add a backdoor user.
+            let create_account = (image == "net.exe" || image == "net1.exe")
+                && cmdline.contains("user")
+                && cmdline.contains("/add");
+
+            // T1543.003 Create/Modify Windows Service with a suspicious binary path.
+            let malicious_service = image == "sc.exe"
+                && cmdline.contains("create")
+                && (cmdline.contains("\\temp\\") || cmdline.contains("\\appdata\\")
+                    || cmdline.contains("\\public\\") || cmdline.contains("\\programdata\\")
+                    || cmdline.contains("\\users\\") || cmdline.contains("cmd.exe")
+                    || cmdline.contains("powershell") || cmdline.contains("rundll32"));
+
+            // T1053.005 Scheduled Task with attack payload in /tr argument.
+            let schtask_attack = image == "schtasks.exe"
+                && cmdline.contains("/create")
+                && (cmdline.contains("powershell") || cmdline.contains("cmd.exe")
+                    || cmdline.contains("wscript")  || cmdline.contains("cscript")
+                    || cmdline.contains("mshta")    || cmdline.contains("regsvr32")
+                    || cmdline.contains("rundll32") || cmdline.contains("\\temp\\")
+                    || cmdline.contains("\\appdata\\") || cmdline.contains("encodedcommand")
+                    || cmdline.contains("http"));
+
+            // T1021.006 WinRM lateral movement — wsmprovhost spawns arbitrary commands.
+            let winrm_exec = parent == "wsmprovhost.exe"
+                && matches!(image.as_str(),
+                    "cmd.exe" | "powershell.exe" | "net.exe" | "whoami.exe"
+                    | "ipconfig.exe" | "systeminfo.exe" | "tasklist.exe");
+
+            // T1059.004 Unix shell via WSL / bash (T1202 Indirect Command Execution).
+            let wsl_exec = matches!(image.as_str(), "wsl.exe" | "bash.exe")
+                && !cmdline.is_empty()
+                && (cmdline.contains("-c ") || cmdline.contains("curl")
+                    || cmdline.contains("wget") || cmdline.contains("python")
+                    || cmdline.contains("nc ") || cmdline.contains("ncat"));
+
+            // T1003.002/T1003.003 reg.exe dumping credential hive files.
+            let reg_dump = image == "reg.exe"
+                && cmdline.contains("save")
+                && (cmdline.contains("sam") || cmdline.contains("system")
+                    || cmdline.contains("security") || cmdline.contains("ntds"));
+
             attack_tool
                 || office_to_script
                 || lolbin_to_script
@@ -209,6 +311,16 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                 || certutil_abuse
                 || script_from_staging
                 || staged_exec
+                || uac_bypass
+                || impair_defenses
+                || clear_logs
+                || inhibit_recovery
+                || create_account
+                || malicious_service
+                || schtask_attack
+                || winrm_exec
+                || wsl_exec
+                || reg_dump
         }
 
         // ── EID 2 — FileCreationTimeChanged: timestomping (T1070.006) ───────────
@@ -252,7 +364,23 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                     || dest_ip.starts_with("172.2")   || dest_ip.starts_with("172.3")
                     || dest_ip.starts_with("192.168."));
 
+            // T1021.001 RDP — unexpected process connecting on 3389 (T1021.001).
+            let rdp_nonstandard = initiated && dest_port == 3389
+                && !matches!(image.as_str(), "mstsc.exe" | "msrdcw.exe");
+
+            // T1021.002 SMB lateral movement — scripting host on port 445 (T1021.002).
+            let smb_lateral = initiated && dest_port == 445
+                && matches!(image.as_str(),
+                    "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe"
+                    | "mshta.exe" | "python.exe" | "wmic.exe");
+
+            // T1021.006 WinRM — unexpected process on WinRM ports 5985/5986.
+            let winrm_lateral = initiated
+                && matches!(dest_port, 5985 | 5986)
+                && !matches!(image.as_str(), "wsmprovhost.exe" | "winrm.cmd");
+
             (lolbin && initiated) || ps_nonstandard || internal_lateral
+                || rdp_nonstandard || smb_lateral || winrm_lateral
         }
 
         // ── EID 6 — DriverLoad: BYOVD / unsigned driver (T1068 / T1014) ─────────
@@ -412,6 +540,29 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                 || obj.contains("\\policies\\system\\enablelua")    // UAC bypass
                 || obj.contains("\\disableantispy")
                 || obj.contains("\\audit\\")                        // audit policy tampering
+                // T1548.002 UAC bypass via registry hijack
+                || obj.contains("\\software\\classes\\ms-settings\\") // fodhelper UAC bypass
+                || obj.contains("\\software\\classes\\mscfile\\")      // eventvwr UAC bypass
+                || obj.contains("\\software\\classes\\exefile\\")      // file association hijack
+                || obj.contains("\\software\\classes\\clsid\\")        // COM hijack T1546.015
+                // T1562.001 Disable Windows Defender via registry
+                || obj.contains("\\windows defender\\")
+                || obj.contains("\\disablerealtimemonitoring")
+                || obj.contains("\\disablebehaviormonitoring")
+                || obj.contains("\\disableioavprotection")
+                || obj.contains("\\disableantispyware")
+                // T1543.003 Service binary path → staging location
+                || (obj.contains("\\services\\") && obj.contains("imagepath")
+                    && {
+                        let detail = v["Details"].as_str().unwrap_or("").to_lowercase();
+                        detail.contains("\\temp\\") || detail.contains("\\appdata\\")
+                            || detail.contains("\\public\\") || detail.contains("\\programdata\\")
+                            || detail.contains("powershell") || detail.contains("cmd.exe")
+                            || detail.contains("rundll32") || detail.contains("mshta")
+                    })
+                // T1112 Disable Windows Error Reporting / crash dumps (anti-forensics)
+                || obj.contains("\\windows error reporting\\disabled")
+                || obj.contains("\\crashcontrol\\crashdumpenabled")
         }
 
         // ── EID 14 — RegistryKeyValueRename: hiding persistence keys ─────────────
