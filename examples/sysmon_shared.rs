@@ -302,6 +302,84 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                 && (cmdline.contains("sam") || cmdline.contains("system")
                     || cmdline.contains("security") || cmdline.contains("ntds"));
 
+            // T1047 WMI execution — wmic process call create, or wmiprvse spawning children.
+            // wmiprvse.exe = WMI Provider Host; anything it spawns is a WMI-executed payload.
+            let wmi_exec =
+                (image == "wmic.exe"
+                    && cmdline.contains("process")
+                    && cmdline.contains("call")
+                    && cmdline.contains("create"))
+                || (parent == "wmiprvse.exe"
+                    && !matches!(image.as_str(), "conhost.exe" | "wbemcons.exe" | "wbemcore.exe"));
+
+            // T1021.003 DCOM lateral movement — mmc.exe or dllhost.exe spawning shells.
+            // These COM server processes should never spawn interactive child processes.
+            let dcom_exec = matches!(parent.as_str(), "mmc.exe" | "dllhost.exe")
+                && matches!(image.as_str(),
+                    "cmd.exe" | "powershell.exe" | "wscript.exe" | "cscript.exe"
+                    | "mshta.exe" | "rundll32.exe" | "regsvr32.exe");
+
+            // T1218.011 Signed binary proxy: rundll32 with unusual / non-standard targets.
+            let rundll32_abuse = image == "rundll32.exe"
+                && (cmdline.contains("javascript:")
+                    || cmdline.contains("mshtml")
+                    || cmdline.contains("pcwutl.dll")
+                    || cmdline.contains("ieadvpack")
+                    || cmdline.contains("setupapi")
+                    || cmdline.contains("shdocvw")
+                    || cmdline.contains("control_rundll")
+                    || cmdline.contains(",shellexec_rundll")
+                    || (cmdline.contains(".dll,") && !cmdline.contains("\\system32\\")));
+
+            // T1569.002 Service execution — services.exe spawning non-service processes.
+            let service_spawn = parent == "services.exe"
+                && !matches!(image.as_str(),
+                    "svchost.exe" | "spoolsv.exe" | "lsass.exe" | "lsm.exe" | "csrss.exe"
+                    | "wininit.exe" | "taskhost.exe" | "taskhostw.exe" | "msdtc.exe"
+                    | "vds.exe" | "wbengine.exe" | "dfsr.exe" | "dfsrs.exe" | "dns.exe"
+                    | "ismserv.exe" | "ntfrs.exe" | "netlogon.exe");
+
+            // T1543.003 Modify existing service binary path (sc config binPath=).
+            let modify_service = image == "sc.exe"
+                && cmdline.contains("config")
+                && (cmdline.contains("powershell") || cmdline.contains("cmd.exe")
+                    || cmdline.contains("\\temp\\") || cmdline.contains("\\appdata\\")
+                    || cmdline.contains("rundll32") || cmdline.contains("mshta"));
+
+            // T1021.002 Net use for lateral movement / SMB share access.
+            let net_lateral = (image == "net.exe" || image == "net1.exe")
+                && (cmdline.contains(" use ") || cmdline.contains(" session "));
+
+            // T1134 Token impersonation — runas abuse or PowerShell token manipulation.
+            let token_abuse = image == "runas.exe"
+                || (image == "powershell.exe" && (
+                    cmdline.contains("seimpersonateprivilege")
+                    || cmdline.contains("[system.security.principal]")
+                    || cmdline.contains("windowsidentity::impersonate")
+                    || cmdline.contains("impersonateloggedonuser")
+                    || cmdline.contains("duplicatetoken")));
+
+            // T1550 Pass-the-Hash / DCSync / Overpass-the-Hash via Mimikatz syntax.
+            let pth_attack = cmdline.contains("sekurlsa::pth")
+                || cmdline.contains("sekurlsa::wdigest")
+                || cmdline.contains("lsadump::dcsync")
+                || cmdline.contains("lsadump::sam")
+                || cmdline.contains("lsadump::lsa")
+                || cmdline.contains("kerberos::ptt")
+                || cmdline.contains("token::elevate")
+                || cmdline.contains("privilege::debug");
+
+            // T1059.005/006 Visual Basic / Macro execution chains via mshta or wscript.
+            let vbs_exec = matches!(parent.as_str(), "mshta.exe" | "wscript.exe" | "cscript.exe")
+                && matches!(image.as_str(),
+                    "cmd.exe" | "powershell.exe" | "net.exe" | "whoami.exe"
+                    | "ipconfig.exe" | "systeminfo.exe" | "reg.exe" | "wmic.exe");
+
+            // T1218.005 Mshta with URL or inline script (not just a local file).
+            let mshta_abuse = image == "mshta.exe"
+                && (cmdline.contains("http") || cmdline.contains("javascript:")
+                    || cmdline.contains("vbscript:") || cmdline.contains("about:"));
+
             attack_tool
                 || office_to_script
                 || lolbin_to_script
@@ -317,10 +395,20 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                 || inhibit_recovery
                 || create_account
                 || malicious_service
+                || modify_service
                 || schtask_attack
                 || winrm_exec
                 || wsl_exec
                 || reg_dump
+                || wmi_exec
+                || dcom_exec
+                || rundll32_abuse
+                || service_spawn
+                || net_lateral
+                || token_abuse
+                || pth_attack
+                || vbs_exec
+                || mshta_abuse
         }
 
         // ── EID 2 — FileCreationTimeChanged: timestomping (T1070.006) ───────────
@@ -379,8 +467,23 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                 && matches!(dest_port, 5985 | 5986)
                 && !matches!(image.as_str(), "wsmprovhost.exe" | "winrm.cmd");
 
+            // T1071.001 LOLBins or scripting hosts on HTTP/HTTPS (staging/C2).
+            // These are attack even on standard ports (certutil, bitsadmin, etc.).
+            let http_lolbin = initiated
+                && matches!(dest_port, 80 | 443 | 8080 | 8443)
+                && matches!(image.as_str(),
+                    "wscript.exe" | "cscript.exe" | "mshta.exe" | "rundll32.exe"
+                    | "regsvr32.exe" | "msbuild.exe" | "installutil.exe" | "regasm.exe"
+                    | "certutil.exe" | "bitsadmin.exe" | "wmic.exe" | "cmstp.exe");
+
+            // T1021.001 Unexpected RDP client process (not just non-mstsc, but scripting hosts).
+            // Also covers: psexec making RDP connections.
+            let psexec_smb = initiated && dest_port == 445
+                && (image.contains("psexec") || image.contains("paexec") || image == "sc.exe");
+
             (lolbin && initiated) || ps_nonstandard || internal_lateral
                 || rdp_nonstandard || smb_lateral || winrm_lateral
+                || http_lolbin || psexec_smb
         }
 
         // ── EID 6 — DriverLoad: BYOVD / unsigned driver (T1068 / T1014) ─────────
@@ -433,7 +536,20 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                     "lsass.exe" | "winlogon.exe" | "csrss.exe" | "wininit.exe"
                     | "services.exe" | "svchost.exe");
 
-            known_bad || staged_dll || unsigned_in_sensitive
+            // T1574.001 DLL hijack via DCOM process (mmc.exe, dllhost.exe, excel.exe).
+            // DCOM lateral movement loads hijacked DLLs into DCOM server processes.
+            let dcom_dll_hijack = matches!(process.as_str(),
+                "dllhost.exe" | "mmc.exe" | "excel.exe" | "outlook.exe" | "svchost.exe")
+                && (signed == "false" || sig_status != "Valid")
+                && !img.contains("\\windows\\system32\\")
+                && !img.contains("\\windows\\syswow64\\")
+                && !img.contains("\\program files\\");
+
+            // T1218.010 Regsvr32 loading remotely-fetched DLLs.
+            let regsvr_dll = process == "regsvr32.exe"
+                && (staged_dll || signed == "false");
+
+            known_bad || staged_dll || unsigned_in_sensitive || dcom_dll_hijack || regsvr_dll
         }
 
         // ── EID 8 — CreateRemoteThread: process injection (T1055) ────────────────
@@ -459,10 +575,19 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                 | "taskhost.exe" | "taskhostw.exe" | "vaultcvc.exe"
                 | "msmpeng.exe" | "msseces.exe"
             );
-            // VM_READ(0x10)|VM_WRITE(0x20)|DUP_HANDLE(0x40) or broad PROCESS_ALL_ACCESS
-            let suspicious_access = access & 0x70 != 0 || access >= 0x1f0000;
+            // VM_READ(0x10)|VM_WRITE(0x20)|DUP_HANDLE(0x40) or broad PROCESS_ALL_ACCESS.
+            // Also: 0x1F0FFF = PROCESS_ALL_ACCESS (DET0363), 0x1410 = token+query ops (T1134).
+            let suspicious_access = access & 0x70 != 0
+                || access >= 0x1f0000
+                || access == 0x1f0fff
+                || access == 0x1410
+                || access == 0x1fffff;
 
-            sensitive_target && suspicious_access
+            // T1134 Token impersonation via handle duplication on winlogon/services.exe.
+            let token_steal = access & 0x40 != 0   // PROCESS_DUP_HANDLE
+                && matches!(target.as_str(), "winlogon.exe" | "services.exe");
+
+            (sensitive_target && suspicious_access) || token_steal
         }
 
         // ── EID 11 — FileCreate: dropper / payload staging ───────────────────────
