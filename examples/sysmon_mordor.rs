@@ -22,7 +22,7 @@
 
 #[path = "sysmon_shared.rs"]
 mod shared;
-use shared::{basename, hive_of};
+use shared::{basename, explain_token, hive_of, MEANINGFUL_PREFIXES};
 
 use std::{collections::HashMap, fs, io::Write, path::Path};
 use tmu_rs::{CoalescedTsetlinMachine, Encoder, Rng};
@@ -592,13 +592,7 @@ fn main() {
         fullpipe_us, 1e6 / fullpipe_us
     );
 
-    let meaningful_prefixes = [
-        "process.name", "process.args", "process.parent",
-        "dll.name", "file.name", "file.path",
-        "target.process", "source.process",
-        "dns.question", "destination.",
-        "network.", "registry.",
-    ];
+    let meaningful_prefixes = MEANINGFUL_PREFIXES;
 
     // ── clause statistics ─────────────────────────────────────────────────────
 
@@ -733,47 +727,4 @@ fn main() {
         }
         println!();
     }
-}
-
-fn explain_token(tok: &str) -> &'static str {
-    if tok.starts_with("event.id::1 ")  || tok == "event.id::1"  { return "Sysmon: process creation"; }
-    if tok.starts_with("event.id::3 ")  || tok == "event.id::3"  { return "Sysmon: network connection"; }
-    if tok.starts_with("event.id::7 ")  || tok == "event.id::7"  { return "Sysmon: image/DLL loaded"; }
-    if tok.starts_with("event.id::10")                           { return "Sysmon: process access (injection / cred dump)"; }
-    if tok.starts_with("event.id::11")                           { return "Sysmon: file created"; }
-    if tok.starts_with("event.id::12") || tok.starts_with("event.id::13") || tok.starts_with("event.id::14") {
-        return "Sysmon: registry create/set/delete";
-    }
-    if tok.starts_with("event.id::22")                           { return "Sysmon: DNS query"; }
-    if tok.starts_with("event.id::25")                           { return "Sysmon: process tampering"; }
-    if tok.starts_with("process.name::")                         { return "executing process binary"; }
-    if tok.starts_with("process.args::")                         { return "command-line argument token"; }
-    if tok.starts_with("process.parent.name::") || tok.starts_with("process.parent::") { return "parent process"; }
-    if tok.starts_with("target.process.name::")                  { return "victim process (accessed/injected)"; }
-    if tok.starts_with("source.process.name::")                  { return "accessor/injecting process"; }
-    if tok.starts_with("target.process.granted_access::")        { return "access rights requested (PROCESS_VM_READ etc.)"; }
-    if tok.starts_with("file.path::Temp") || tok.contains("::Temp") { return "staging in temp directory (common dropper)"; }
-    if tok.starts_with("file.path::System32")                    { return "system directory (legit or DLL hijack)"; }
-    if tok.starts_with("file.path::AppData")                     { return "user profile staging area"; }
-    if tok.starts_with("file.path::")                            { return "file location"; }
-    if tok.starts_with("file.name::")                            { return "file name"; }
-    if tok.starts_with("dll.name::")                             { return "DLL loaded"; }
-    if tok.starts_with("network.destination") || tok.starts_with("destination.") { return "outbound C2 / lateral target"; }
-    if tok.starts_with("dns.question::")                         { return "DNS lookup (C2 beacon / lateral)"; }
-    if tok.starts_with("registry.")                              { return "registry operation"; }
-    if tok.contains("::lsass")                                   { return "LSASS — credential store (high value target)"; }
-    if tok.contains("::mimikatz") || tok.contains("::mimi")      { return "Mimikatz credential dumper"; }
-    if tok.contains("::powershell") || tok.contains("::psh")     { return "PowerShell execution"; }
-    if tok.contains("::cmd.exe")                                 { return "Command prompt execution"; }
-    if tok.contains("::rundll32")                                { return "LOLBin: runs arbitrary DLLs"; }
-    if tok.contains("::regsvr32")                                { return "LOLBin: runs COM/SCT payloads"; }
-    if tok.contains("::mshta")                                   { return "LOLBin: runs HTML/VBS/JS"; }
-    if tok.contains("::wmic")                                    { return "WMI execution / lateral movement"; }
-    if tok.contains("::schtasks") || tok.contains("::at.exe")    { return "scheduled task (persistence)"; }
-    if tok.contains("::net.exe") || tok.contains("::net1.exe")   { return "domain/user enumeration"; }
-    if tok.contains("Signature::Microsoft Windows")              { return "Microsoft-signed binary (very common — not specific)"; }
-    if tok.contains("code_signature.status::Valid")              { return "valid code signature (most legit processes)"; }
-    if tok.contains("UserID::S-1-5-18")                         { return "SYSTEM account"; }
-    if tok.contains("UserID::S-1-5-19") || tok.contains("UserID::S-1-5-20") { return "LOCAL/NETWORK SERVICE account"; }
-    ""
 }
