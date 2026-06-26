@@ -23,7 +23,7 @@
 
 #[path = "sysmon_shared.rs"]
 mod shared;
-use shared::{basename, hive_of};
+use shared::{basename, hive_of, is_attack_behavior};
 
 use std::{collections::HashMap, collections::HashSet, fs, io::Write, path::Path};
 use tmu_rs::{Encoder, Rng, TMAutoEncoder, TMCoalescedAutoEncoder};
@@ -52,46 +52,6 @@ const TACTIC_DIRS: &[&str] = &[
     "collection",
 ];
 
-// ── attack heuristic ──────────────────────────────────────────────────────────
-
-const ATTACK_PROCS: &[&str] = &[
-    "SharpView.exe",
-    "powershell.exe",
-    "netsh.exe",
-    "wscript.exe",
-    "python.exe",
-    "whoami.exe",
-    "cmd.exe",
-    "mshta.exe",
-    "vbc.exe",
-    "vbscript.dll",
-    "mimikatz.exe",
-    "mimilib.dll",
-    "Rubeus.exe",
-    "kekeo.exe",
-    "SharpDPAPI.exe",
-    "SharpDump.exe",
-    "procdump.exe",
-    "procdump64.exe",
-    "wce.exe",
-    "fgdump.exe",
-    "regsvcs.exe",
-    "regasm.exe",
-    "msbuild.exe",
-    "cmstp.exe",
-    "odbcconf.exe",
-    "cscript.exe",
-    "msiexec.exe",
-    "PsExec.exe",
-    "PsExec64.exe",
-    "psexesvc.exe",
-    "wmic.exe",
-    "schtasks.exe",
-    "at.exe",
-    "ncat.exe",
-    "nc.exe",
-    "nmap.exe",
-];
 
 const SKIP_FIELDS: &[&str] = &[
     "ProcessGuid",
@@ -278,11 +238,6 @@ fn event_to_tokens(v: &serde_json::Value, eid: u32) -> Vec<String> {
     t
 }
 
-fn is_attack(v: &serde_json::Value, eid: u32) -> bool {
-    let img_field = if eid == 10 { "SourceImage" } else { "Image" };
-    let base = basename(v[img_field].as_str().unwrap_or(""));
-    ATTACK_PROCS.iter().any(|p| base.eq_ignore_ascii_case(p))
-}
 
 // ── file parsing ──────────────────────────────────────────────────────────────
 
@@ -301,7 +256,7 @@ fn parse_file(path: &str) -> std::io::Result<Vec<(Vec<String>, bool)>> {
             continue;
         }
         let eid = v["EventID"].as_u64().unwrap_or(0) as u32;
-        let attack = is_attack(&v, eid);
+        let attack = is_attack_behavior(&v, eid);
         events.push((event_to_tokens(&v, eid), attack));
     }
     Ok(events)
@@ -833,7 +788,7 @@ fn main() {
     println!("\n{n_attack} attack events  {n_benign} benign events\n");
 
     if n_attack == 0 || n_benign == 0 {
-        eprintln!("ERROR: one class is empty — check ATTACK_PROCS or dataset");
+        eprintln!("ERROR: one class is empty — check behavioral rules or dataset");
         std::process::exit(1);
     }
 

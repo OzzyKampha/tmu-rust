@@ -9,8 +9,8 @@
 //!    JSON is included (except high-cardinality noise like GUIDs/PIDs/timestamps).
 //!    Paths → basename + `file.path::<dir>` location tokens.
 //!    CommandLine/ParentCommandLine → word-level `process.args::<token>` tokens.
-//! 3. Labels each event using a within-trace heuristic: primary image in ATTACK_PROCS
-//!    → label 1; background OS processes → label 0.
+//! 3. Labels each event by behavioral rules (EID + field patterns): attack behaviors
+//!    → label 1; background OS events → label 0.
 //! 4. Shuffles, 80/20 train/test split, trains a TM, reports accuracy every 5 epochs.
 //! 5. Prints the vocabulary, top attack/benign rules, and per-sample clause explanations.
 //!
@@ -21,7 +21,7 @@
 
 #[path = "sysmon_shared.rs"]
 mod shared;
-use shared::{basename, hive_of};
+use shared::{basename, hive_of, is_attack_behavior};
 
 use std::{collections::HashSet, fs, io::Write, path::Path};
 use tmu_rs::{Encoder, Rng, TsetlinMachine};
@@ -41,53 +41,6 @@ const TACTIC_DIRS: &[&str] = &[
     "persistence",
     "privilege_escalation",
     "collection",
-];
-
-// ── attack heuristic ──────────────────────────────────────────────────────────
-
-const ATTACK_PROCS: &[&str] = &[
-    // Execution
-    "SharpView.exe",
-    "powershell.exe",
-    "netsh.exe",
-    "wscript.exe",
-    "python.exe",
-    "whoami.exe",
-    "cmd.exe",
-    "mshta.exe",
-    "vbc.exe",
-    "vbscript.dll",
-    // Credential access
-    "mimikatz.exe",
-    "mimilib.dll",
-    "Rubeus.exe",
-    "kekeo.exe",
-    "SharpDPAPI.exe",
-    "SharpDump.exe",
-    "procdump.exe",
-    "procdump64.exe",
-    "wce.exe",
-    "fgdump.exe",
-    // Defense evasion / execution via LOLBins rarely seen in benign traces
-    "regsvcs.exe",
-    "regasm.exe",
-    "msbuild.exe",
-    "cmstp.exe",
-    "odbcconf.exe",
-    "cscript.exe",
-    "msiexec.exe",
-    // Lateral movement
-    "PsExec.exe",
-    "PsExec64.exe",
-    "psexesvc.exe",
-    "wmic.exe",
-    // Persistence helpers
-    "schtasks.exe",
-    "at.exe",
-    // C2 / misc
-    "ncat.exe",
-    "nc.exe",
-    "nmap.exe",
 ];
 
 // ── field skip list (GUIDs, PIDs, timestamps, raw hashes, stack traces) ───────
@@ -296,14 +249,6 @@ fn event_to_tokens(v: &serde_json::Value, eid: u32) -> Vec<String> {
     t
 }
 
-// ── labeling heuristic ────────────────────────────────────────────────────────
-
-fn is_attack(v: &serde_json::Value, eid: u32) -> bool {
-    let img_field = if eid == 10 { "SourceImage" } else { "Image" };
-    let base = basename(v[img_field].as_str().unwrap_or(""));
-    ATTACK_PROCS.iter().any(|p| base.eq_ignore_ascii_case(p))
-}
-
 // ── parse one NDJSON file ──────────────────────────────────────────────────────
 
 fn parse_file(path: &str) -> std::io::Result<Vec<(Vec<String>, usize)>> {
@@ -321,7 +266,7 @@ fn parse_file(path: &str) -> std::io::Result<Vec<(Vec<String>, usize)>> {
             continue;
         }
         let eid = v["EventID"].as_u64().unwrap_or(0) as u32;
-        let label = usize::from(is_attack(&v, eid));
+        let label = usize::from(is_attack_behavior(&v, eid));
         events.push((event_to_tokens(&v, eid), label));
     }
     Ok(events)
@@ -445,7 +390,7 @@ fn main() {
     println!("{n_benign} benign events (label 0)  ← real background OS activity\n");
 
     if n_attack == 0 || n_benign == 0 {
-        eprintln!("ERROR: one class is empty — check ATTACK_PROCS or dataset contents");
+        eprintln!("ERROR: one class is empty — check behavioral rules or dataset contents");
         std::process::exit(1);
     }
 
