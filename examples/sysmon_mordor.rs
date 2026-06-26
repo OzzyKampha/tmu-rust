@@ -26,6 +26,8 @@ use shared::{basename, hive_of};
 use std::{collections::HashSet, fs, path::Path};
 use tmu_rs::{Encoder, Rng, TsetlinMachine};
 
+const MINI_BATCH_SIZE: usize = 4096;
+
 // ── dataset discovery ─────────────────────────────────────────────────────────
 
 const DATA_DIR: &str = "mordor_data";
@@ -478,22 +480,34 @@ fn main() {
         encoder.n_features(),
     );
 
-    let train_x = encoder.encode_batch_categorical(&tr_refs);
+    // Only encode the test set eagerly — it's small and reused every epoch.
+    // Training is done in mini-batches so we never hold the full encoded
+    // training set in memory (~116 MB for 427K events).
     let test_x = encoder.encode_batch_categorical(&te_refs);
 
     let mut tm = TsetlinMachine::with_config(2, encoder.n_features(), 80, 50, 5.0, 8, true, 42);
-    for epoch in 1..=50 {
+    let mut shuffle_rng = Rng::new(0xDEAD_BEEF);
+    let n_train = tr_inner.len();
+
+    for epoch in 1..=10 {
         let t0 = std::time::Instant::now();
-        tm.fit_epoch(&train_x, &train_y);
-        let elapsed = t0.elapsed();
-        if epoch % 5 == 0 || epoch == 1 {
-            let tr_acc = tm.accuracy(&train_x, &train_y) * 100.0;
-            let te_acc = tm.accuracy(&test_x, &test_y) * 100.0;
-            println!(
-                "epoch {epoch:>2}  train={tr_acc:.2}%  test={te_acc:.2}%  ({:.1}s)",
-                elapsed.as_secs_f32()
-            );
+        let mut order: Vec<usize> = (0..n_train).collect();
+        for i in (1..n_train).rev() {
+            let j = shuffle_rng.below(i + 1);
+            order.swap(i, j);
         }
+        for chunk in order.chunks(MINI_BATCH_SIZE) {
+            let slices: Vec<&[&str]> = chunk.iter().map(|&i| tr_inner[i].as_slice()).collect();
+            let mini_x = encoder.encode_batch_categorical(&slices);
+            let mini_y: Vec<usize> = chunk.iter().map(|&i| train_y[i]).collect();
+            tm.fit_epoch(&mini_x, &mini_y);
+        }
+        let elapsed = t0.elapsed();
+        let te_acc = tm.accuracy(&test_x, &test_y) * 100.0;
+        println!(
+            "epoch {epoch:>2}  test={te_acc:.2}%  ({:.1}s)",
+            elapsed.as_secs_f32()
+        );
     }
 
     // Vocabulary printout.
