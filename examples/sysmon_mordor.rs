@@ -492,7 +492,7 @@ fn main() {
     }
     println!();
 
-    let mut tm = TsetlinMachine::with_config(n_tactics, encoder.n_features(), 80, 50, 5.0, 8, true, 42)
+    let mut tm = TsetlinMachine::with_config(n_tactics, encoder.n_features(), 256, 50, 5.0, 8, true, 42)
         .class_weights(cw);
     let mut shuffle_rng = Rng::new(0xDEAD_BEEF);
     let n_batches = n_train.div_ceil(MINI_BATCH_SIZE);
