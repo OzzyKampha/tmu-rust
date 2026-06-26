@@ -22,7 +22,7 @@
 
 #[path = "sysmon_shared.rs"]
 mod shared;
-use shared::{basename, explain_token, hive_of, MEANINGFUL_PREFIXES};
+use shared::{basename, explain_token, hive_of, is_attack_behavior, MEANINGFUL_PREFIXES};
 
 use std::{collections::HashMap, fs, io::Write, path::Path};
 use tmu_rs::{CoalescedTsetlinMachine, Encoder, Rng};
@@ -287,6 +287,7 @@ fn parse_file(path: &str, tactic_idx: usize) -> std::io::Result<Vec<(Vec<String>
             continue;
         }
         let eid = v["EventID"].as_u64().unwrap_or(0) as u32;
+        if !is_attack_behavior(&v, eid) { continue; }
         events.push((event_to_tokens(&v, eid), tactic_idx));
     }
     Ok(events)
