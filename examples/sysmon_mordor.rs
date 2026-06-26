@@ -9,10 +9,11 @@
 //!    JSON is included (except high-cardinality noise like GUIDs/PIDs/timestamps).
 //!    Paths → basename + `file.path::<dir>` location tokens.
 //!    CommandLine/ParentCommandLine → word-level `process.args::<token>` tokens.
-//! 3. Labels each event by behavioral rules (EID + field patterns): attack behaviors
-//!    → label 1; background OS events → label 0.
-//! 4. Shuffles, 80/20 train/test split, trains a TM, reports accuracy every 5 epochs.
-//! 5. Prints the vocabulary, top attack/benign rules, and per-sample clause explanations.
+//! 3. Labels every event in a file with the file's ATT&CK tactic (from the Mordor
+//!    directory structure: execution/, credential_access/, etc.) — these ARE the
+//!    Mordor dataset labels.  No per-event heuristics needed.
+//! 4. Trains an 8-class TM (one class per tactic), 80/20 split, per-epoch accuracy.
+//! 5. Reports per-tactic accuracy and top discriminating clause rules.
 //!
 //! ## Run
 //! ```text
@@ -21,9 +22,9 @@
 
 #[path = "sysmon_shared.rs"]
 mod shared;
-use shared::{basename, hive_of, is_attack_behavior};
+use shared::{basename, hive_of};
 
-use std::{collections::HashSet, fs, io::Write, path::Path};
+use std::{collections::HashMap, fs, io::Write, path::Path};
 use tmu_rs::{Encoder, Rng, TsetlinMachine};
 
 const MINI_BATCH_SIZE: usize = 4096;
@@ -42,6 +43,24 @@ const TACTIC_DIRS: &[&str] = &[
     "privilege_escalation",
     "collection",
 ];
+
+// ── tactic map: ZIP stem → tactic index, persisted between runs ──────────────
+
+const TACTIC_MAP_FILE: &str = "mordor_data/tactic_map.json";
+
+fn load_tactic_map() -> HashMap<String, usize> {
+    fs::read_to_string(TACTIC_MAP_FILE)
+        .ok()
+        .and_then(|s| serde_json::from_str::<HashMap<String, usize>>(&s).ok())
+        .unwrap_or_default()
+}
+
+fn file_tactic_idx(json_name: &str, map: &HashMap<String, usize>) -> usize {
+    map.iter()
+        .find(|(stem, _)| json_name.starts_with(stem.as_str()))
+        .map(|(_, &idx)| idx)
+        .unwrap_or(0)
+}
 
 // ── field skip list (GUIDs, PIDs, timestamps, raw hashes, stack traces) ───────
 
@@ -251,7 +270,9 @@ fn event_to_tokens(v: &serde_json::Value, eid: u32) -> Vec<String> {
 
 // ── parse one NDJSON file ──────────────────────────────────────────────────────
 
-fn parse_file(path: &str) -> std::io::Result<Vec<(Vec<String>, usize)>> {
+// All events in a file receive the file's tactic index as the label.
+// This uses the Mordor dataset's own labels (tactic directory structure).
+fn parse_file(path: &str, tactic_idx: usize) -> std::io::Result<Vec<(Vec<String>, usize)>> {
     let text = fs::read_to_string(path)?;
     let mut events = Vec::new();
     for line in text.lines() {
@@ -266,8 +287,7 @@ fn parse_file(path: &str) -> std::io::Result<Vec<(Vec<String>, usize)>> {
             continue;
         }
         let eid = v["EventID"].as_u64().unwrap_or(0) as u32;
-        let label = usize::from(is_attack_behavior(&v, eid));
-        events.push((event_to_tokens(&v, eid), label));
+        events.push((event_to_tokens(&v, eid), tactic_idx));
     }
     Ok(events)
 }
@@ -275,8 +295,11 @@ fn parse_file(path: &str) -> std::io::Result<Vec<(Vec<String>, usize)>> {
 // ── dynamic discovery + download ──────────────────────────────────────────────
 
 fn discover_and_download() {
+    // Load any existing tactic map from previous runs.
+    let mut tactic_map: HashMap<String, usize> = load_tactic_map();
+
     fs::create_dir_all(DATA_DIR).expect("could not create mordor_data/");
-    for tactic in TACTIC_DIRS {
+    for (tactic_idx, tactic) in TACTIC_DIRS.iter().enumerate() {
         let api_url = format!(
             "https://api.github.com/repos/OTRF/Security-Datasets/contents/datasets/atomic/windows/{tactic}/host"
         );
@@ -304,6 +327,9 @@ fn discover_and_download() {
                 continue;
             }
             let stem = name.trim_end_matches(".zip");
+            // Record this scenario's tactic even if already downloaded.
+            tactic_map.entry(stem.to_string()).or_insert(tactic_idx);
+
             let url = entry["download_url"].as_str().unwrap_or("");
             if url.is_empty() {
                 continue;
@@ -334,28 +360,37 @@ fn discover_and_download() {
             }
         }
     }
+
+    // Persist the tactic map so file parsing can look up each scenario's tactic.
+    if let Ok(json) = serde_json::to_string_pretty(&tactic_map) {
+        let _ = fs::write(TACTIC_MAP_FILE, json);
+    }
 }
 
 // ── recursive JSON file collection ────────────────────────────────────────────
 
-fn collect_json_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+fn collect_json_files(
+    dir: &Path,
+    tactic_map: &HashMap<String, usize>,
+    out: &mut Vec<(std::path::PathBuf, usize)>,
+) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            // skip macOS resource-fork artifact directories
             if path.file_name().and_then(|n| n.to_str()) == Some("__MACOSX") {
                 continue;
             }
-            collect_json_files(&path, out);
+            collect_json_files(&path, tactic_map, out);
         } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
-            // skip macOS resource-fork files (start with "._")
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !name.starts_with("._") {
-                out.push(path);
+            if name.starts_with("._") || name == "tactic_map.json" {
+                continue;
             }
+            let tactic_idx = file_tactic_idx(name, tactic_map);
+            out.push((path, tactic_idx));
         }
     }
 }
@@ -363,34 +398,49 @@ fn collect_json_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 // ── main ───────────────────────────────────────────────────────────────────────
 
 fn main() {
+    println!("Mordor Tactic Classifier — 8-class ATT&CK tactic prediction from Sysmon events\n");
+    println!("Downloading / verifying Mordor datasets…");
     discover_and_download();
 
-    let mut json_files = Vec::new();
-    collect_json_files(Path::new(DATA_DIR), &mut json_files);
-    json_files.sort();
+    let tactic_map = load_tactic_map();
+    if tactic_map.is_empty() {
+        eprintln!("WARN: tactic map is empty — re-run to let the API populate it");
+    }
+
+    let mut json_files: Vec<(std::path::PathBuf, usize)> = Vec::new();
+    collect_json_files(Path::new(DATA_DIR), &tactic_map, &mut json_files);
+    json_files.sort_by_key(|(p, _)| p.clone());
 
     let mut all_events: Vec<(Vec<String>, usize)> = Vec::new();
-    for path in &json_files {
-        match parse_file(path.to_str().unwrap()) {
+    for (path, tactic_idx) in &json_files {
+        match parse_file(path.to_str().unwrap(), *tactic_idx) {
             Ok(evs) => {
-                println!(
-                    "  {} → {} Sysmon events",
-                    path.file_name().unwrap().to_str().unwrap(),
-                    evs.len()
-                );
+                let n = evs.len();
+                if n > 0 {
+                    let tactic = TACTIC_DIRS.get(*tactic_idx).unwrap_or(&"?");
+                    println!(
+                        "  [{tactic}] {} → {n} events",
+                        path.file_name().unwrap().to_str().unwrap()
+                    );
+                }
                 all_events.extend(evs);
             }
             Err(e) => eprintln!("  WARN: {e}"),
         }
     }
 
-    let n_attack = all_events.iter().filter(|(_, y)| *y == 1).count();
-    let n_benign = all_events.iter().filter(|(_, y)| *y == 0).count();
-    println!("\n{n_attack} attack events (label 1)  ← real attack-tool activity");
-    println!("{n_benign} benign events (label 0)  ← real background OS activity\n");
+    println!();
+    let mut tactic_counts = vec![0usize; TACTIC_DIRS.len()];
+    for (_, y) in &all_events {
+        tactic_counts[*y] += 1;
+    }
+    for (i, tactic) in TACTIC_DIRS.iter().enumerate() {
+        println!("  {i}  {:<25}  {} events", tactic, tactic_counts[i]);
+    }
+    println!("     {:<25}  {} total\n", "", all_events.len());
 
-    if n_attack == 0 || n_benign == 0 {
-        eprintln!("ERROR: one class is empty — check behavioral rules or dataset contents");
+    if all_events.is_empty() {
+        eprintln!("ERROR: no events loaded — check dataset contents");
         std::process::exit(1);
     }
 
@@ -425,12 +475,10 @@ fn main() {
         encoder.n_features(),
     );
 
-    // Only encode the test set eagerly — it's small and reused every epoch.
-    // Training is done in mini-batches so we never hold the full encoded
-    // training set in memory (~116 MB for 427K events).
     let test_x = encoder.encode_batch_categorical(&te_refs);
 
-    let mut tm = TsetlinMachine::with_config(2, encoder.n_features(), 80, 50, 5.0, 8, true, 42);
+    let n_tactics = TACTIC_DIRS.len();
+    let mut tm = TsetlinMachine::with_config(n_tactics, encoder.n_features(), 80, 50, 5.0, 8, true, 42);
     let mut shuffle_rng = Rng::new(0xDEAD_BEEF);
     let n_train = tr_inner.len();
     let n_batches = n_train.div_ceil(MINI_BATCH_SIZE);
@@ -458,191 +506,68 @@ fn main() {
         );
     }
 
-    // Vocabulary printout.
-    println!("\n--- vocabulary ({} features) ---", encoder.n_features());
-    for bit in 0..encoder.n_features() {
-        let tok = encoder.vocab_token(bit);
-        if !tok.contains("<UNK>") && !tok.contains("<OOV>") {
-            println!("  {bit:>4}  {tok}");
+    // Per-tactic accuracy.
+    println!("\n--- per-tactic test accuracy ---");
+    for (class, tactic) in TACTIC_DIRS.iter().enumerate() {
+        let indices: Vec<usize> = test_y
+            .iter()
+            .enumerate()
+            .filter(|(_, &y)| y == class)
+            .map(|(i, _)| i)
+            .collect();
+        if indices.is_empty() {
+            continue;
         }
+        let correct = indices.iter().filter(|&&i| {
+            let s = encoder.encode_one_categorical(&te_inner[i]);
+            tm.predict(&s) == class
+        }).count();
+        println!(
+            "  {class}  {:<25}  {correct}/{} ({:.1}%)",
+            tactic,
+            indices.len(),
+            correct as f64 / indices.len() as f64 * 100.0
+        );
     }
-    let n_sentinel = (0..encoder.n_features())
-        .filter(|&b| {
-            let t = encoder.vocab_token(b);
-            t.contains("<UNK>") || t.contains("<OOV>")
-        })
-        .count();
-    println!("  … plus {n_sentinel} <UNK>/<OOV> sentinels");
 
-    // Top-5 rules per class: one compact line each, ranked by weight.
-    // Prefer clauses referencing process/args/file tokens (more interpretable).
+    // Top-3 discriminating rules per tactic.
     let meaningful_prefixes = [
-        "process.name",
-        "process.args",
-        "process.parent",
-        "dll.name",
-        "file.name",
-        "file.path",
-        "target.process",
-        "source.process",
-        "dns.question",
-        "destination.",
+        "process.name", "process.args", "process.parent",
+        "dll.name", "file.name", "file.path",
+        "target.process", "source.process",
+        "dns.question", "destination.",
     ];
 
-    for (class, label) in [(1usize, "attack"), (0, "benign")] {
-        println!("\n--- top {} rules (class {}) ---", label, class);
+    for (class, tactic) in TACTIC_DIRS.iter().enumerate() {
+        let n_class = test_y.iter().filter(|&&y| y == class).count();
+        if n_class == 0 { continue; }
+        println!("\n--- top rules for {tactic} (class {class}) ---");
         let mut ranked: Vec<usize> = (0..tm.clauses_per_class())
             .filter(|&c| tm.clause_is_positive(c))
             .filter(|&c| tm.clause_rule(class, c).iter().any(|&(_, neg)| !neg))
             .collect();
-        // Sort: most positive literals first, then has-meaningful-token, then weight
         ranked.sort_by(|&a, &b| {
-            let pa = tm
-                .clause_rule(class, a)
-                .iter()
-                .filter(|&&(_, neg)| !neg)
-                .count();
-            let pb = tm
-                .clause_rule(class, b)
-                .iter()
-                .filter(|&&(_, neg)| !neg)
-                .count();
+            let pa = tm.clause_rule(class, a).iter().filter(|&&(_, neg)| !neg).count();
+            let pb = tm.clause_rule(class, b).iter().filter(|&&(_, neg)| !neg).count();
             let ma = tm.clause_rule(class, a).iter().any(|&(f, neg)| {
-                !neg && meaningful_prefixes
-                    .iter()
-                    .any(|p| encoder.vocab_token(f).starts_with(p))
+                !neg && meaningful_prefixes.iter().any(|p| encoder.vocab_token(f).starts_with(p))
             });
             let mb = tm.clause_rule(class, b).iter().any(|&(f, neg)| {
-                !neg && meaningful_prefixes
-                    .iter()
-                    .any(|p| encoder.vocab_token(f).starts_with(p))
+                !neg && meaningful_prefixes.iter().any(|p| encoder.vocab_token(f).starts_with(p))
             });
-            pb.cmp(&pa)
-                .then(mb.cmp(&ma))
+            pb.cmp(&pa).then(mb.cmp(&ma))
                 .then(tm.clause_weight(class, b).cmp(&tm.clause_weight(class, a)))
         });
-        for (rank, &c) in ranked.iter().take(5).enumerate() {
+        for (rank, &c) in ranked.iter().take(3).enumerate() {
             let rule = tm.clause_rule(class, c);
             let w = tm.clause_weight(class, c);
             let pos: Vec<_> = rule.iter().filter(|&&(_, neg)| !neg).collect();
             let neg_count = rule.len() - pos.len();
-            let literals: Vec<String> = pos
-                .iter()
+            let literals: Vec<String> = pos.iter()
                 .map(|&&(feat, _)| encoder.vocab_token(feat).to_string())
                 .collect();
-            let neg_suffix = if neg_count > 0 {
-                format!("  (+ {neg_count} NOT)")
-            } else {
-                String::new()
-            };
-            println!(
-                "  [{}] w={}  {}{}",
-                rank + 1,
-                w,
-                literals.join("  "),
-                neg_suffix
-            );
-        }
-    }
-
-    // Per-sample clause explanation.
-    // For each class: (a) pick the first correct test sample and show its top firing
-    // clauses by weight; (b) search all test samples of that class for the one whose
-    // best multi-literal (≥2 positive literals) firing clause has the most literals.
-    let firing_clauses = |class: usize, toks: &[String]| -> Vec<(i32, Vec<String>)> {
-        let token_set: HashSet<&str> = toks.iter().map(String::as_str).collect();
-        let mut out: Vec<(i32, Vec<String>)> = vec![];
-        for c in 0..tm.clauses_per_class() {
-            if !tm.clause_is_positive(c) {
-                continue;
-            }
-            let rule = tm.clause_rule(class, c);
-            if rule.is_empty() {
-                continue;
-            }
-            let fires = rule.iter().all(|&(feat, is_neg)| {
-                let present = token_set.contains(encoder.vocab_token(feat));
-                if is_neg {
-                    !present
-                } else {
-                    present
-                }
-            });
-            if fires {
-                let pos_lits: Vec<String> = rule
-                    .iter()
-                    .filter(|&&(_, neg)| !neg)
-                    .map(|&(f, _)| encoder.vocab_token(f).to_string())
-                    .collect();
-                if pos_lits.is_empty() {
-                    continue;
-                }
-                out.push((tm.clause_weight(class, c), pos_lits));
-            }
-        }
-        out.sort_by(|a, b| b.0.cmp(&a.0));
-        out
-    };
-
-    for (class, label) in [(1usize, "attack"), (0, "benign")] {
-        // Representative sample: first correct prediction for this class
-        let Some(idx) = test_y
-            .iter()
-            .enumerate()
-            .filter(|&(i, &y)| {
-                if y != class {
-                    return false;
-                }
-                let s = encoder.encode_one_categorical(&te_inner[i]);
-                tm.predict(&s) == class
-            })
-            .map(|(i, _)| i)
-            .next()
-        else {
-            continue;
-        };
-
-        let tokens: &[String] = test_tokens[idx];
-        let token_set: HashSet<&str> = tokens.iter().map(String::as_str).collect();
-        let sample = encoder.encode_one_categorical(&te_inner[idx]);
-        let pred = tm.predict(&sample);
-        let verdict = if pred == class { "correct" } else { "WRONG" };
-
-        println!(
-            "\n--- {} sample explanation (pred={}, {}) ---",
-            label, pred, verdict
-        );
-        let mut sorted_toks: Vec<&str> = token_set.iter().cloned().collect();
-        sorted_toks.sort();
-        println!("  tokens: {}", sorted_toks.join("  "));
-
-        let firing = firing_clauses(class, tokens);
-        if firing.is_empty() {
-            println!("  (no positive clauses fired)");
-        } else {
-            println!("  top firing clauses ({} total):", firing.len());
-            for (w, lits) in firing.iter().take(5) {
-                println!("    w={}  {}", w, lits.join("  "));
-            }
-        }
-
-        // Find the test sample (same class) whose best multi-literal firing clause
-        // has the most positive literals.
-        let best_multi = test_y
-            .iter()
-            .enumerate()
-            .filter(|&(_, &y)| y == class)
-            .filter_map(|(i, _)| {
-                firing_clauses(class, test_tokens[i])
-                    .into_iter()
-                    .filter(|(_, l)| l.len() >= 2)
-                    .max_by_key(|(_, l)| l.len())
-            })
-            .max_by_key(|(_, l)| l.len());
-
-        if let Some((w, lits)) = best_multi {
-            println!("  richest AND clause across all {} test samples:", label);
-            println!("    w={}  {}", w, lits.join("  "));
+            let neg_sfx = if neg_count > 0 { format!("  (+ {neg_count} NOT)") } else { String::new() };
+            println!("  [{}] w={w}  {}{neg_sfx}", rank + 1, literals.join("  "));
         }
     }
 }

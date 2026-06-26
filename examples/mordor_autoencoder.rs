@@ -1,20 +1,20 @@
 //! Mordor anomaly detection via TMAutoEncoder and TMCoalescedAutoEncoder.
 //!
-//! Trains an autoencoder on **benign-only** Sysmon events from the OTRF Mordor
-//! Security-Datasets and uses per-sample reconstruction error as an anomaly score.
-//! Attack events (mimikatz, PsExec, procdump, …) should be harder for the model
-//! to reconstruct because it was only trained on normal OS-process patterns.
+//! Trains an autoencoder on Sysmon events from the OTRF Mordor Security-Datasets.
+//! Every event is labeled by its file's ATT&CK tactic (the Mordor ground truth:
+//! tactic directory = label).  Per-tactic reconstruction error shows which
+//! tactics produce the most "unusual" behavior relative to the overall distribution.
 //!
 //! ## What this does
 //!
 //! 1. Downloads and parses Mordor host datasets (same pipeline as sysmon_mordor).
-//! 2. Fits an encoder vocabulary on ALL data so both benign and attack tokens are
-//!    represented; trains the autoencoder on **benign-only** events (no labels).
-//! 3. Computes per-sample reconstruction error = fraction of bits wrong → anomaly score.
-//! 4. Reports anomaly detection metrics (accuracy/precision/recall) by scanning
-//!    thresholds over reconstruction error.
-//! 5. Shows which ECS token features are hardest to reconstruct for attack events.
-//! 6. Repeats with TMCoalescedAutoEncoder for comparison.
+//! 2. Labels every event with its file's ATT&CK tactic index (from the Mordor
+//!    directory structure: execution/, credential_access/, etc.).
+//! 3. Fits an encoder vocabulary on ALL data; caps to top-1024 tokens.
+//! 4. Trains the autoencoder on 80% of all events (unsupervised — no labels used).
+//! 5. Reports per-tactic mean reconstruction error on the 20% test set.
+//! 6. Shows which ECS token features are hardest to reconstruct overall.
+//! 7. Repeats with TMCoalescedAutoEncoder for comparison.
 //!
 //! ## Run
 //! ```text
@@ -23,7 +23,7 @@
 
 #[path = "sysmon_shared.rs"]
 mod shared;
-use shared::{basename, hive_of, is_attack_behavior};
+use shared::{basename, hive_of};
 
 use std::{collections::HashMap, collections::HashSet, fs, io::Write, path::Path};
 use tmu_rs::{Encoder, Rng, TMAutoEncoder, TMCoalescedAutoEncoder};
@@ -32,9 +32,7 @@ use tmu_rs::{Encoder, Rng, TMAutoEncoder, TMCoalescedAutoEncoder};
 // 16K raw features → 21 GB.  Cap to top-N by frequency to keep it < 100 MB.
 const MAX_VOCAB: usize = 1024;
 
-// Mini-batch size for training.  Encoding the full 428K training set upfront
-// costs ~116 MB; with mini-batches we only hold MINI_BATCH_SIZE × 34 words
-// (~560 KB) in memory at a time and can report progress within each epoch.
+// Mini-batch size for training.
 const MINI_BATCH_SIZE: usize = 4096;
 
 // ── dataset discovery ─────────────────────────────────────────────────────────
@@ -52,6 +50,25 @@ const TACTIC_DIRS: &[&str] = &[
     "collection",
 ];
 
+// ── tactic map: ZIP stem → tactic index, persisted between runs ──────────────
+
+const TACTIC_MAP_FILE: &str = "mordor_data/tactic_map.json";
+
+fn load_tactic_map() -> HashMap<String, usize> {
+    fs::read_to_string(TACTIC_MAP_FILE)
+        .ok()
+        .and_then(|s| serde_json::from_str::<HashMap<String, usize>>(&s).ok())
+        .unwrap_or_default()
+}
+
+fn file_tactic_idx(json_name: &str, map: &HashMap<String, usize>) -> usize {
+    map.iter()
+        .find(|(stem, _)| json_name.starts_with(stem.as_str()))
+        .map(|(_, &idx)| idx)
+        .unwrap_or(0)
+}
+
+// ── field skip list (GUIDs, PIDs, timestamps, raw hashes, stack traces) ───────
 
 const SKIP_FIELDS: &[&str] = &[
     "ProcessGuid",
@@ -238,10 +255,10 @@ fn event_to_tokens(v: &serde_json::Value, eid: u32) -> Vec<String> {
     t
 }
 
-
 // ── file parsing ──────────────────────────────────────────────────────────────
 
-fn parse_file(path: &str) -> std::io::Result<Vec<(Vec<String>, bool)>> {
+// All events in a file receive the file's tactic index as the label.
+fn parse_file(path: &str, tactic_idx: usize) -> std::io::Result<Vec<(Vec<String>, usize)>> {
     let text = fs::read_to_string(path)?;
     let mut events = Vec::new();
     for line in text.lines() {
@@ -256,8 +273,7 @@ fn parse_file(path: &str) -> std::io::Result<Vec<(Vec<String>, bool)>> {
             continue;
         }
         let eid = v["EventID"].as_u64().unwrap_or(0) as u32;
-        let attack = is_attack_behavior(&v, eid);
-        events.push((event_to_tokens(&v, eid), attack));
+        events.push((event_to_tokens(&v, eid), tactic_idx));
     }
     Ok(events)
 }
@@ -266,7 +282,8 @@ fn parse_file(path: &str) -> std::io::Result<Vec<(Vec<String>, bool)>> {
 
 fn discover_and_download() {
     fs::create_dir_all(DATA_DIR).expect("could not create mordor_data/");
-    for tactic in TACTIC_DIRS {
+    let mut tactic_map = load_tactic_map();
+    for (tactic_idx, tactic) in TACTIC_DIRS.iter().enumerate() {
         let api_url = format!(
             "https://api.github.com/repos/OTRF/Security-Datasets/contents/datasets/atomic/windows/{tactic}/host"
         );
@@ -294,6 +311,7 @@ fn discover_and_download() {
                 continue;
             }
             let stem = name.trim_end_matches(".zip");
+            tactic_map.entry(stem.to_string()).or_insert(tactic_idx);
             let url = entry["download_url"].as_str().unwrap_or("");
             if url.is_empty() {
                 continue;
@@ -322,9 +340,16 @@ fn discover_and_download() {
             }
         }
     }
+    if let Ok(json) = serde_json::to_string_pretty(&tactic_map) {
+        let _ = fs::write(TACTIC_MAP_FILE, json);
+    }
 }
 
-fn collect_json_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+fn collect_json_files(
+    dir: &Path,
+    tactic_map: &HashMap<String, usize>,
+    out: &mut Vec<(std::path::PathBuf, usize)>,
+) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -334,24 +359,20 @@ fn collect_json_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
             if path.file_name().and_then(|n| n.to_str()) == Some("__MACOSX") {
                 continue;
             }
-            collect_json_files(&path, out);
+            collect_json_files(&path, tactic_map, out);
         } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !name.starts_with("._") {
-                out.push(path);
+            if name.starts_with("._") || name == "tactic_map.json" {
+                continue;
             }
+            let tactic_idx = file_tactic_idx(name, tactic_map);
+            out.push((path, tactic_idx));
         }
     }
 }
 
 // ── per-sample reconstruction error ──────────────────────────────────────────
 
-/// Fraction of feature bits incorrectly reconstructed for one sample.
-/// Returns a value in [0.0, 1.0]; higher = more anomalous.
-///
-/// Input bits are determined by checking whether each vocabulary token is
-/// present in the input token set — equivalent to what the encoder packs, and
-/// avoids accessing the private inner field of EncodedSample.
 fn recon_error(ae: &TMAutoEncoder, enc: &Encoder, tokens: &[&str]) -> f64 {
     let sample = enc.encode_one_categorical(tokens);
     let recon = ae.reconstruct(&sample);
@@ -380,75 +401,8 @@ fn recon_error_coalesced(ae: &TMCoalescedAutoEncoder, enc: &Encoder, tokens: &[&
     errors as f64 / nf as f64
 }
 
-// ── anomaly detection metrics ─────────────────────────────────────────────────
-
-/// Precision / recall / accuracy at a fixed threshold on (score, is_attack) pairs.
-fn metrics_at(scores: &[(f64, bool)], threshold: f64) -> (f64, f64, f64) {
-    let mut tp = 0usize;
-    let mut fp = 0usize;
-    let mut tn = 0usize;
-    let mut fn_ = 0usize;
-    for &(s, attack) in scores {
-        match (s >= threshold, attack) {
-            (true, true) => tp += 1,
-            (true, false) => fp += 1,
-            (false, false) => tn += 1,
-            (false, true) => fn_ += 1,
-        }
-    }
-    let precision = if tp + fp == 0 {
-        0.0
-    } else {
-        tp as f64 / (tp + fp) as f64
-    };
-    let recall = if tp + fn_ == 0 {
-        0.0
-    } else {
-        tp as f64 / (tp + fn_) as f64
-    };
-    let accuracy = (tp + tn) as f64 / scores.len() as f64;
-    (precision, recall, accuracy)
-}
-
-/// Sweep thresholds and return the one maximising balanced accuracy
-/// (mean of sensitivity and specificity).
-fn best_threshold(scores: &[(f64, bool)]) -> f64 {
-    let mut best_t = 0.0f64;
-    let mut best_bal = 0.0f64;
-    let n_attack = scores.iter().filter(|&&(_, a)| a).count();
-    let n_benign = scores.len() - n_attack;
-    if n_attack == 0 || n_benign == 0 {
-        return 0.0;
-    }
-    // Try every unique score as a threshold.
-    let mut thresholds: Vec<f64> = scores.iter().map(|&(s, _)| s).collect();
-    thresholds.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    thresholds.dedup();
-    for &t in &thresholds {
-        let tp = scores
-            .iter()
-            .filter(|&&(s, a)| a && s >= t)
-            .count() as f64;
-        let tn = scores
-            .iter()
-            .filter(|&&(s, a)| !a && s < t)
-            .count() as f64;
-        let sensitivity = tp / n_attack as f64;
-        let specificity = tn / n_benign as f64;
-        let bal = (sensitivity + specificity) / 2.0;
-        if bal > best_bal {
-            best_bal = bal;
-            best_t = t;
-        }
-    }
-    best_t
-}
-
 // ── per-feature error profile ─────────────────────────────────────────────────
 
-/// For each feature bit, compute the average reconstruction error across samples.
-/// Returns (feature_index, avg_error) sorted descending — features most often
-/// wrong for the given sample set.
 fn per_feature_error(
     ae: &TMAutoEncoder,
     enc: &Encoder,
@@ -485,9 +439,8 @@ fn per_feature_error(
 
 fn run_vanilla(
     encoder: &Encoder,
-    train_benign: &[Vec<String>],
-    test_benign: &[Vec<String>],
-    test_attack: &[Vec<String>],
+    train: &[Vec<String>],
+    test: &[(Vec<String>, usize)],
 ) {
     println!("\n━━━ TMAutoEncoder ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
@@ -500,102 +453,58 @@ fn run_vanilla(
         "config: n_features={nf}  clauses_per_output={clauses_per_output}  \
          threshold={threshold}  s={s}  mini_batch={MINI_BATCH_SIZE}"
     );
-    println!(
-        "train on {} benign events (unsupervised, no labels)\n",
-        train_benign.len()
-    );
-
-    // Pre-encode only the test sets — small enough to hold in memory, reused every epoch.
-    let te_ben_refs: Vec<Vec<&str>> = test_benign
-        .iter()
-        .map(|t| t.iter().map(String::as_str).collect())
-        .collect();
-    let te_ben_slices: Vec<&[&str]> = te_ben_refs.iter().map(|v| v.as_slice()).collect();
-    let batch_test_ben = encoder.encode_batch_categorical(&te_ben_slices);
-
-    let te_atk_refs: Vec<Vec<&str>> = test_attack
-        .iter()
-        .map(|t| t.iter().map(String::as_str).collect())
-        .collect();
-    let te_atk_slices: Vec<&[&str]> = te_atk_refs.iter().map(|v| v.as_slice()).collect();
-    let batch_test_atk = encoder.encode_batch_categorical(&te_atk_slices);
+    println!("train on {} events (unsupervised)\n", train.len());
 
     let mut ae = TMAutoEncoder::with_config(nf, clauses_per_output, threshold, s, 8, true, 42);
-    // Separate RNG for epoch-level shuffling (decoupled from the model's internal RNG).
     let mut shuffle_rng = Rng::new(0xDEAD_BEEF);
 
-    println!("{:>6}  {:>12}  {:>12}  {:>8}", "Epoch", "Ben recon", "Atk recon", "Gap");
-    let n_train = train_benign.len();
+    let n_train = train.len();
     let n_batches = n_train.div_ceil(MINI_BATCH_SIZE);
     for epoch in 1..=5 {
-        // Shuffle training indices for this epoch.
         let mut order: Vec<usize> = (0..n_train).collect();
         for i in (1..n_train).rev() {
             let j = shuffle_rng.below(i + 1);
             order.swap(i, j);
         }
-        // Encode and train one mini-batch at a time — peak extra memory is
-        // MINI_BATCH_SIZE × words × 8 bytes ≈ 560 KB instead of ~116 MB.
         for (b, chunk) in order.chunks(MINI_BATCH_SIZE).enumerate() {
             print!("  epoch {epoch}  batch {}/{n_batches}\r", b + 1);
             let _ = std::io::stdout().flush();
             let refs: Vec<Vec<&str>> = chunk
                 .iter()
-                .map(|&i| train_benign[i].iter().map(String::as_str).collect())
+                .map(|&i| train[i].iter().map(String::as_str).collect())
                 .collect();
             let slices: Vec<&[&str]> = refs.iter().map(|v| v.as_slice()).collect();
             let mini = encoder.encode_batch_categorical(&slices);
             ae.fit_epoch(&mini);
         }
-        let ben = ae.reconstruction_accuracy(&batch_test_ben);
-        let atk = ae.reconstruction_accuracy(&batch_test_atk);
-        println!("{epoch:>6}  {ben:>12.4}  {atk:>12.4}  {:>8.4}", ben - atk);
+        println!("  epoch {epoch} complete                    ");
     }
 
-    // Compute per-sample anomaly scores on test set.
-    let mut scores: Vec<(f64, bool)> = Vec::new();
-    for tokens in test_benign {
+    // Per-tactic reconstruction error on test set.
+    let n_tactics = TACTIC_DIRS.len();
+    let mut tactic_errors: Vec<Vec<f64>> = vec![Vec::new(); n_tactics];
+    for (tokens, tactic_idx) in test {
         let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-        scores.push((recon_error(&ae, encoder, &refs), false));
+        let err = recon_error(&ae, encoder, &refs);
+        tactic_errors[*tactic_idx].push(err);
     }
-    for tokens in test_attack {
-        let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-        scores.push((recon_error(&ae, encoder, &refs), true));
-    }
-
-    let benign_scores: Vec<f64> = scores
-        .iter()
-        .filter(|&&(_, a)| !a)
-        .map(|&(s, _)| s)
-        .collect();
-    let attack_scores: Vec<f64> = scores
-        .iter()
-        .filter(|&&(_, a)| a)
-        .map(|&(s, _)| s)
-        .collect();
 
     let mean = |v: &[f64]| -> f64 {
-        if v.is_empty() {
-            0.0
-        } else {
-            v.iter().sum::<f64>() / v.len() as f64
-        }
+        if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 }
     };
-    println!(
-        "\nmean recon error — benign: {:.4}  attack: {:.4}",
-        mean(&benign_scores),
-        mean(&attack_scores)
-    );
 
-    let t = best_threshold(&scores);
-    let (prec, rec, acc) = metrics_at(&scores, t);
-    println!(
-        "best threshold: {t:.4}  →  accuracy={acc:.4}  precision={prec:.4}  recall={rec:.4}"
-    );
+    println!("\nper-tactic reconstruction error (higher = more unusual):");
+    println!("{:<25}  {:>8}  {:>10}", "tactic", "n_test", "mean_err");
+    println!("{}", "─".repeat(50));
+    for (idx, tactic) in TACTIC_DIRS.iter().enumerate() {
+        let errs = &tactic_errors[idx];
+        println!("{:<25}  {:>8}  {:>10.4}", tactic, errs.len(), mean(errs));
+    }
 
-    // Per-feature error profile: top features most often wrong for attack events.
-    println!("\ntop-10 features with highest reconstruction error on attack test events:");
-    let profile = per_feature_error(&ae, encoder, test_attack);
+    // Top features most often wrong across all test events.
+    let all_test_tokens: Vec<Vec<String>> = test.iter().map(|(t, _)| t.clone()).collect();
+    println!("\ntop-10 features with highest reconstruction error on test events:");
+    let profile = per_feature_error(&ae, encoder, &all_test_tokens);
     for (feat, err) in profile.iter().take(10) {
         let tok = encoder.vocab_token(*feat);
         if !tok.contains("<UNK>") && !tok.contains("<OOV>") {
@@ -603,7 +512,6 @@ fn run_vanilla(
         }
     }
 
-    // Show clause rules for the output bit most often wrong on attack events.
     if let Some(&(top_bit, _)) = profile
         .iter()
         .find(|(f, _)| !encoder.vocab_token(*f).contains("<UNK>"))
@@ -634,9 +542,8 @@ fn run_vanilla(
 
 fn run_coalesced(
     encoder: &Encoder,
-    train_benign: &[Vec<String>],
-    test_benign: &[Vec<String>],
-    test_attack: &[Vec<String>],
+    train: &[Vec<String>],
+    test: &[(Vec<String>, usize)],
 ) {
     println!(
         "\n━━━ TMCoalescedAutoEncoder ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -651,31 +558,12 @@ fn run_coalesced(
         "config: n_features={nf}  n_clauses={n_clauses} (shared)  \
          threshold={threshold}  s={s}  mini_batch={MINI_BATCH_SIZE}"
     );
-    println!(
-        "train on {} benign events (unsupervised, no labels)\n",
-        train_benign.len()
-    );
+    println!("train on {} events (unsupervised)\n", train.len());
 
-    let te_ben_refs: Vec<Vec<&str>> = test_benign
-        .iter()
-        .map(|t| t.iter().map(String::as_str).collect())
-        .collect();
-    let te_ben_slices: Vec<&[&str]> = te_ben_refs.iter().map(|v| v.as_slice()).collect();
-    let batch_test_ben = encoder.encode_batch_categorical(&te_ben_slices);
-
-    let te_atk_refs: Vec<Vec<&str>> = test_attack
-        .iter()
-        .map(|t| t.iter().map(String::as_str).collect())
-        .collect();
-    let te_atk_slices: Vec<&[&str]> = te_atk_refs.iter().map(|v| v.as_slice()).collect();
-    let batch_test_atk = encoder.encode_batch_categorical(&te_atk_slices);
-
-    let mut ae =
-        TMCoalescedAutoEncoder::with_config(nf, n_clauses, threshold, s, 8, true, 42);
+    let mut ae = TMCoalescedAutoEncoder::with_config(nf, n_clauses, threshold, s, 8, true, 42);
     let mut shuffle_rng = Rng::new(0xDEAD_BEEF);
 
-    println!("{:>6}  {:>12}  {:>12}  {:>8}", "Epoch", "Ben recon", "Atk recon", "Gap");
-    let n_train = train_benign.len();
+    let n_train = train.len();
     let n_batches = n_train.div_ceil(MINI_BATCH_SIZE);
     for epoch in 1..=5 {
         let mut order: Vec<usize> = (0..n_train).collect();
@@ -688,56 +576,34 @@ fn run_coalesced(
             let _ = std::io::stdout().flush();
             let refs: Vec<Vec<&str>> = chunk
                 .iter()
-                .map(|&i| train_benign[i].iter().map(String::as_str).collect())
+                .map(|&i| train[i].iter().map(String::as_str).collect())
                 .collect();
             let slices: Vec<&[&str]> = refs.iter().map(|v| v.as_slice()).collect();
             let mini = encoder.encode_batch_categorical(&slices);
             ae.fit_epoch(&mini);
         }
-        let ben = ae.reconstruction_accuracy(&batch_test_ben);
-        let atk = ae.reconstruction_accuracy(&batch_test_atk);
-        println!("{epoch:>6}  {ben:>12.4}  {atk:>12.4}  {:>8.4}", ben - atk);
+        println!("  epoch {epoch} complete                    ");
     }
 
-    let mut scores: Vec<(f64, bool)> = Vec::new();
-    for tokens in test_benign {
+    let n_tactics = TACTIC_DIRS.len();
+    let mut tactic_errors: Vec<Vec<f64>> = vec![Vec::new(); n_tactics];
+    for (tokens, tactic_idx) in test {
         let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-        scores.push((recon_error_coalesced(&ae, encoder, &refs), false));
+        let err = recon_error_coalesced(&ae, encoder, &refs);
+        tactic_errors[*tactic_idx].push(err);
     }
-    for tokens in test_attack {
-        let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
-        scores.push((recon_error_coalesced(&ae, encoder, &refs), true));
-    }
-
-    let benign_scores: Vec<f64> = scores
-        .iter()
-        .filter(|&&(_, a)| !a)
-        .map(|&(s, _)| s)
-        .collect();
-    let attack_scores: Vec<f64> = scores
-        .iter()
-        .filter(|&&(_, a)| a)
-        .map(|&(s, _)| s)
-        .collect();
 
     let mean = |v: &[f64]| -> f64 {
-        if v.is_empty() {
-            0.0
-        } else {
-            v.iter().sum::<f64>() / v.len() as f64
-        }
+        if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 }
     };
-    println!(
-        "\nmean recon error — benign: {:.4}  attack: {:.4}",
-        mean(&benign_scores),
-        mean(&attack_scores)
-    );
 
-    let t = best_threshold(&scores);
-    let (prec, rec, acc) = metrics_at(&scores, t);
-    println!(
-        "best threshold: {t:.4}  →  accuracy={acc:.4}  precision={prec:.4}  recall={rec:.4}"
-    );
+    println!("\nper-tactic reconstruction error (higher = more unusual):");
+    println!("{:<25}  {:>8}  {:>10}", "tactic", "n_test", "mean_err");
+    println!("{}", "─".repeat(50));
+    for (idx, tactic) in TACTIC_DIRS.iter().enumerate() {
+        let errs = &tactic_errors[idx];
+        println!("{:<25}  {:>8}  {:>10.4}", tactic, errs.len(), mean(errs));
+    }
 
     // Mixed-polarity clause stats (a coalesced-specific property).
     let mixed = (0..n_clauses)
@@ -758,22 +624,26 @@ fn run_coalesced(
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
-    println!("Mordor Autoencoder — unsupervised anomaly detection on Sysmon events\n");
+    println!("Mordor Autoencoder — per-tactic reconstruction error on Sysmon events\n");
     println!("Downloading / verifying Mordor datasets…");
     discover_and_download();
 
-    let mut json_files = Vec::new();
-    collect_json_files(Path::new(DATA_DIR), &mut json_files);
-    json_files.sort();
+    let tactic_map = load_tactic_map();
+    let mut json_files: Vec<(std::path::PathBuf, usize)> = Vec::new();
+    collect_json_files(Path::new(DATA_DIR), &tactic_map, &mut json_files);
+    json_files.sort_by_key(|(p, _)| p.clone());
 
-    let mut all_events: Vec<(Vec<String>, bool)> = Vec::new();
-    for path in &json_files {
-        match parse_file(path.to_str().unwrap()) {
+    let mut all_events: Vec<(Vec<String>, usize)> = Vec::new();
+    let mut tactic_counts = vec![0usize; TACTIC_DIRS.len()];
+    for (path, tactic_idx) in &json_files {
+        match parse_file(path.to_str().unwrap(), *tactic_idx) {
             Ok(evs) => {
                 let n = evs.len();
                 if n > 0 {
+                    tactic_counts[*tactic_idx] += n;
                     println!(
-                        "  {} → {n} events",
+                        "  [{}] {} → {n} events",
+                        TACTIC_DIRS[*tactic_idx],
                         path.file_name().unwrap().to_str().unwrap()
                     );
                 }
@@ -783,51 +653,37 @@ fn main() {
         }
     }
 
-    let n_attack = all_events.iter().filter(|(_, a)| *a).count();
-    let n_benign = all_events.iter().filter(|(_, a)| !a).count();
-    println!("\n{n_attack} attack events  {n_benign} benign events\n");
+    println!("\nper-tactic event counts:");
+    for (idx, tactic) in TACTIC_DIRS.iter().enumerate() {
+        println!("  {idx}  {tactic:<25}  {}", tactic_counts[idx]);
+    }
+    println!("\ntotal: {} events\n", all_events.len());
 
-    if n_attack == 0 || n_benign == 0 {
-        eprintln!("ERROR: one class is empty — check behavioral rules or dataset");
+    if all_events.is_empty() {
+        eprintln!("ERROR: no events loaded — check dataset download");
         std::process::exit(1);
     }
 
-    // Shuffle deterministically, then split:
-    //   80% of benign → train (autoencoder trained on benign only)
-    //   20% of benign → test_benign
-    //   all attack    → test_attack
+    // Shuffle deterministically, then 80/20 split.
     let mut rng = Rng::new(42);
     for i in (1..all_events.len()).rev() {
         let j = rng.below(i + 1);
         all_events.swap(i, j);
     }
 
-    let mut benign: Vec<Vec<String>> = all_events
-        .iter()
-        .filter(|(_, a)| !a)
-        .map(|(t, _)| t.clone())
-        .collect();
-    let attack: Vec<Vec<String>> = all_events
-        .iter()
-        .filter(|(_, a)| *a)
-        .map(|(t, _)| t.clone())
-        .collect();
-
-    let cut = benign.len() * 4 / 5;
-    let test_benign = benign.split_off(cut);
-    let train_benign = benign;
+    let cut = all_events.len() * 4 / 5;
+    let test_events = all_events.split_off(cut);
+    let train_events = all_events;
 
     println!(
-        "split: train_benign={}  test_benign={}  test_attack={}",
-        train_benign.len(),
-        test_benign.len(),
-        attack.len()
+        "split: train={}  test={}",
+        train_events.len(),
+        test_events.len()
     );
 
-    // Count token frequencies across ALL events to find the most informative features.
-    // The autoencoder's memory scales as O(n_features²), so we must cap the vocabulary.
+    // Count token frequencies across ALL events to select top-K vocabulary.
     let mut freq: HashMap<String, usize> = HashMap::new();
-    for (tokens, _) in &all_events {
+    for (tokens, _) in train_events.iter().chain(test_events.iter()) {
         for tok in tokens {
             *freq.entry(tok.clone()).or_insert(0) += 1;
         }
@@ -841,8 +697,6 @@ fn main() {
         .collect();
     println!("top-{MAX_VOCAB} vocabulary tokens selected (raw vocab: {})", freq_vec.len());
 
-    // Filter every event's token list to the top-K set.
-    // Unknown tokens map to the encoder's per-column <UNK> sentinel automatically.
     let filter_tokens = |tokens: &[String]| -> Vec<String> {
         tokens
             .iter()
@@ -851,23 +705,25 @@ fn main() {
             .collect()
     };
 
-    let train_benign_f: Vec<Vec<String>> = train_benign.iter().map(|t| filter_tokens(t)).collect();
-    let test_benign_f: Vec<Vec<String>> = test_benign.iter().map(|t| filter_tokens(t)).collect();
-    let attack_f: Vec<Vec<String>> = attack.iter().map(|t| filter_tokens(t)).collect();
-
-    // Build encoder from top-K filtered tokens across all events.
-    let all_filtered: Vec<Vec<String>> = all_events
+    let train_filtered: Vec<Vec<String>> = train_events
         .iter()
         .map(|(t, _)| filter_tokens(t))
         .collect();
-    let all_refs: Vec<Vec<&str>> = all_filtered
+    let test_filtered: Vec<(Vec<String>, usize)> = test_events
         .iter()
+        .map(|(t, idx)| (filter_tokens(t), *idx))
+        .collect();
+
+    // Build encoder from all filtered tokens.
+    let all_refs: Vec<Vec<&str>> = train_filtered
+        .iter()
+        .chain(test_filtered.iter().map(|(t, _)| t))
         .map(|t| t.iter().map(String::as_str).collect())
         .collect();
     let all_slices: Vec<&[&str]> = all_refs.iter().map(|v| v.as_slice()).collect();
     let encoder = Encoder::fit_categorical(&all_slices);
     println!("encoder vocabulary: {} features\n", encoder.n_features());
 
-    run_vanilla(&encoder, &train_benign_f, &test_benign_f, &attack_f);
-    run_coalesced(&encoder, &train_benign_f, &test_benign_f, &attack_f);
+    run_vanilla(&encoder, &train_filtered, &test_filtered);
+    run_coalesced(&encoder, &train_filtered, &test_filtered);
 }
