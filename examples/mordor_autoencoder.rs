@@ -458,17 +458,26 @@ fn run_vanilla(
     let mut ae = TMAutoEncoder::with_config(nf, clauses_per_output, threshold, s, 8, true, 42);
     let mut shuffle_rng = Rng::new(0xDEAD_BEEF);
 
+    // Pre-encode a fixed 2000-event probe for per-epoch reconstruction accuracy.
+    let probe_n = test.len().min(2000);
+    let probe_refs: Vec<Vec<&str>> = test[..probe_n]
+        .iter()
+        .map(|(t, _)| t.iter().map(String::as_str).collect())
+        .collect();
+    let probe_slices: Vec<&[&str]> = probe_refs.iter().map(|v| v.as_slice()).collect();
+    let probe_enc = encoder.encode_batch_categorical(&probe_slices);
+
     let n_train = train.len();
     let n_batches = n_train.div_ceil(MINI_BATCH_SIZE);
     for epoch in 1..=5 {
+        let t0 = std::time::Instant::now();
         let mut order: Vec<usize> = (0..n_train).collect();
         for i in (1..n_train).rev() {
             let j = shuffle_rng.below(i + 1);
             order.swap(i, j);
         }
         for (b, chunk) in order.chunks(MINI_BATCH_SIZE).enumerate() {
-            print!("  epoch {epoch}  batch {}/{n_batches}\r", b + 1);
-            let _ = std::io::stdout().flush();
+            let bt0 = std::time::Instant::now();
             let refs: Vec<Vec<&str>> = chunk
                 .iter()
                 .map(|&i| train[i].iter().map(String::as_str).collect())
@@ -476,8 +485,20 @@ fn run_vanilla(
             let slices: Vec<&[&str]> = refs.iter().map(|v| v.as_slice()).collect();
             let mini = encoder.encode_batch_categorical(&slices);
             ae.fit_epoch(&mini);
+            let evps = chunk.len() as f64 / bt0.elapsed().as_secs_f64();
+            if b % 10 == 9 || b + 1 == n_batches {
+                println!(
+                    "  epoch {epoch:>2}  batch {:>3}/{n_batches}  {evps:>7.0} ev/s",
+                    b + 1
+                );
+                let _ = std::io::stdout().flush();
+            }
         }
-        println!("  epoch {epoch} complete                    ");
+        let recon_acc = ae.reconstruction_accuracy(&probe_enc);
+        println!(
+            "epoch {epoch:>2}  recon_acc={recon_acc:.4}  ({:.1}s total)\n",
+            t0.elapsed().as_secs_f32()
+        );
     }
 
     // Per-tactic reconstruction error on test set.
@@ -563,17 +584,25 @@ fn run_coalesced(
     let mut ae = TMCoalescedAutoEncoder::with_config(nf, n_clauses, threshold, s, 8, true, 42);
     let mut shuffle_rng = Rng::new(0xDEAD_BEEF);
 
+    let probe_n = test.len().min(2000);
+    let probe_refs: Vec<Vec<&str>> = test[..probe_n]
+        .iter()
+        .map(|(t, _)| t.iter().map(String::as_str).collect())
+        .collect();
+    let probe_slices: Vec<&[&str]> = probe_refs.iter().map(|v| v.as_slice()).collect();
+    let probe_enc = encoder.encode_batch_categorical(&probe_slices);
+
     let n_train = train.len();
     let n_batches = n_train.div_ceil(MINI_BATCH_SIZE);
     for epoch in 1..=5 {
+        let t0 = std::time::Instant::now();
         let mut order: Vec<usize> = (0..n_train).collect();
         for i in (1..n_train).rev() {
             let j = shuffle_rng.below(i + 1);
             order.swap(i, j);
         }
         for (b, chunk) in order.chunks(MINI_BATCH_SIZE).enumerate() {
-            print!("  epoch {epoch}  batch {}/{n_batches}\r", b + 1);
-            let _ = std::io::stdout().flush();
+            let bt0 = std::time::Instant::now();
             let refs: Vec<Vec<&str>> = chunk
                 .iter()
                 .map(|&i| train[i].iter().map(String::as_str).collect())
@@ -581,8 +610,20 @@ fn run_coalesced(
             let slices: Vec<&[&str]> = refs.iter().map(|v| v.as_slice()).collect();
             let mini = encoder.encode_batch_categorical(&slices);
             ae.fit_epoch(&mini);
+            let evps = chunk.len() as f64 / bt0.elapsed().as_secs_f64();
+            if b % 10 == 9 || b + 1 == n_batches {
+                println!(
+                    "  epoch {epoch:>2}  batch {:>3}/{n_batches}  {evps:>7.0} ev/s",
+                    b + 1
+                );
+                let _ = std::io::stdout().flush();
+            }
         }
-        println!("  epoch {epoch} complete                    ");
+        let recon_acc = ae.reconstruction_accuracy(&probe_enc);
+        println!(
+            "epoch {epoch:>2}  recon_acc={recon_acc:.4}  ({:.1}s total)\n",
+            t0.elapsed().as_secs_f32()
+        );
     }
 
     let n_tactics = TACTIC_DIRS.len();

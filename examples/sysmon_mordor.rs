@@ -491,17 +491,24 @@ fn main() {
             order.swap(i, j);
         }
         for (b, chunk) in order.chunks(MINI_BATCH_SIZE).enumerate() {
-            print!("  epoch {epoch}  batch {}/{n_batches}\r", b + 1);
-            let _ = std::io::stdout().flush();
+            let bt0 = std::time::Instant::now();
             let slices: Vec<&[&str]> = chunk.iter().map(|&i| tr_inner[i].as_slice()).collect();
             let mini_x = encoder.encode_batch_categorical(&slices);
             let mini_y: Vec<usize> = chunk.iter().map(|&i| train_y[i]).collect();
             tm.fit_epoch(&mini_x, &mini_y);
+            let evps = chunk.len() as f64 / bt0.elapsed().as_secs_f64();
+            if b % 10 == 9 || b + 1 == n_batches {
+                println!(
+                    "  epoch {epoch:>2}  batch {:>3}/{n_batches}  {evps:>7.0} ev/s",
+                    b + 1
+                );
+                let _ = std::io::stdout().flush();
+            }
         }
         let elapsed = t0.elapsed();
         let te_acc = tm.accuracy(&test_x, &test_y) * 100.0;
         println!(
-            "epoch {epoch:>2}  test={te_acc:.2}%  ({:.1}s)",
+            "epoch {epoch:>2}  test={te_acc:.2}%  ({:.1}s total)\n",
             elapsed.as_secs_f32()
         );
     }
