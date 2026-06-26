@@ -562,15 +562,14 @@ fn main() {
                 indices.len(),
             );
         }
+        print_epoch_stats(&tm, &encoder, &test_y, epoch);
         println!();
     }
 
-    // Inference speed on pre-encoded test set (no tokenization cost).
+    // Final inference speed measurement.
     let infer_t0 = std::time::Instant::now();
     let _ = tm.accuracy(&test_x, &test_y);
     let infer_bulk_us = infer_t0.elapsed().as_secs_f64() * 1e6 / test_y.len() as f64;
-
-    // Encode+predict timing: run a single full pass over all test events.
     let fullpipe_t0 = std::time::Instant::now();
     let mut _sink = 0usize;
     for tokens in &te_inner {
@@ -578,25 +577,20 @@ fn main() {
         _sink ^= tm.predict(&s);
     }
     let fullpipe_us = fullpipe_t0.elapsed().as_secs_f64() * 1e6 / te_inner.len() as f64;
+    println!("inference speed ({} test events):", test_y.len());
+    println!("  pre-encoded predict:  {:.2}µs/event  ({:.0} ev/s)", infer_bulk_us, 1e6 / infer_bulk_us);
+    println!("  encode + predict:     {:.2}µs/event  ({:.0} ev/s)", fullpipe_us, 1e6 / fullpipe_us);
+}
 
-    println!(
-        "\ninference speed ({} test events):",
-        test_y.len()
-    );
-    println!(
-        "  pre-encoded predict:  {:.2}µs/event  ({:.0} ev/s)",
-        infer_bulk_us, 1e6 / infer_bulk_us
-    );
-    println!(
-        "  encode + predict:     {:.2}µs/event  ({:.0} ev/s)",
-        fullpipe_us, 1e6 / fullpipe_us
-    );
-
+fn print_epoch_stats(
+    tm: &CoalescedTsetlinMachine,
+    encoder: &Encoder,
+    test_y: &[usize],
+    epoch: usize,
+) {
     let meaningful_prefixes = MEANINGFUL_PREFIXES;
 
-    // ── clause statistics ─────────────────────────────────────────────────────
-
-    println!("\n━━━ clause statistics ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    println!("━━━ epoch {epoch} clause statistics ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
     // Per-class: pos/neg clause counts, mean & max weight.
     println!("{:<25}  {:>10}  {:>10}  {:>9}  {:>6}", "tactic", "pos_clauses", "neg_clauses", "mean_w_pos", "max_w");
@@ -620,9 +614,9 @@ fn main() {
         println!("  {:>9}  {:>3}  {:>4.0}%  {}", label, cnt, pct, "█".repeat((pct / 3.0) as usize));
     }
 
-    // Top-20 most frequent positive literal tokens across all positively-weighted clauses.
+    // Token frequency across all positively-weighted clauses.
     let mut token_freq: HashMap<usize, usize> = HashMap::new();
-    let mut token_class_set: HashMap<usize, u8> = HashMap::new(); // bitmask of classes
+    let mut token_class_set: HashMap<usize, u8> = HashMap::new();
     for class in 0..TACTIC_DIRS.len() {
         for c in 0..tm.n_clauses() {
             if tm.clause_weight(class, c) > 0 {
@@ -638,14 +632,13 @@ fn main() {
     let mut freq_vec: Vec<(usize, usize)> = token_freq.into_iter().collect();
     freq_vec.sort_by(|a, b| b.1.cmp(&a.1));
 
-    println!("\ntop-20 most common positive literal tokens (all classes × clauses):");
+    println!("\ntop-20 most common positive literal tokens:");
     println!("  {:>5}  {:>6}  token", "count", "n_cls");
     for &(feat, count) in freq_vec.iter().take(20) {
         let n_cls = token_class_set[&feat].count_ones();
         println!("  {:>5}  {:>6}  {}", count, n_cls, encoder.vocab_token(feat));
     }
 
-    // Top attack-relevant tokens (meaningful prefix only).
     let atk_tokens: Vec<_> = freq_vec.iter()
         .filter(|&&(feat, _)| meaningful_prefixes.iter().any(|p| encoder.vocab_token(feat).starts_with(p)))
         .take(20)
@@ -657,7 +650,6 @@ fn main() {
         println!("  {:>5}  {:>6}  {}", count, n_cls, encoder.vocab_token(feat));
     }
 
-    // Class-exclusive tokens: appear in positive clauses of exactly one class.
     println!("\nclass-exclusive tokens (positive in exactly 1 class's clauses):");
     for (class, tactic) in TACTIC_DIRS.iter().enumerate() {
         let excl: Vec<_> = freq_vec.iter()
@@ -666,21 +658,15 @@ fn main() {
             .collect();
         if excl.is_empty() { continue; }
         print!("  {tactic:<25}");
-        for &&(feat, _) in &excl {
-            print!("  {}", encoder.vocab_token(feat));
-        }
+        for &&(feat, _) in &excl { print!("  {}", encoder.vocab_token(feat)); }
         println!();
     }
 
-    // ── top-5 rules per tactic with annotations ───────────────────────────────
-
-    println!("\n━━━ top rules per tactic (annotated) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    println!("\n━━━ epoch {epoch} top rules per tactic ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
     for (class, tactic) in TACTIC_DIRS.iter().enumerate() {
-        let n_class = test_y.iter().filter(|&&y| y == class).count();
-        if n_class == 0 { continue; }
+        if test_y.iter().filter(|&&y| y == class).count() == 0 { continue; }
         println!("── {tactic} (class {class}) ──");
-
         let mut ranked: Vec<usize> = Vec::new();
         for &max_lits in &[30usize, 60, 120, 300, usize::MAX] {
             ranked = (0..tm.n_clauses())
@@ -705,7 +691,6 @@ fn main() {
             });
             mb.cmp(&ma).then(wb.cmp(&wa)).then(la.cmp(&lb))
         });
-
         for (rank, &c) in ranked.iter().take(5).enumerate() {
             let rule = tm.clause_rule(c);
             let w = tm.clause_weight(class, c);
@@ -718,11 +703,8 @@ fn main() {
             println!("  [{}] w={w}{neg_sfx}", rank + 1);
             for tok in &tokens {
                 let note = explain_token(tok);
-                if note.is_empty() {
-                    println!("       {tok}");
-                } else {
-                    println!("       {tok:<55}  ← {note}");
-                }
+                if note.is_empty() { println!("       {tok}"); }
+                else { println!("       {tok:<55}  ← {note}"); }
             }
         }
         println!();
