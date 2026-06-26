@@ -233,27 +233,55 @@ fn fetch_mitre_attack() -> (HashMap<String, String>, HashMap<String, String>) {
     let mut detects: HashMap<String, String> = HashMap::new();
 
     if let Some(objects) = bundle["objects"].as_array() {
+        // Pass 1: collect technique names from non-revoked/deprecated entries only
         for obj in objects {
             if obj["type"].as_str() != Some("attack-pattern") { continue; }
             if obj["revoked"].as_bool() == Some(true)
                 || obj["x_mitre_deprecated"].as_bool() == Some(true) { continue; }
             let name = obj["name"].as_str().unwrap_or("").to_string();
-            let detection = obj["x_mitre_detection"].as_str().unwrap_or("").to_string();
             if let Some(refs) = obj["external_references"].as_array() {
                 for r in refs {
                     if r["source_name"].as_str() == Some("mitre-attack") {
                         if let Some(id) = r["external_id"].as_str() {
                             if id.starts_with('T') && id.len() >= 5 {
                                 names.insert(id.to_string(), name.clone());
-                                if !detection.is_empty() {
-                                    detects.insert(id.to_string(), detection.clone());
-                                }
                                 if let Some(dot) = id.find('.') {
-                                    let parent = &id[..dot];
-                                    names.entry(parent.to_string()).or_insert_with(|| name.clone());
-                                    if !detection.is_empty() {
-                                        detects.entry(parent.to_string()).or_insert_with(|| detection.clone());
-                                    }
+                                    names.entry(id[..dot].to_string()).or_insert_with(|| name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pass 2: aggregate detection guidance text from ALL entries (including revoked).
+        // Some technique families (e.g. T1562) are entirely revoked in STIX versioning
+        // but still represent valid ATT&CK techniques with useful description text.
+        // Fall back to `description` when `x_mitre_detection` is absent (ATT&CK v14+).
+        for obj in objects {
+            if obj["type"].as_str() != Some("attack-pattern") { continue; }
+            let text = obj["x_mitre_detection"].as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| obj["description"].as_str().filter(|s| !s.is_empty()))
+                .unwrap_or("")
+                .to_string();
+            if text.is_empty() { continue; }
+            if let Some(refs) = obj["external_references"].as_array() {
+                for r in refs {
+                    if r["source_name"].as_str() == Some("mitre-attack") {
+                        if let Some(id) = r["external_id"].as_str() {
+                            if id.starts_with('T') && id.len() >= 5 {
+                                // Append — sub-techniques accumulate into the same key
+                                let e = detects.entry(id.to_string()).or_insert_with(String::new);
+                                if !e.is_empty() { e.push(' '); }
+                                e.push_str(&text);
+                                // Also contribute to parent
+                                if let Some(dot) = id.find('.') {
+                                    let parent = id[..dot].to_string();
+                                    let pe = detects.entry(parent).or_insert_with(String::new);
+                                    if !pe.is_empty() { pe.push(' '); }
+                                    pe.push_str(&text);
                                 }
                             }
                         }
