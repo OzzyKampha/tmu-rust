@@ -22,7 +22,7 @@
 
 #[path = "sysmon_shared.rs"]
 mod shared;
-use shared::{basename, explain_token, hive_of, is_attack_behavior, MEANINGFUL_PREFIXES};
+use shared::{basename, car_tactic, explain_token, hive_of, is_attack_behavior, MEANINGFUL_PREFIXES};
 
 use std::{collections::HashMap, fs, io::Write, path::Path};
 use tmu_rs::{CoalescedTsetlinMachine, Encoder, Rng};
@@ -270,8 +270,9 @@ fn event_to_tokens(v: &serde_json::Value, eid: u32) -> Vec<String> {
 
 // ── parse one NDJSON file ──────────────────────────────────────────────────────
 
-// All events in a file receive the file's tactic index as the label.
-// This uses the Mordor dataset's own labels (tactic directory structure).
+// Events are labeled by the file's tactic (from Mordor directory structure) unless
+// car_tactic() returns a high-confidence per-event override based on what the event
+// actually does (e.g. wmiprvse.exe parent → lateral_movement regardless of file label).
 fn parse_file(path: &str, tactic_idx: usize) -> std::io::Result<Vec<(Vec<String>, usize)>> {
     let text = fs::read_to_string(path)?;
     let mut events = Vec::new();
@@ -288,7 +289,9 @@ fn parse_file(path: &str, tactic_idx: usize) -> std::io::Result<Vec<(Vec<String>
         }
         let eid = v["EventID"].as_u64().unwrap_or(0) as u32;
         if !is_attack_behavior(&v, eid) { continue; }
-        events.push((event_to_tokens(&v, eid), tactic_idx));
+        // Per-event CAR label overrides the file-level directory label when confident.
+        let label = car_tactic(&v, eid).unwrap_or(tactic_idx);
+        events.push((event_to_tokens(&v, eid), label));
     }
     Ok(events)
 }

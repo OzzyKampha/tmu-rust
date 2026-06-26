@@ -980,9 +980,245 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
             log_delete || prefetch || scripted
         }
 
+        // ── EID 5 — ProcessTerminate: targeted kill of security tools ────────────
+        // Only flag termination of known security/forensics processes (T1562.001).
+        5 => {
+            let image = basename(v["Image"].as_str().unwrap_or("")).to_lowercase();
+            matches!(image.as_str(),
+                "msmpeng.exe" | "msseces.exe" | "mbam.exe" | "mbamtray.exe"
+                | "avgnt.exe" | "avp.exe" | "avguard.exe" | "avgwdsvc.exe"
+                | "sysmon.exe" | "sysmon64.exe" | "winlogbeat.exe" | "elastic-agent.exe"
+                | "wireshark.exe" | "processhacker.exe" | "procmon.exe" | "procmon64.exe"
+                | "autoruns.exe" | "autorunsc.exe" | "regedit.exe"
+                | "fltmc.exe" | "bds-vision.exe" | "eguiproxy.exe")
+        }
+
+        // ── EID 24 — ClipboardChange: data collection via clipboard (T1115) ──────
+        24 => true,
+
         // ── EID 25 — ProcessTampering: hollowing / herpaderping (T1055) ──────────
         25 => true,
 
+        // ── EID 28 — FileBlockExecutable: blocked execution — evasion attempt ────
+        // Blocked by AV/WDAC = adversary tried to run a payload (T1553 / T1027).
+        28 => true,
+
         _ => false,
+    }
+}
+
+// ── CAR-based per-event tactic labeling ───────────────────────────────────────
+//
+// Returns a tactic index (0-7) based on WHAT THE EVENT DOES, not which file it
+// came from.  This overrides the file-level directory label for events where the
+// behavioral pattern unambiguously maps to a specific ATT&CK tactic.
+//
+// Tactic index: 0=execution  1=credential_access  2=defense_evasion
+//               3=discovery  4=lateral_movement   5=persistence
+//               6=privilege_escalation  7=collection
+//
+// Returns None when the behavior is ambiguous — caller keeps the file label.
+pub fn car_tactic(v: &serde_json::Value, eid: u32) -> Option<usize> {
+    match eid {
+        // ── EID 1 — ProcessCreate: most behavioral signal ────────────────────────
+        1 => {
+            let image   = basename(v["Image"].as_str().unwrap_or("")).to_lowercase();
+            let parent  = basename(v["ParentImage"].as_str().unwrap_or("")).to_lowercase();
+            let cmdline = v["CommandLine"].as_str().unwrap_or("").to_lowercase();
+            let img_path = v["Image"].as_str().unwrap_or("").to_lowercase();
+
+            // ── Lateral movement ────────────────────────────────────────────────
+            // WMI remote execution: wmiprvse.exe spawns any non-system child.
+            if parent == "wmiprvse.exe"
+                && !matches!(image.as_str(), "conhost.exe" | "wbemcons.exe" | "wbemcore.exe") {
+                return Some(4);
+            }
+            // WinRM remote execution via wsmprovhost.
+            if parent == "wsmprovhost.exe" {
+                return Some(4);
+            }
+            // PSExec / PAExec lateral tool.
+            if matches!(image.as_str(), "psexec.exe" | "psexec64.exe" | "psexesvc.exe" | "paexec.exe") {
+                return Some(4);
+            }
+            // schtasks with remote /s flag — scheduling on a remote host.
+            if image == "schtasks.exe" && (cmdline.contains(" /s ") || cmdline.contains("/s\\\\")) {
+                return Some(4);
+            }
+            // Execution from UNC share path — file copied then run remotely.
+            if img_path.starts_with("\\\\") {
+                return Some(4);
+            }
+            // DCOM lateral: mmc/dllhost spawning a scripting process.
+            if matches!(parent.as_str(), "mmc.exe" | "dllhost.exe")
+                && matches!(image.as_str(),
+                    "cmd.exe" | "powershell.exe" | "wscript.exe" | "cscript.exe")
+            {
+                return Some(4);
+            }
+
+            // ── Credential access ───────────────────────────────────────────────
+            // Direct credential-dump tools.
+            if matches!(image.as_str(),
+                "mimikatz.exe" | "rubeus.exe" | "kekeo.exe" | "safetykatz.exe"
+                | "sharpkatz.exe" | "nanodump.exe" | "dumpert.exe" | "wce.exe"
+                | "fgdump.exe" | "pwdump.exe" | "pwdump6.exe" | "pwdump7.exe"
+                | "gsecdump.exe" | "cachedump.exe" | "lazagne.exe")
+            {
+                return Some(1);
+            }
+            // procdump/comsvcs targeting lsass.
+            if (image.starts_with("procdump") || image == "rundll32.exe")
+                && (cmdline.contains("lsass") || cmdline.contains("minidump"))
+            {
+                return Some(1);
+            }
+            // reg.exe saving credential hives.
+            if image == "reg.exe" && cmdline.contains("save")
+                && (cmdline.contains("sam") || cmdline.contains("security")
+                    || cmdline.contains("system") || cmdline.contains("ntds"))
+            {
+                return Some(1);
+            }
+            // Mimikatz command syntax in any process (Invoke-Mimikatz etc.).
+            if cmdline.contains("sekurlsa::") || cmdline.contains("lsadump::")
+                || cmdline.contains("kerberos::ptt") || cmdline.contains("kerberos::list")
+                || cmdline.contains("token::elevate") || cmdline.contains("privilege::debug")
+            {
+                return Some(1);
+            }
+            // Network sniffer — credential interception (T1040).
+            if matches!(image.as_str(), "tshark.exe" | "windump.exe" | "tcpdump.exe") {
+                return Some(1);
+            }
+
+            // ── Privilege escalation ────────────────────────────────────────────
+            // Accessibility app as debugger — sticky-keys / utilman backdoor.
+            if matches!(parent.as_str(),
+                "sethc.exe" | "utilman.exe" | "osk.exe" | "narrator.exe"
+                | "magnify.exe" | "displayswitch.exe" | "atbroker.exe")
+            {
+                return Some(6);
+            }
+            // GetSystem via named-pipe echo (Meterpreter / CS).
+            if cmdline.contains("echo") && (cmdline.contains("\\pipe\\") || cmdline.contains("\\\\.\\pipe")) {
+                return Some(6);
+            }
+            // mavinject DLL injection (T1055.001 / T1548.002).
+            if image == "mavinject.exe" || cmdline.contains("/injectrunning") {
+                return Some(6);
+            }
+            // Disable UAC via registry cmdline.
+            if cmdline.contains("enablelua") && cmdline.contains("/d 0") {
+                return Some(6);
+            }
+
+            // ── Defense evasion ─────────────────────────────────────────────────
+            // fltmc unload removes AV/EDR minifilter.
+            if image == "fltmc.exe" && cmdline.contains("unload") {
+                return Some(2);
+            }
+            // Clear PS history — anti-forensics.
+            if image == "powershell.exe"
+                && (cmdline.contains("historysavepath") || cmdline.contains("set-psreadlineoption"))
+            {
+                return Some(2);
+            }
+            // wevtutil clear-log.
+            if image == "wevtutil.exe"
+                && (cmdline.contains(" cl ") || cmdline.contains("clear-log"))
+            {
+                return Some(2);
+            }
+            // taskkill against AV processes.
+            if image == "taskkill.exe"
+                && (cmdline.contains("msmpeng") || cmdline.contains("sysmon")
+                    || cmdline.contains("msseces") || cmdline.contains("winlogbeat"))
+            {
+                return Some(2);
+            }
+
+            // ── Persistence ─────────────────────────────────────────────────────
+            // schtasks /create locally (no remote /s).
+            if image == "schtasks.exe" && cmdline.contains("/create")
+                && !cmdline.contains(" /s ")
+            {
+                return Some(5);
+            }
+            // sc.exe create/config with suspicious binPath.
+            if image == "sc.exe" && cmdline.contains("create") {
+                return Some(5);
+            }
+            // bitsadmin job creation for persistence/download.
+            if image == "bitsadmin.exe"
+                && (cmdline.contains("/create") || cmdline.contains("/addfile"))
+            {
+                return Some(5);
+            }
+            // at.exe legacy scheduler.
+            if image == "at.exe" && !cmdline.is_empty() {
+                return Some(5);
+            }
+            // Webshell parent (persistence via web server).
+            if matches!(parent.as_str(), "w3wp.exe" | "httpd.exe" | "nginx.exe") {
+                return Some(5);
+            }
+
+            // ── Discovery ───────────────────────────────────────────────────────
+            // Stand-alone enumeration tools (not under a scripting parent).
+            if !matches!(parent.as_str(), "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe") {
+                if matches!(image.as_str(),
+                    "whoami.exe" | "hostname.exe" | "ipconfig.exe" | "systeminfo.exe"
+                    | "arp.exe" | "nslookup.exe" | "tasklist.exe" | "quser.exe"
+                    | "qwinsta.exe" | "gpresult.exe" | "nltest.exe" | "dsquery.exe")
+                {
+                    return Some(3);
+                }
+                if image == "net.exe"
+                    && (cmdline.contains(" user") || cmdline.contains(" group")
+                        || cmdline.contains(" localgroup") || cmdline.contains(" view"))
+                {
+                    return Some(3);
+                }
+            }
+
+            // ── Execution ───────────────────────────────────────────────────────
+            // wmic process call create — direct WMI execution trigger.
+            if image == "wmic.exe" && cmdline.contains("process") && cmdline.contains("call") {
+                return Some(0);
+            }
+            // Office macro spawning scripting host (initial execution).
+            if matches!(parent.as_str(),
+                "winword.exe" | "excel.exe" | "powerpnt.exe" | "outlook.exe"
+                | "onenote.exe" | "eqnedt32.exe")
+                && matches!(image.as_str(),
+                    "cmd.exe" | "powershell.exe" | "wscript.exe" | "cscript.exe" | "mshta.exe")
+            {
+                return Some(0);
+            }
+
+            None
+        }
+
+        // ── EID 10 — ProcessAccess: strongly indicates credential access ──────────
+        10 => {
+            let target = basename(v["TargetImage"].as_str().unwrap_or("")).to_lowercase();
+            if target == "lsass.exe" { return Some(1); }
+            None
+        }
+
+        // ── EID 24 — ClipboardChange: collection tactic ──────────────────────────
+        24 => Some(7),
+
+        // ── EID 2 — FileCreationTimeChanged: timestomping = defense evasion ───────
+        2 => Some(2),
+
+        // ── EID 25 — ProcessTampering: injection = defense evasion or privesc ─────
+        25 => Some(2),
+
+        // ── EID 28 — FileBlockExecutable: blocked payload = defense evasion ───────
+        28 => Some(2),
+
+        _ => None,
     }
 }
