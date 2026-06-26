@@ -391,7 +391,8 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
 
             // CAR-2020-11-004: Process parent-chain mismatch — indicates hollowing / injection (T1055.012).
             // log_source=process/create, mutable=parent_exe (deviation from expected Windows lineage)
-            let hollow_parent =
+            // Guard: skip events with missing/empty parent (early-boot processes have no recorded parent).
+            let hollow_parent = !parent.is_empty() && (
                 (image == "smss.exe"     && !matches!(parent.as_str(), "smss.exe" | "system"))
                 || (image == "csrss.exe" && !matches!(parent.as_str(), "smss.exe" | "svchost.exe"))
                 || (image == "wininit.exe" && parent != "smss.exe")
@@ -400,16 +401,17 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                 || (image == "services.exe" && parent != "wininit.exe")
                 || (image == "spoolsv.exe" && parent != "services.exe")
                 || (image == "userinit.exe"
-                    && !matches!(parent.as_str(), "dwm.exe" | "winlogon.exe" | "explorer.exe"));
+                    && !matches!(parent.as_str(), "dwm.exe" | "winlogon.exe" | "explorer.exe")));
 
             // CAR-2021-04-001: Common Windows process running from non-standard path (T1036.005).
             // log_source=process/create, mutable=image_path (masquerading via wrong directory)
-            let masquerade = matches!(image.as_str(),
-                "svchost.exe" | "smss.exe" | "csrss.exe" | "wininit.exe" | "winlogon.exe"
-                | "lsass.exe" | "services.exe" | "spoolsv.exe" | "taskhost.exe" | "explorer.exe")
+            // Guard: only check when we have a full path (contains '\'); bare basenames match nothing.
+            let masquerade = img_path.contains('\\')
+                && matches!(image.as_str(),
+                    "svchost.exe" | "smss.exe" | "csrss.exe" | "wininit.exe" | "winlogon.exe"
+                    | "lsass.exe" | "services.exe" | "spoolsv.exe" | "taskhost.exe" | "explorer.exe")
                 && !img_path.contains("\\windows\\system32\\")
-                && !img_path.contains("\\windows\\syswow64\\")
-                && !img_path.is_empty();
+                && !img_path.contains("\\windows\\syswow64\\");
 
             // CAR-2019-07-002: procdump targeting lsass (T1003.001).
             // log_source=process/create, mutable=command_line + exe
@@ -420,12 +422,11 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
             // log_source=process/create, mutable=command_line
             let certutil_cert = image == "certutil.exe" && cmdline.contains("-exportpfx");
 
-            // T1218.007 Msiexec remote/silent install as LOLBin (staging/execution).
-            // log_source=process/create, mutable=command_line (http or UNC path with /q)
+            // T1218.007 Msiexec loading remote MSI (LOLBin staging / supply-chain execution).
+            // log_source=process/create, mutable=command_line (http or UNC remote path — not /quiet alone)
             let msiexec_remote = image == "msiexec.exe"
                 && (cmdline.contains("http://") || cmdline.contains("https://")
-                    || (cmdline.contains("/i") && cmdline.contains("\\\\"))
-                    || cmdline.contains("/quiet"));
+                    || (cmdline.contains("/i") && cmdline.contains("\\\\")));
 
             // T1134 /savecred stores credentials for later reuse (runas /savecred).
             // log_source=process/create, mutable=command_line
