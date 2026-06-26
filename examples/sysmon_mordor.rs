@@ -592,9 +592,6 @@ fn main() {
         fullpipe_us, 1e6 / fullpipe_us
     );
 
-    // Top-3 discriminating rules per tactic.
-    // Filter to clauses with few total literals (general, interpretable rules).
-    // Slide the cap up from tight→loose until we find at least 3 candidates.
     let meaningful_prefixes = [
         "process.name", "process.args", "process.parent",
         "dll.name", "file.name", "file.path",
@@ -603,13 +600,93 @@ fn main() {
         "network.", "registry.",
     ];
 
+    // ── clause statistics ─────────────────────────────────────────────────────
+
+    println!("\n━━━ clause statistics ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+
+    // Per-class: pos/neg clause counts, mean & max weight.
+    println!("{:<25}  {:>10}  {:>10}  {:>9}  {:>6}", "tactic", "pos_clauses", "neg_clauses", "mean_w_pos", "max_w");
+    for (class, tactic) in TACTIC_DIRS.iter().enumerate() {
+        let pos: Vec<i32> = (0..tm.n_clauses())
+            .filter_map(|c| { let w = tm.clause_weight(class, c); if w > 0 { Some(w) } else { None } })
+            .collect();
+        let neg_cnt = (0..tm.n_clauses()).filter(|&c| tm.clause_weight(class, c) < 0).count();
+        let mean_w = if pos.is_empty() { 0.0 } else { pos.iter().sum::<i32>() as f64 / pos.len() as f64 };
+        let max_w  = pos.iter().copied().max().unwrap_or(0);
+        println!("{:<25}  {:>10}  {:>10}  {:>9.1}  {:>6}", tactic, pos.len(), neg_cnt, mean_w, max_w);
+    }
+
+    // Literal count histogram across all clauses.
+    println!("\nliteral count histogram ({} total clauses):", tm.n_clauses());
+    let buckets: &[(usize, usize)] = &[(1,5),(6,15),(16,30),(31,60),(61,120),(121,300),(301,1000),(1001,usize::MAX)];
+    for &(lo, hi) in buckets {
+        let cnt = (0..tm.n_clauses()).filter(|&c| { let n = tm.clause_rule(c).len(); n >= lo && n <= hi }).count();
+        let pct = cnt as f64 / tm.n_clauses() as f64 * 100.0;
+        let label = if hi == usize::MAX { format!("{}+", lo) } else { format!("{}-{}", lo, hi) };
+        println!("  {:>9}  {:>3}  {:>4.0}%  {}", label, cnt, pct, "█".repeat((pct / 3.0) as usize));
+    }
+
+    // Top-20 most frequent positive literal tokens across all positively-weighted clauses.
+    let mut token_freq: HashMap<usize, usize> = HashMap::new();
+    let mut token_class_set: HashMap<usize, u8> = HashMap::new(); // bitmask of classes
+    for class in 0..TACTIC_DIRS.len() {
+        for c in 0..tm.n_clauses() {
+            if tm.clause_weight(class, c) > 0 {
+                for &(feat, neg) in tm.clause_rule(c).iter() {
+                    if !neg {
+                        *token_freq.entry(feat).or_insert(0) += 1;
+                        *token_class_set.entry(feat).or_insert(0) |= 1 << class;
+                    }
+                }
+            }
+        }
+    }
+    let mut freq_vec: Vec<(usize, usize)> = token_freq.into_iter().collect();
+    freq_vec.sort_by(|a, b| b.1.cmp(&a.1));
+
+    println!("\ntop-20 most common positive literal tokens (all classes × clauses):");
+    println!("  {:>5}  {:>6}  token", "count", "n_cls");
+    for &(feat, count) in freq_vec.iter().take(20) {
+        let n_cls = token_class_set[&feat].count_ones();
+        println!("  {:>5}  {:>6}  {}", count, n_cls, encoder.vocab_token(feat));
+    }
+
+    // Top attack-relevant tokens (meaningful prefix only).
+    let atk_tokens: Vec<_> = freq_vec.iter()
+        .filter(|&&(feat, _)| meaningful_prefixes.iter().any(|p| encoder.vocab_token(feat).starts_with(p)))
+        .take(20)
+        .collect();
+    println!("\ntop-20 attack-relevant positive literal tokens:");
+    println!("  {:>5}  {:>6}  token", "count", "n_cls");
+    for &&(feat, count) in &atk_tokens {
+        let n_cls = token_class_set[&feat].count_ones();
+        println!("  {:>5}  {:>6}  {}", count, n_cls, encoder.vocab_token(feat));
+    }
+
+    // Class-exclusive tokens: appear in positive clauses of exactly one class.
+    println!("\nclass-exclusive tokens (positive in exactly 1 class's clauses):");
+    for (class, tactic) in TACTIC_DIRS.iter().enumerate() {
+        let excl: Vec<_> = freq_vec.iter()
+            .filter(|&&(feat, _)| token_class_set[&feat] == (1u8 << class))
+            .take(5)
+            .collect();
+        if excl.is_empty() { continue; }
+        print!("  {tactic:<25}");
+        for &&(feat, _) in &excl {
+            print!("  {}", encoder.vocab_token(feat));
+        }
+        println!();
+    }
+
+    // ── top-5 rules per tactic with annotations ───────────────────────────────
+
+    println!("\n━━━ top rules per tactic (annotated) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+
     for (class, tactic) in TACTIC_DIRS.iter().enumerate() {
         let n_class = test_y.iter().filter(|&&y| y == class).count();
         if n_class == 0 { continue; }
-        println!("\n--- top rules for {tactic} (class {class}) ---");
+        println!("── {tactic} (class {class}) ──");
 
-        // Try progressively relaxed caps on total literals (pos + neg).
-        // This surfaces general rules first; falls back to specific ones if needed.
         let mut ranked: Vec<usize> = Vec::new();
         for &max_lits in &[30usize, 60, 120, 300, usize::MAX] {
             ranked = (0..tm.n_clauses())
@@ -619,9 +696,8 @@ fn main() {
                     r.iter().any(|&(_, neg)| !neg) && r.len() <= max_lits
                 })
                 .collect();
-            if ranked.len() >= 3 { break; }
+            if ranked.len() >= 5 { break; }
         }
-        // Sort: meaningful-prefix tokens first, then weight desc, then fewer total literals.
         ranked.sort_by(|&a, &b| {
             let wa = tm.clause_weight(class, a);
             let wb = tm.clause_weight(class, b);
@@ -636,16 +712,68 @@ fn main() {
             mb.cmp(&ma).then(wb.cmp(&wa)).then(la.cmp(&lb))
         });
 
-        for (rank, &c) in ranked.iter().take(3).enumerate() {
+        for (rank, &c) in ranked.iter().take(5).enumerate() {
             let rule = tm.clause_rule(c);
             let w = tm.clause_weight(class, c);
             let pos: Vec<_> = rule.iter().filter(|&&(_, neg)| !neg).collect();
             let neg_count = rule.len() - pos.len();
-            let literals: Vec<String> = pos.iter()
+            let tokens: Vec<String> = pos.iter()
                 .map(|&&(feat, _)| encoder.vocab_token(feat).to_string())
                 .collect();
-            let neg_sfx = if neg_count > 0 { format!("  (+ {neg_count} NOT)") } else { String::new() };
-            println!("  [{}] w={w}  {}{neg_sfx}", rank + 1, literals.join("  "));
+            let neg_sfx = if neg_count > 0 { format!(" (+ {neg_count} NOT)") } else { String::new() };
+            println!("  [{}] w={w}{neg_sfx}", rank + 1);
+            for tok in &tokens {
+                let note = explain_token(tok);
+                if note.is_empty() {
+                    println!("       {tok}");
+                } else {
+                    println!("       {tok:<55}  ← {note}");
+                }
+            }
         }
+        println!();
     }
+}
+
+fn explain_token(tok: &str) -> &'static str {
+    if tok.starts_with("event.id::1 ")  || tok == "event.id::1"  { return "Sysmon: process creation"; }
+    if tok.starts_with("event.id::3 ")  || tok == "event.id::3"  { return "Sysmon: network connection"; }
+    if tok.starts_with("event.id::7 ")  || tok == "event.id::7"  { return "Sysmon: image/DLL loaded"; }
+    if tok.starts_with("event.id::10")                           { return "Sysmon: process access (injection / cred dump)"; }
+    if tok.starts_with("event.id::11")                           { return "Sysmon: file created"; }
+    if tok.starts_with("event.id::12") || tok.starts_with("event.id::13") || tok.starts_with("event.id::14") {
+        return "Sysmon: registry create/set/delete";
+    }
+    if tok.starts_with("event.id::22")                           { return "Sysmon: DNS query"; }
+    if tok.starts_with("event.id::25")                           { return "Sysmon: process tampering"; }
+    if tok.starts_with("process.name::")                         { return "executing process binary"; }
+    if tok.starts_with("process.args::")                         { return "command-line argument token"; }
+    if tok.starts_with("process.parent.name::") || tok.starts_with("process.parent::") { return "parent process"; }
+    if tok.starts_with("target.process.name::")                  { return "victim process (accessed/injected)"; }
+    if tok.starts_with("source.process.name::")                  { return "accessor/injecting process"; }
+    if tok.starts_with("target.process.granted_access::")        { return "access rights requested (PROCESS_VM_READ etc.)"; }
+    if tok.starts_with("file.path::Temp") || tok.contains("::Temp") { return "staging in temp directory (common dropper)"; }
+    if tok.starts_with("file.path::System32")                    { return "system directory (legit or DLL hijack)"; }
+    if tok.starts_with("file.path::AppData")                     { return "user profile staging area"; }
+    if tok.starts_with("file.path::")                            { return "file location"; }
+    if tok.starts_with("file.name::")                            { return "file name"; }
+    if tok.starts_with("dll.name::")                             { return "DLL loaded"; }
+    if tok.starts_with("network.destination") || tok.starts_with("destination.") { return "outbound C2 / lateral target"; }
+    if tok.starts_with("dns.question::")                         { return "DNS lookup (C2 beacon / lateral)"; }
+    if tok.starts_with("registry.")                              { return "registry operation"; }
+    if tok.contains("::lsass")                                   { return "LSASS — credential store (high value target)"; }
+    if tok.contains("::mimikatz") || tok.contains("::mimi")      { return "Mimikatz credential dumper"; }
+    if tok.contains("::powershell") || tok.contains("::psh")     { return "PowerShell execution"; }
+    if tok.contains("::cmd.exe")                                 { return "Command prompt execution"; }
+    if tok.contains("::rundll32")                                { return "LOLBin: runs arbitrary DLLs"; }
+    if tok.contains("::regsvr32")                                { return "LOLBin: runs COM/SCT payloads"; }
+    if tok.contains("::mshta")                                   { return "LOLBin: runs HTML/VBS/JS"; }
+    if tok.contains("::wmic")                                    { return "WMI execution / lateral movement"; }
+    if tok.contains("::schtasks") || tok.contains("::at.exe")    { return "scheduled task (persistence)"; }
+    if tok.contains("::net.exe") || tok.contains("::net1.exe")   { return "domain/user enumeration"; }
+    if tok.contains("Signature::Microsoft Windows")              { return "Microsoft-signed binary (very common — not specific)"; }
+    if tok.contains("code_signature.status::Valid")              { return "valid code signature (most legit processes)"; }
+    if tok.contains("UserID::S-1-5-18")                         { return "SYSTEM account"; }
+    if tok.contains("UserID::S-1-5-19") || tok.contains("UserID::S-1-5-20") { return "LOCAL/NETWORK SERVICE account"; }
+    ""
 }
