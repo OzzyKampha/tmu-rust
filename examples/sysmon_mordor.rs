@@ -25,7 +25,7 @@ mod shared;
 use shared::{basename, hive_of};
 
 use std::{collections::HashMap, fs, io::Write, path::Path};
-use tmu_rs::{Encoder, Rng, TsetlinMachine};
+use tmu_rs::{CoalescedTsetlinMachine, Encoder, Rng};
 
 const MINI_BATCH_SIZE: usize = 4096;
 
@@ -480,37 +480,59 @@ fn main() {
     let n_tactics = TACTIC_DIRS.len();
     let n_train = tr_inner.len();
 
-    // Compute inverse-frequency class weights: weight[c] = n_train / (n_tactics * count[c]).
-    let mut counts = vec![0usize; n_tactics];
-    for &y in &train_y { counts[y] += 1; }
-    let cw: Vec<f64> = counts.iter().map(|&c| {
-        if c == 0 { 1.0 } else { n_train as f64 / (n_tactics as f64 * c as f64) }
-    }).collect();
-    println!("class weights (inverse frequency):");
-    for (i, (tactic, w)) in TACTIC_DIRS.iter().zip(&cw).enumerate() {
-        println!("  {i}  {tactic:<25}  train_count={:>6}  weight={w:.3}", counts[i]);
+    // Build per-class index lists and print counts.
+    let mut class_indices: Vec<Vec<usize>> = vec![Vec::new(); n_tactics];
+    for (i, &y) in train_y.iter().enumerate() {
+        class_indices[y].push(i);
+    }
+    println!("class training counts (balanced sampling per mini-batch):");
+    for (i, tactic) in TACTIC_DIRS.iter().enumerate() {
+        println!("  {i}  {tactic:<25}  train_count={:>6}", class_indices[i].len());
     }
     println!();
 
-    let mut tm = TsetlinMachine::with_config(n_tactics, encoder.n_features(), 256, 50, 5.0, 8, true, 42)
-        .class_weights(cw);
+    // CoalescedTsetlinMachine: n_clauses shared across all classes.
+    // 2048 total ≈ vanilla 256 × 8 classes in capacity.
+    let mut tm = CoalescedTsetlinMachine::with_config(
+        n_tactics, encoder.n_features(), 2048, 50, 5.0, 8, true, 42,
+    );
     let mut shuffle_rng = Rng::new(0xDEAD_BEEF);
+
+    // Each mini-batch draws MINI_BATCH_SIZE/n_tactics samples per class (with
+    // replacement for small classes), guaranteeing perfectly balanced batches.
+    let per_class = MINI_BATCH_SIZE / n_tactics;
     let n_batches = n_train.div_ceil(MINI_BATCH_SIZE);
 
     for epoch in 1..=10 {
         let t0 = std::time::Instant::now();
-        let mut order: Vec<usize> = (0..n_train).collect();
-        for i in (1..n_train).rev() {
-            let j = shuffle_rng.below(i + 1);
-            order.swap(i, j);
+        // Shuffle each class's index list independently.
+        for ci in 0..n_tactics {
+            let len = class_indices[ci].len();
+            for i in (1..len).rev() {
+                let j = shuffle_rng.below(i + 1);
+                class_indices[ci].swap(i, j);
+            }
         }
-        for (b, chunk) in order.chunks(MINI_BATCH_SIZE).enumerate() {
+        for b in 0..n_batches {
             let bt0 = std::time::Instant::now();
-            let slices: Vec<&[&str]> = chunk.iter().map(|&i| tr_inner[i].as_slice()).collect();
+            // Sample per_class items from each class (wrap around for small classes).
+            let mut batch: Vec<usize> = Vec::with_capacity(MINI_BATCH_SIZE);
+            for ci in 0..n_tactics {
+                let ci_len = class_indices[ci].len();
+                for k in 0..per_class {
+                    batch.push(class_indices[ci][(b * per_class + k) % ci_len]);
+                }
+            }
+            // Shuffle within batch to mix classes.
+            for i in (1..batch.len()).rev() {
+                let j = shuffle_rng.below(i + 1);
+                batch.swap(i, j);
+            }
+            let slices: Vec<&[&str]> = batch.iter().map(|&i| tr_inner[i].as_slice()).collect();
             let mini_x = encoder.encode_batch_categorical(&slices);
-            let mini_y: Vec<usize> = chunk.iter().map(|&i| train_y[i]).collect();
+            let mini_y: Vec<usize> = batch.iter().map(|&i| train_y[i]).collect();
             tm.fit_epoch(&mini_x, &mini_y);
-            let evps = chunk.len() as f64 / bt0.elapsed().as_secs_f64();
+            let evps = batch.len() as f64 / bt0.elapsed().as_secs_f64();
             if b % 10 == 9 || b + 1 == n_batches {
                 println!(
                     "  epoch {epoch:>2}  batch {:>3}/{n_batches}  {evps:>7.0} ev/s",
@@ -552,6 +574,8 @@ fn main() {
     }
 
     // Top-3 discriminating rules per tactic.
+    // For coalesced TM: clause_rule(c) takes only clause index;
+    // clause_weight(class, c) gives per-class vote weight.
     let meaningful_prefixes = [
         "process.name", "process.args", "process.parent",
         "dll.name", "file.name", "file.path",
@@ -563,24 +587,26 @@ fn main() {
         let n_class = test_y.iter().filter(|&&y| y == class).count();
         if n_class == 0 { continue; }
         println!("\n--- top rules for {tactic} (class {class}) ---");
-        let mut ranked: Vec<usize> = (0..tm.clauses_per_class())
-            .filter(|&c| tm.clause_is_positive(c))
-            .filter(|&c| tm.clause_rule(class, c).iter().any(|&(_, neg)| !neg))
+        // Rank clauses by positive weight for this class, then literal count.
+        let mut ranked: Vec<usize> = (0..tm.n_clauses())
+            .filter(|&c| tm.clause_weight(class, c) > 0)
+            .filter(|&c| tm.clause_rule(c).iter().any(|&(_, neg)| !neg))
             .collect();
         ranked.sort_by(|&a, &b| {
-            let pa = tm.clause_rule(class, a).iter().filter(|&&(_, neg)| !neg).count();
-            let pb = tm.clause_rule(class, b).iter().filter(|&&(_, neg)| !neg).count();
-            let ma = tm.clause_rule(class, a).iter().any(|&(f, neg)| {
+            let wa = tm.clause_weight(class, a);
+            let wb = tm.clause_weight(class, b);
+            let pa = tm.clause_rule(a).iter().filter(|&&(_, neg)| !neg).count();
+            let pb = tm.clause_rule(b).iter().filter(|&&(_, neg)| !neg).count();
+            let ma = tm.clause_rule(a).iter().any(|&(f, neg)| {
                 !neg && meaningful_prefixes.iter().any(|p| encoder.vocab_token(f).starts_with(p))
             });
-            let mb = tm.clause_rule(class, b).iter().any(|&(f, neg)| {
+            let mb = tm.clause_rule(b).iter().any(|&(f, neg)| {
                 !neg && meaningful_prefixes.iter().any(|p| encoder.vocab_token(f).starts_with(p))
             });
-            pb.cmp(&pa).then(mb.cmp(&ma))
-                .then(tm.clause_weight(class, b).cmp(&tm.clause_weight(class, a)))
+            wb.cmp(&wa).then(pb.cmp(&pa)).then(mb.cmp(&ma))
         });
         for (rank, &c) in ranked.iter().take(3).enumerate() {
-            let rule = tm.clause_rule(class, c);
+            let rule = tm.clause_rule(c);
             let w = tm.clause_weight(class, c);
             let pos: Vec<_> = rule.iter().filter(|&&(_, neg)| !neg).collect();
             let neg_count = rule.len() - pos.len();
