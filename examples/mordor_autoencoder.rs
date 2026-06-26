@@ -25,7 +25,7 @@
 mod shared;
 use shared::{basename, hive_of};
 
-use std::{collections::HashMap, collections::HashSet, fs, path::Path};
+use std::{collections::HashMap, collections::HashSet, fs, io::Write, path::Path};
 use tmu_rs::{Encoder, Rng, TMAutoEncoder, TMCoalescedAutoEncoder};
 
 // Autoencoder memory = n_features² × clauses_per_output bytes.
@@ -571,6 +571,7 @@ fn run_vanilla(
 
     println!("{:>6}  {:>12}  {:>12}  {:>8}", "Epoch", "Ben recon", "Atk recon", "Gap");
     let n_train = train_benign.len();
+    let n_batches = n_train.div_ceil(MINI_BATCH_SIZE);
     for epoch in 1..=5 {
         // Shuffle training indices for this epoch.
         let mut order: Vec<usize> = (0..n_train).collect();
@@ -580,7 +581,9 @@ fn run_vanilla(
         }
         // Encode and train one mini-batch at a time — peak extra memory is
         // MINI_BATCH_SIZE × words × 8 bytes ≈ 560 KB instead of ~116 MB.
-        for chunk in order.chunks(MINI_BATCH_SIZE) {
+        for (b, chunk) in order.chunks(MINI_BATCH_SIZE).enumerate() {
+            print!("  epoch {epoch}  batch {}/{n_batches}\r", b + 1);
+            let _ = std::io::stdout().flush();
             let refs: Vec<Vec<&str>> = chunk
                 .iter()
                 .map(|&i| train_benign[i].iter().map(String::as_str).collect())
@@ -589,11 +592,9 @@ fn run_vanilla(
             let mini = encoder.encode_batch_categorical(&slices);
             ae.fit_epoch(&mini);
         }
-        if epoch % 1 == 0 {
-            let ben = ae.reconstruction_accuracy(&batch_test_ben);
-            let atk = ae.reconstruction_accuracy(&batch_test_atk);
-            println!("{epoch:>6}  {ben:>12.4}  {atk:>12.4}  {:>8.4}", ben - atk);
-        }
+        let ben = ae.reconstruction_accuracy(&batch_test_ben);
+        let atk = ae.reconstruction_accuracy(&batch_test_atk);
+        println!("{epoch:>6}  {ben:>12.4}  {atk:>12.4}  {:>8.4}", ben - atk);
     }
 
     // Compute per-sample anomaly scores on test set.
@@ -720,13 +721,16 @@ fn run_coalesced(
 
     println!("{:>6}  {:>12}  {:>12}  {:>8}", "Epoch", "Ben recon", "Atk recon", "Gap");
     let n_train = train_benign.len();
+    let n_batches = n_train.div_ceil(MINI_BATCH_SIZE);
     for epoch in 1..=5 {
         let mut order: Vec<usize> = (0..n_train).collect();
         for i in (1..n_train).rev() {
             let j = shuffle_rng.below(i + 1);
             order.swap(i, j);
         }
-        for chunk in order.chunks(MINI_BATCH_SIZE) {
+        for (b, chunk) in order.chunks(MINI_BATCH_SIZE).enumerate() {
+            print!("  epoch {epoch}  batch {}/{n_batches}\r", b + 1);
+            let _ = std::io::stdout().flush();
             let refs: Vec<Vec<&str>> = chunk
                 .iter()
                 .map(|&i| train_benign[i].iter().map(String::as_str).collect())
@@ -735,11 +739,9 @@ fn run_coalesced(
             let mini = encoder.encode_batch_categorical(&slices);
             ae.fit_epoch(&mini);
         }
-        if epoch % 1 == 0 {
-            let ben = ae.reconstruction_accuracy(&batch_test_ben);
-            let atk = ae.reconstruction_accuracy(&batch_test_atk);
-            println!("{epoch:>6}  {ben:>12.4}  {atk:>12.4}  {:>8.4}", ben - atk);
-        }
+        let ben = ae.reconstruction_accuracy(&batch_test_ben);
+        let atk = ae.reconstruction_accuracy(&batch_test_atk);
+        println!("{epoch:>6}  {ben:>12.4}  {atk:>12.4}  {:>8.4}", ben - atk);
     }
 
     let mut scores: Vec<(f64, bool)> = Vec::new();

@@ -23,7 +23,7 @@
 mod shared;
 use shared::{basename, hive_of};
 
-use std::{collections::HashSet, fs, path::Path};
+use std::{collections::HashSet, fs, io::Write, path::Path};
 use tmu_rs::{Encoder, Rng, TsetlinMachine};
 
 const MINI_BATCH_SIZE: usize = 4096;
@@ -488,6 +488,7 @@ fn main() {
     let mut tm = TsetlinMachine::with_config(2, encoder.n_features(), 80, 50, 5.0, 8, true, 42);
     let mut shuffle_rng = Rng::new(0xDEAD_BEEF);
     let n_train = tr_inner.len();
+    let n_batches = n_train.div_ceil(MINI_BATCH_SIZE);
 
     for epoch in 1..=10 {
         let t0 = std::time::Instant::now();
@@ -496,7 +497,9 @@ fn main() {
             let j = shuffle_rng.below(i + 1);
             order.swap(i, j);
         }
-        for chunk in order.chunks(MINI_BATCH_SIZE) {
+        for (b, chunk) in order.chunks(MINI_BATCH_SIZE).enumerate() {
+            print!("  epoch {epoch}  batch {}/{n_batches}\r", b + 1);
+            let _ = std::io::stdout().flush();
             let slices: Vec<&[&str]> = chunk.iter().map(|&i| tr_inner[i].as_slice()).collect();
             let mini_x = encoder.encode_batch_categorical(&slices);
             let mini_y: Vec<usize> = chunk.iter().map(|&i| train_y[i]).collect();
