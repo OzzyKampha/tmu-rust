@@ -548,8 +548,14 @@ fn main() {
         );
     }
 
-    // Per-tactic accuracy.
+    // Inference speed on pre-encoded test set (no tokenization cost).
+    let infer_t0 = std::time::Instant::now();
+    let _ = tm.accuracy(&test_x, &test_y);
+    let infer_bulk_us = infer_t0.elapsed().as_secs_f64() * 1e6 / test_y.len() as f64;
+
+    // Per-tactic accuracy — encode + predict from raw tokens (full pipeline latency).
     println!("\n--- per-tactic test accuracy ---");
+    let fullpipe_t0 = std::time::Instant::now();
     for (class, tactic) in TACTIC_DIRS.iter().enumerate() {
         let indices: Vec<usize> = test_y
             .iter()
@@ -571,39 +577,65 @@ fn main() {
             correct as f64 / indices.len() as f64 * 100.0
         );
     }
+    let fullpipe_us = fullpipe_t0.elapsed().as_secs_f64() * 1e6 / test_y.len() as f64;
+
+    println!(
+        "\ninference speed ({} test events):",
+        test_y.len()
+    );
+    println!(
+        "  pre-encoded predict:  {:.2}µs/event  ({:.0} ev/s)",
+        infer_bulk_us, 1e6 / infer_bulk_us
+    );
+    println!(
+        "  encode + predict:     {:.2}µs/event  ({:.0} ev/s)",
+        fullpipe_us, 1e6 / fullpipe_us
+    );
 
     // Top-3 discriminating rules per tactic.
-    // For coalesced TM: clause_rule(c) takes only clause index;
-    // clause_weight(class, c) gives per-class vote weight.
+    // Filter to clauses with few total literals (general, interpretable rules).
+    // Slide the cap up from tight→loose until we find at least 3 candidates.
     let meaningful_prefixes = [
         "process.name", "process.args", "process.parent",
         "dll.name", "file.name", "file.path",
         "target.process", "source.process",
         "dns.question", "destination.",
+        "network.", "registry.",
     ];
 
     for (class, tactic) in TACTIC_DIRS.iter().enumerate() {
         let n_class = test_y.iter().filter(|&&y| y == class).count();
         if n_class == 0 { continue; }
         println!("\n--- top rules for {tactic} (class {class}) ---");
-        // Rank clauses by positive weight for this class, then literal count.
-        let mut ranked: Vec<usize> = (0..tm.n_clauses())
-            .filter(|&c| tm.clause_weight(class, c) > 0)
-            .filter(|&c| tm.clause_rule(c).iter().any(|&(_, neg)| !neg))
-            .collect();
+
+        // Try progressively relaxed caps on total literals (pos + neg).
+        // This surfaces general rules first; falls back to specific ones if needed.
+        let mut ranked: Vec<usize> = Vec::new();
+        for &max_lits in &[30usize, 60, 120, 300, usize::MAX] {
+            ranked = (0..tm.n_clauses())
+                .filter(|&c| tm.clause_weight(class, c) > 0)
+                .filter(|&c| {
+                    let r = tm.clause_rule(c);
+                    r.iter().any(|&(_, neg)| !neg) && r.len() <= max_lits
+                })
+                .collect();
+            if ranked.len() >= 3 { break; }
+        }
+        // Sort: meaningful-prefix tokens first, then weight desc, then fewer total literals.
         ranked.sort_by(|&a, &b| {
             let wa = tm.clause_weight(class, a);
             let wb = tm.clause_weight(class, b);
-            let pa = tm.clause_rule(a).iter().filter(|&&(_, neg)| !neg).count();
-            let pb = tm.clause_rule(b).iter().filter(|&&(_, neg)| !neg).count();
+            let la = tm.clause_rule(a).len();
+            let lb = tm.clause_rule(b).len();
             let ma = tm.clause_rule(a).iter().any(|&(f, neg)| {
                 !neg && meaningful_prefixes.iter().any(|p| encoder.vocab_token(f).starts_with(p))
             });
             let mb = tm.clause_rule(b).iter().any(|&(f, neg)| {
                 !neg && meaningful_prefixes.iter().any(|p| encoder.vocab_token(f).starts_with(p))
             });
-            wb.cmp(&wa).then(pb.cmp(&pa)).then(mb.cmp(&ma))
+            mb.cmp(&ma).then(wb.cmp(&wa)).then(la.cmp(&lb))
         });
+
         for (rank, &c) in ranked.iter().take(3).enumerate() {
             let rule = tm.clause_rule(c);
             let w = tm.clause_weight(class, c);
