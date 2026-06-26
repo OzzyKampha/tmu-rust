@@ -432,6 +432,96 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
             // log_source=process/create, mutable=command_line
             let savecred = cmdline.contains("/savecred");
 
+            // CAR-2014-11-003: Accessibility app as debugger — sticky keys backdoor (T1546.008).
+            // sethc/utilman/osk/etc. spawning any child = IFEO debugger hijack.
+            let accessibility_backdoor = matches!(parent.as_str(),
+                "sethc.exe" | "utilman.exe" | "osk.exe" | "narrator.exe"
+                | "magnify.exe" | "displayswitch.exe" | "atbroker.exe");
+
+            // CAR-2021-02-001: Web server spawning shells = webshell execution (T1505.003).
+            let webshell_exec = matches!(parent.as_str(),
+                "w3wp.exe" | "httpd.exe" | "nginx.exe" | "apache.exe"
+                | "apache2.exe" | "tomcat.exe" | "php-cgi.exe")
+                && matches!(image.as_str(),
+                    "cmd.exe" | "powershell.exe" | "net.exe" | "whoami.exe"
+                    | "hostname.exe" | "systeminfo.exe" | "ipconfig.exe" | "wscript.exe");
+
+            // CAR-2021-05-004 / CAR-2021-05-005: BITS job creation/download (T1197 / T1105).
+            // log_source=process/create, mutable=command_line (bitsadmin /create /addfile /transfer)
+            let bits_abuse = image == "bitsadmin.exe"
+                && (cmdline.contains("/create") || cmdline.contains("/addfile")
+                    || cmdline.contains("/transfer") || cmdline.contains("/setnotifycmdline")
+                    || cmdline.contains("/resume") || cmdline.contains("/setnotifyflags"));
+
+            // CAR-2013-05-002: Execution from unusual / hidden Windows paths (T1036).
+            let suspicious_location = img_path.contains("\\recycler\\")
+                || img_path.contains("\\$recycle.bin\\")
+                || img_path.contains("\\systemvolumeinformation\\")
+                || img_path.contains("\\windows\\debug\\");
+
+            // CAR-2020-11-005: Clear PowerShell console history (T1070.003 — anti-forensics).
+            // log_source=process/create, mutable=command_line (HistorySavePath / SaveNothing)
+            let ps_history_clear = image == "powershell.exe"
+                && (cmdline.contains("historysavepath")
+                    || (cmdline.contains("set-psreadlineoption")
+                        && cmdline.contains("savenothing"))
+                    || cmdline.contains("consolehost_history.txt"));
+
+            // CAR-2020-11-002: Network sniffer / packet capture tools (T1040).
+            // log_source=process/create, mutable=exe (tshark, windump, tcpdump)
+            let sniffer_exec = matches!(image.as_str(),
+                "tshark.exe" | "windump.exe" | "tcpdump.exe" | "wprui.exe" | "wpr.exe")
+                || (image == "netsh.exe" && cmdline.contains("trace"));
+
+            // CAR-2020-11-009: hh.exe compiled HTML help — LOLBin for executing scripts (T1218.001).
+            let hh_abuse = image == "hh.exe";
+
+            // CAR-2020-09-004: Credential search in registry/config files (T1552.001 / T1552.002).
+            // log_source=process/create, mutable=command_line (reg query /f password)
+            let cred_search = (cmdline.contains("/f") && cmdline.contains("password"))
+                || cmdline.contains("get-unattendedinstallfile")
+                || cmdline.contains("get-cachedgpppassword")
+                || cmdline.contains("get-registryautologon")
+                || cmdline.contains("get-sitelistpassword")
+                || (cmdline.contains("reg") && cmdline.contains("query")
+                    && (cmdline.contains("autologon") || cmdline.contains("defaultpassword")));
+
+            // CAR-2021-05-001: certutil adding cert to untrusted store — bypasses trust chain (T1553.004).
+            let certutil_addstore = image == "certutil.exe" && cmdline.contains("-addstore");
+
+            // T1053.002: at.exe scheduled task — legacy scheduler, used for lateral/persistence.
+            let at_exec = image == "at.exe" && !cmdline.is_empty();
+
+            // T1053.005 remote lateral: schtasks with /s flag targets a remote computer.
+            // log_source=process/create, mutable=command_line (/s <hostname>)
+            let remote_schtask = image == "schtasks.exe"
+                && (cmdline.contains(" /s ") || cmdline.contains("/s\\\\"));
+
+            // T1021.002: Execution from UNC share path — lateral movement file copy + execute.
+            let unc_execution = img_path.starts_with("\\\\");
+
+            // CAR-2019-04-002: regsvr32.exe spawning child processes — COM execution chain (T1218.010).
+            // log_source=process/create, mutable=parent_exe (child of regsvr32)
+            let regsvr32_child = parent == "regsvr32.exe"
+                && !matches!(image.as_str(),
+                    "regsvr32.exe" | "werfault.exe" | "wevtutil.exe" | "conhost.exe");
+
+            // CAR-2020-11-007: Net share removal — cleanup after lateral movement (T1070.005).
+            let share_cleanup = image == "net.exe"
+                && (cmdline.contains(" use") && cmdline.contains(" /delete"))
+                || (image == "powershell.exe"
+                    && (cmdline.contains("remove-smbshare") || cmdline.contains("remove-fileshare")));
+
+            // CAR-2020-11-008: MSBuild / msxsl outside Visual Studio — Trusted Dev Tool abuse (T1127).
+            let msbuild_abuse = (image == "msbuild.exe"
+                && !img_path.contains("\\microsoft visual studio\\")
+                && !img_path.contains("\\msbuild\\"))
+                || image == "msxsl.exe";
+
+            // CAR-2020-11-010: cmstp.exe with external src_ip — UAC bypass / LOLBIN (T1218.003).
+            let cmstp_abuse = image == "cmstp.exe"
+                && (cmdline.contains("http") || cmdline.contains("\\\\"));
+
             attack_tool
                 || office_to_script
                 || lolbin_to_script
@@ -469,6 +559,22 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                 || certutil_cert
                 || msiexec_remote
                 || savecred
+                || accessibility_backdoor
+                || webshell_exec
+                || bits_abuse
+                || suspicious_location
+                || ps_history_clear
+                || sniffer_exec
+                || hh_abuse
+                || cred_search
+                || certutil_addstore
+                || at_exec
+                || remote_schtask
+                || unc_execution
+                || regsvr32_child
+                || share_cleanup
+                || msbuild_abuse
+                || cmstp_abuse
         }
 
         // ── EID 2 — FileCreationTimeChanged: timestomping (T1070.006) ───────────
@@ -699,7 +805,15 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
             let system32_script = fname.contains("\\windows\\system32\\")
                 && (fname.ends_with(".bat") || fname.ends_with(".cmd") || fname.ends_with(".ps1"));
 
+            // CAR-2019-08-001: lsass.dmp created by Task Manager — credential dump via UI (T1003.001).
+            let taskmgr_dump = image == "taskmgr.exe"
+                && fname.contains("lsass") && fname.ends_with(".dmp");
+
+            // CAR-2019-08-002: ntds.dit dropped — Active Directory database dump (T1003.003).
+            let ntds_drop = fname.contains("ntds.dit") || fname.contains("ntds.jfm");
+
             scripting && (staging || executable) || dump || task_drop || system32_script
+                || taskmgr_dump || ntds_drop
         }
 
         // ── EID 12/13 — RegistryEvent: persistence / defence-evasion keys ────────
@@ -772,6 +886,18 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                 // CAR-2021-12-002: Common Startup folder redirection (T1547.001).
                 // log_source=registry/add, mutable=key (Common Startup path)
                 || obj.contains("common startup")
+                // CAR-2020-09-005: AppInit_Dlls key — DLL loaded into every user-mode process (T1546.010).
+                // log_source=registry/add+edit, mutable=key (AppInit_Dlls value)
+                || obj.contains("appinit_dlls")
+                // CAR-2020-11-011: SCRNSAVE.EXE screensaver persistence key (T1546.002).
+                // log_source=registry/edit+add, mutable=key (Control Panel Desktop)
+                || obj.contains("scrnsave.exe") || obj.contains("scrnsave")
+                // T1547.005: Security Support Provider (SSP) DLL for credential interception.
+                || obj.contains("\\security packages")
+                // T1547.008: LSASS driver — driver loaded at boot into lsass.exe.
+                || obj.contains("\\lsa\\") && obj.contains("notification packages")
+                // T1112 COM server hijack via InprocServer32.
+                || (obj.contains("\\inprocserver32") && !obj.contains("\\windows\\system32\\"))
         }
 
         // ── EID 14 — RegistryKeyValueRename: hiding persistence keys ─────────────
