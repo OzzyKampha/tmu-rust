@@ -543,9 +543,26 @@ fn main() {
         let elapsed = t0.elapsed();
         let te_acc = tm.accuracy(&test_x, &test_y) * 100.0;
         println!(
-            "epoch {epoch:>2}  test={te_acc:.2}%  ({:.1}s total)\n",
+            "epoch {epoch:>2}  test={te_acc:.2}%  ({:.1}s total)",
             elapsed.as_secs_f32()
         );
+        // Per-tactic breakdown after every epoch.
+        for (class, tactic) in TACTIC_DIRS.iter().enumerate() {
+            let indices: Vec<usize> = test_y.iter().enumerate()
+                .filter(|(_, &y)| y == class).map(|(i, _)| i).collect();
+            if indices.is_empty() { continue; }
+            let correct = indices.iter().filter(|&&i| {
+                let s = encoder.encode_one_categorical(&te_inner[i]);
+                tm.predict(&s) == class
+            }).count();
+            println!(
+                "  {class}  {:<25}  {:>5.1}%  ({correct}/{})",
+                tactic,
+                correct as f64 / indices.len() as f64 * 100.0,
+                indices.len(),
+            );
+        }
+        println!();
     }
 
     // Inference speed on pre-encoded test set (no tokenization cost).
@@ -553,31 +570,14 @@ fn main() {
     let _ = tm.accuracy(&test_x, &test_y);
     let infer_bulk_us = infer_t0.elapsed().as_secs_f64() * 1e6 / test_y.len() as f64;
 
-    // Per-tactic accuracy — encode + predict from raw tokens (full pipeline latency).
-    println!("\n--- per-tactic test accuracy ---");
+    // Encode+predict timing: run a single full pass over all test events.
     let fullpipe_t0 = std::time::Instant::now();
-    for (class, tactic) in TACTIC_DIRS.iter().enumerate() {
-        let indices: Vec<usize> = test_y
-            .iter()
-            .enumerate()
-            .filter(|(_, &y)| y == class)
-            .map(|(i, _)| i)
-            .collect();
-        if indices.is_empty() {
-            continue;
-        }
-        let correct = indices.iter().filter(|&&i| {
-            let s = encoder.encode_one_categorical(&te_inner[i]);
-            tm.predict(&s) == class
-        }).count();
-        println!(
-            "  {class}  {:<25}  {correct}/{} ({:.1}%)",
-            tactic,
-            indices.len(),
-            correct as f64 / indices.len() as f64 * 100.0
-        );
+    let mut _sink = 0usize;
+    for tokens in &te_inner {
+        let s = encoder.encode_one_categorical(tokens);
+        _sink ^= tm.predict(&s);
     }
-    let fullpipe_us = fullpipe_t0.elapsed().as_secs_f64() * 1e6 / test_y.len() as f64;
+    let fullpipe_us = fullpipe_t0.elapsed().as_secs_f64() * 1e6 / te_inner.len() as f64;
 
     println!(
         "\ninference speed ({} test events):",
