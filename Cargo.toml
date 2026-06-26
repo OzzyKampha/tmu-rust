@@ -124,6 +124,10 @@ path = "examples/composite.rs"
 name = "mordor_autoencoder"   # TMAutoEncoder + TMCoalescedAutoEncoder: unsupervised anomaly detection on Mordor Sysmon events
 path = "examples/mordor_autoencoder.rs"
 
+[[example]]
+name = "mitre_ttp_classifier" # MITRE ATT&CK TTP classifier: technique-level prediction from Mordor Sysmon events
+path = "examples/mitre_ttp_classifier.rs"
+
 [[bench]]
 name = "throughput"
 path = "benches/throughput.rs"
