@@ -478,9 +478,23 @@ fn main() {
     let test_x = encoder.encode_batch_categorical(&te_refs);
 
     let n_tactics = TACTIC_DIRS.len();
-    let mut tm = TsetlinMachine::with_config(n_tactics, encoder.n_features(), 80, 50, 5.0, 8, true, 42);
-    let mut shuffle_rng = Rng::new(0xDEAD_BEEF);
     let n_train = tr_inner.len();
+
+    // Compute inverse-frequency class weights: weight[c] = n_train / (n_tactics * count[c]).
+    let mut counts = vec![0usize; n_tactics];
+    for &y in &train_y { counts[y] += 1; }
+    let cw: Vec<f64> = counts.iter().map(|&c| {
+        if c == 0 { 1.0 } else { n_train as f64 / (n_tactics as f64 * c as f64) }
+    }).collect();
+    println!("class weights (inverse frequency):");
+    for (i, (tactic, w)) in TACTIC_DIRS.iter().zip(&cw).enumerate() {
+        println!("  {i}  {tactic:<25}  train_count={:>6}  weight={w:.3}", counts[i]);
+    }
+    println!();
+
+    let mut tm = TsetlinMachine::with_config(n_tactics, encoder.n_features(), 80, 50, 5.0, 8, true, 42)
+        .class_weights(cw);
+    let mut shuffle_rng = Rng::new(0xDEAD_BEEF);
     let n_batches = n_train.div_ceil(MINI_BATCH_SIZE);
 
     for epoch in 1..=10 {
