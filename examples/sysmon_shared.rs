@@ -302,13 +302,13 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                 && (cmdline.contains("sam") || cmdline.contains("system")
                     || cmdline.contains("security") || cmdline.contains("ntds"));
 
-            // T1047 WMI execution — wmic process call create, or wmiprvse spawning children.
+            // T1047 WMI execution — wmic process call create or remote /node:, or wmiprvse spawning children.
             // wmiprvse.exe = WMI Provider Host; anything it spawns is a WMI-executed payload.
+            // CAR-2016-03-002: log_source=process/create, mutable=command_line, wmic /node: <host>
             let wmi_exec =
                 (image == "wmic.exe"
-                    && cmdline.contains("process")
-                    && cmdline.contains("call")
-                    && cmdline.contains("create"))
+                    && (cmdline.contains("/node:")                        // remote WMI (T1021/T1047 lateral)
+                        || (cmdline.contains("process") && cmdline.contains("call"))))
                 || (parent == "wmiprvse.exe"
                     && !matches!(image.as_str(), "conhost.exe" | "wbemcons.exe" | "wbemcore.exe"));
 
@@ -380,6 +380,57 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                 && (cmdline.contains("http") || cmdline.contains("javascript:")
                     || cmdline.contains("vbscript:") || cmdline.contains("about:"));
 
+            // CAR-2020-09-003: fltmc.exe unloading a minifilter driver disables AV/EDR (T1562.006).
+            // log_source=process/create, mutable=command_line (exe="fltmc.exe", cmd contains "unload")
+            let fltmc_unload = image == "fltmc.exe" && cmdline.contains("unload");
+
+            // CAR-2021-02-002: GetSystem via named pipe echo (Meterpreter/CS privilege escalation T1134).
+            // log_source=process/create, mutable=command_line (echo + \pipe\)
+            let getsystem_pipe = cmdline.contains("echo")
+                && (cmdline.contains("\\pipe\\") || cmdline.contains("\\\\.\\pipe"));
+
+            // CAR-2020-11-004: Process parent-chain mismatch — indicates hollowing / injection (T1055.012).
+            // log_source=process/create, mutable=parent_exe (deviation from expected Windows lineage)
+            let hollow_parent =
+                (image == "smss.exe"     && !matches!(parent.as_str(), "smss.exe" | "system"))
+                || (image == "csrss.exe" && !matches!(parent.as_str(), "smss.exe" | "svchost.exe"))
+                || (image == "wininit.exe" && parent != "smss.exe")
+                || (image == "winlogon.exe" && parent != "smss.exe")
+                || (image == "lsass.exe" && !matches!(parent.as_str(), "wininit.exe" | "winlogon.exe"))
+                || (image == "services.exe" && parent != "wininit.exe")
+                || (image == "spoolsv.exe" && parent != "services.exe")
+                || (image == "userinit.exe"
+                    && !matches!(parent.as_str(), "dwm.exe" | "winlogon.exe" | "explorer.exe"));
+
+            // CAR-2021-04-001: Common Windows process running from non-standard path (T1036.005).
+            // log_source=process/create, mutable=image_path (masquerading via wrong directory)
+            let masquerade = matches!(image.as_str(),
+                "svchost.exe" | "smss.exe" | "csrss.exe" | "wininit.exe" | "winlogon.exe"
+                | "lsass.exe" | "services.exe" | "spoolsv.exe" | "taskhost.exe" | "explorer.exe")
+                && !img_path.contains("\\windows\\system32\\")
+                && !img_path.contains("\\windows\\syswow64\\")
+                && !img_path.is_empty();
+
+            // CAR-2019-07-002: procdump targeting lsass (T1003.001).
+            // log_source=process/create, mutable=command_line + exe
+            let procdump_lsass = image.starts_with("procdump")
+                && (cmdline.contains("lsass") || cmdline.contains("-ma"));
+
+            // CAR-2021-05-008: certutil -exportPFX to steal certificates (T1606.002).
+            // log_source=process/create, mutable=command_line
+            let certutil_cert = image == "certutil.exe" && cmdline.contains("-exportpfx");
+
+            // T1218.007 Msiexec remote/silent install as LOLBin (staging/execution).
+            // log_source=process/create, mutable=command_line (http or UNC path with /q)
+            let msiexec_remote = image == "msiexec.exe"
+                && (cmdline.contains("http://") || cmdline.contains("https://")
+                    || (cmdline.contains("/i") && cmdline.contains("\\\\"))
+                    || cmdline.contains("/quiet"));
+
+            // T1134 /savecred stores credentials for later reuse (runas /savecred).
+            // log_source=process/create, mutable=command_line
+            let savecred = cmdline.contains("/savecred");
+
             attack_tool
                 || office_to_script
                 || lolbin_to_script
@@ -409,6 +460,14 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                 || pth_attack
                 || vbs_exec
                 || mshta_abuse
+                || fltmc_unload
+                || getsystem_pipe
+                || hollow_parent
+                || masquerade
+                || procdump_lsass
+                || certutil_cert
+                || msiexec_remote
+                || savecred
         }
 
         // ── EID 2 — FileCreationTimeChanged: timestomping (T1070.006) ───────────
@@ -628,7 +687,18 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                 || (fname.ends_with(".bin")
                     && (fname.contains("lsass") || fname.contains("ntds") || fname.contains("sam")));
 
-            scripting && (staging || executable) || dump
+            // CAR-2020-09-001: Task file created in Tasks directory by a non-scheduler process (T1053.005).
+            // log_source=file/create, mutable=file_path (path in \Tasks\) + image_path (not svchost)
+            let task_drop = (fname.contains("\\windows\\system32\\tasks\\")
+                || fname.contains("\\windows\\tasks\\"))
+                && !matches!(image.as_str(), "svchost.exe" | "taskeng.exe" | "taskhostw.exe");
+
+            // CAR-2021-05-002: Batch/cmd script dropped into System32 (T1204.002 / T1059.003).
+            // log_source=file/create, mutable=file_path (in system32) + extension (.bat/.cmd)
+            let system32_script = fname.contains("\\windows\\system32\\")
+                && (fname.ends_with(".bat") || fname.ends_with(".cmd") || fname.ends_with(".ps1"));
+
+            scripting && (staging || executable) || dump || task_drop || system32_script
         }
 
         // ── EID 12/13 — RegistryEvent: persistence / defence-evasion keys ────────
@@ -688,6 +758,19 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                 // T1112 Disable Windows Error Reporting / crash dumps (anti-forensics)
                 || obj.contains("\\windows error reporting\\disabled")
                 || obj.contains("\\crashcontrol\\crashdumpenabled")
+                // CAR-2021-11-001: SafeDllSearchMode=0 enables DLL hijacking via search-order (T1574.001).
+                // log_source=registry/value_edit, mutable=value (SafeDllSearchMode=0 in Session Manager)
+                || obj.contains("safedllsearchmode")
+                // CAR-2022-03-001: EventLog service key tampering to disable logging (T1562.002).
+                // log_source=registry/value_edit, mutable=value (Start/File/MaxSize keys under EventLog)
+                || (obj.contains("\\eventlog\\")
+                    && (obj.ends_with("\\start") || obj.ends_with("\\file")
+                        || obj.ends_with("\\maxsize") || obj.ends_with("\\autobackuplogfiles")))
+                // T1562.002 MiniNt key disables Security event log on next boot.
+                || obj.contains("\\minint")
+                // CAR-2021-12-002: Common Startup folder redirection (T1547.001).
+                // log_source=registry/add, mutable=key (Common Startup path)
+                || obj.contains("common startup")
         }
 
         // ── EID 14 — RegistryKeyValueRename: hiding persistence keys ─────────────
