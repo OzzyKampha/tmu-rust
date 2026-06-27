@@ -25,6 +25,7 @@
 
 mod booleanizer;
 pub(crate) mod clause_bank;
+mod clause_inspect;
 pub mod data;
 pub mod encoder;
 pub mod models;
@@ -33,6 +34,7 @@ mod rng;
 mod serial;
 
 pub use booleanizer::Booleanizer;
+pub use clause_inspect::ClauseInspect;
 pub use encoder::{EncodedBatch, EncodedSample, Encoder};
 pub use models::{
     CoalescedTsetlinMachine, ConvolutionalTsetlinMachine, TMAutoEncoder, TMCoalescedAutoEncoder,
