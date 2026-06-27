@@ -358,6 +358,18 @@ impl TMCoalescedAutoEncoder {
         }
     }
 
+    /// Return the indices of all shared clauses that fire for `sample`.
+    /// The `_output` parameter is accepted for API uniformity but ignored — clauses are shared.
+    pub fn fired_clauses(&self, sample: &EncodedSample, _output: usize) -> Vec<usize> {
+        let lit = &sample.0;
+        let words = self.words;
+        let include = self.include.as_slice();
+        let valid = self.valid.as_slice();
+        (0..self.n_clauses)
+            .filter(|&j| fire_predict(&include[j * words..(j + 1) * words], lit, valid, words))
+            .collect()
+    }
+
     // ---- training helpers ---------------------------------------------------
 
     /// Update all shared clauses for output `o`.

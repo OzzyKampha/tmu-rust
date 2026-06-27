@@ -1,3 +1,4 @@
+use crate::encoder::EncodedSample;
 use crate::models::{
     CoalescedTsetlinMachine, TMAutoEncoder, TMCoalescedAutoEncoder, TMRegressor, TsetlinMachine,
 };
@@ -20,6 +21,9 @@ pub trait ClauseInspect {
 
     /// Included literals for `clause` of `output` as `(feature_index, is_negated)` pairs.
     fn clause_rule(&self, output: usize, clause: usize) -> Vec<(usize, bool)>;
+
+    /// Return the indices of all clauses (local to `output`) that fire for `sample`.
+    fn fired_clauses(&self, sample: &EncodedSample, output: usize) -> Vec<usize>;
 }
 
 impl ClauseInspect for CoalescedTsetlinMachine {
@@ -34,6 +38,9 @@ impl ClauseInspect for CoalescedTsetlinMachine {
     }
     fn clause_rule(&self, _output: usize, clause: usize) -> Vec<(usize, bool)> {
         self.clause_rule(clause)
+    }
+    fn fired_clauses(&self, sample: &EncodedSample, output: usize) -> Vec<usize> {
+        self.fired_clauses(sample, output)
     }
 }
 
@@ -53,6 +60,9 @@ impl ClauseInspect for TsetlinMachine {
     fn clause_rule(&self, output: usize, clause: usize) -> Vec<(usize, bool)> {
         self.clause_rule(output, clause)
     }
+    fn fired_clauses(&self, sample: &EncodedSample, output: usize) -> Vec<usize> {
+        self.fired_clauses(sample, output)
+    }
 }
 
 impl ClauseInspect for TMAutoEncoder {
@@ -67,6 +77,9 @@ impl ClauseInspect for TMAutoEncoder {
     }
     fn clause_rule(&self, output: usize, clause: usize) -> Vec<(usize, bool)> {
         self.clause_rule(output, clause)
+    }
+    fn fired_clauses(&self, sample: &EncodedSample, output: usize) -> Vec<usize> {
+        self.fired_clauses(sample, output)
     }
 }
 
@@ -83,6 +96,9 @@ impl ClauseInspect for TMCoalescedAutoEncoder {
     fn clause_rule(&self, _output: usize, clause: usize) -> Vec<(usize, bool)> {
         self.clause_rule(clause)
     }
+    fn fired_clauses(&self, sample: &EncodedSample, output: usize) -> Vec<usize> {
+        self.fired_clauses(sample, output)
+    }
 }
 
 impl ClauseInspect for TMRegressor {
@@ -97,5 +113,8 @@ impl ClauseInspect for TMRegressor {
     }
     fn clause_rule(&self, _output: usize, clause: usize) -> Vec<(usize, bool)> {
         self.clause_rule(clause)
+    }
+    fn fired_clauses(&self, sample: &EncodedSample, output: usize) -> Vec<usize> {
+        self.fired_clauses(sample, output)
     }
 }

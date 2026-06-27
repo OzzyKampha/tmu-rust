@@ -291,6 +291,18 @@ impl TMRegressor {
         self.predict_lit(&sample.0)
     }
 
+    /// Return the indices of all clauses that fire for `sample`.
+    /// The `_output` parameter is accepted for API uniformity but ignored — the regressor has one output.
+    pub fn fired_clauses(&self, sample: &EncodedSample, _output: usize) -> Vec<usize> {
+        let lit = &sample.0;
+        let words = self.words;
+        let inc = self.include.as_slice();
+        let val = self.valid.as_slice();
+        (0..self.n_clauses)
+            .filter(|&j| fire_predict(&inc[j * words..(j + 1) * words], lit, val, words))
+            .collect()
+    }
+
     /// Predict outputs for all samples in a batch.
     pub fn predict_batch(&self, batch: &EncodedBatch) -> Vec<f64> {
         let packed = batch.data.as_slice();

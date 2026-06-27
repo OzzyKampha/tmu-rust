@@ -356,6 +356,18 @@ impl TMAutoEncoder {
         }
     }
 
+    /// Return the indices of all clauses (local to `output`) that fire for `sample`.
+    pub fn fired_clauses(&self, sample: &EncodedSample, output: usize) -> Vec<usize> {
+        let lit = &sample.0;
+        let cpo = self.clauses_per_output;
+        let words = self.words;
+        let include = self.include.as_slice();
+        let valid = self.valid.as_slice();
+        (0..cpo)
+            .filter(|&j| fire_predict(&include[(output * cpo + j) * words..(output * cpo + j + 1) * words], lit, valid, words))
+            .collect()
+    }
+
     // ---- training helpers ----------------------------------------------------
 
     fn output_sum_train(&self, o: usize, lit_active: &[u64]) -> i32 {
