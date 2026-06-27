@@ -766,7 +766,7 @@ fn main() {
     let (n_clauses, threshold, n_literals, n_epochs) = if fast_mode {
         (64usize, 20i32, 4usize, 5usize)
     } else {
-        (256usize, 50i32, 8usize, 10usize)
+        (256usize, 50i32, 8usize, 50usize)
     };
 
     if compare_mode {
