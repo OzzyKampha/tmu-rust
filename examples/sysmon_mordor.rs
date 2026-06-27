@@ -593,6 +593,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let fast_mode    = args.iter().any(|a| a == "--fast");
     let compare_mode = args.iter().any(|a| a == "--compare");
+    let holdout_mode = args.iter().any(|a| a == "--holdout");
 
     if fast_mode {
         println!("Mordor Tactic Classifier — FAST MODE (n_clauses=64, T=20, n_literals=4, 5 epochs)\n");
@@ -601,6 +602,10 @@ fn main() {
     }
     if compare_mode {
         println!("COMPARE MODE: trains two TMs in parallel — real-only vs real+synthetic — same test set\n");
+    }
+    if holdout_mode {
+        println!("HOLDOUT MODE: scenario-level split — ~30% of scenarios per tactic held out as test\n\
+                  Test events come from entirely unseen scenarios (no leakage).\n");
     }
     println!("Downloading / verifying Mordor datasets…");
     discover_and_download();
@@ -614,40 +619,80 @@ fn main() {
     collect_json_files(Path::new(DATA_DIR), &tactic_map, &mut json_files);
     json_files.sort_by_key(|(p, _)| p.clone());
 
-    let mut all_events: Vec<(Vec<String>, usize)> = Vec::new();
-    for (path, tactic_idx) in &json_files {
-        match parse_file(path.to_str().unwrap(), *tactic_idx) {
-            Ok(evs) => {
-                let n = evs.len();
-                if n > 0 {
-                    let tactic = TACTIC_DIRS.get(*tactic_idx).unwrap_or(&"?");
-                    println!(
-                        "  [{tactic}] {} → {n} events",
-                        path.file_name().unwrap().to_str().unwrap()
-                    );
-                }
-                all_events.extend(evs);
-            }
-            Err(e) => eprintln!("  WARN: {e}"),
+    // ── Split files into train/test at the scenario level (holdout) or
+    //    load everything and split events later (default).
+    let (train_files, test_files): (Vec<_>, Vec<_>) = if holdout_mode {
+        // Group files by tactic, hold out ~30% of scenarios per tactic as test.
+        // Files are sorted alphabetically, so the holdout is deterministic.
+        let mut by_tactic: Vec<Vec<std::path::PathBuf>> = vec![Vec::new(); TACTIC_DIRS.len()];
+        for (path, tactic_idx) in &json_files {
+            by_tactic[*tactic_idx].push(path.clone());
         }
-    }
+        let mut tr: Vec<(std::path::PathBuf, usize)> = Vec::new();
+        let mut te: Vec<(std::path::PathBuf, usize)> = Vec::new();
+        for (tactic_idx, files) in by_tactic.iter().enumerate() {
+            // At least 1 holdout file when tactic has >1 scenario; 0 when only 1.
+            let n_holdout = if files.len() <= 1 { 0 } else {
+                ((files.len() as f64 * 0.30).ceil() as usize).max(1)
+            };
+            let n_train = files.len() - n_holdout;
+            let tactic = TACTIC_DIRS[tactic_idx];
+            println!("  [{tactic}] {} train scenarios, {n_holdout} holdout scenarios", n_train);
+            for (i, path) in files.iter().enumerate() {
+                if i < n_train {
+                    tr.push((path.clone(), tactic_idx));
+                } else {
+                    te.push((path.clone(), tactic_idx));
+                }
+            }
+        }
+        println!();
+        (tr, te)
+    } else {
+        // Default: all files go to "train_files"; we split by events below.
+        (json_files.clone(), Vec::new())
+    };
 
-    println!();
-    let mut tactic_counts = vec![0usize; TACTIC_DIRS.len()];
-    for (_, y) in &all_events {
-        tactic_counts[*y] += 1;
+    // Parse events from each set.
+    let parse_set = |files: &[(std::path::PathBuf, usize)], label: &str| -> Vec<(Vec<String>, usize)> {
+        let mut events = Vec::new();
+        for (path, tactic_idx) in files {
+            match parse_file(path.to_str().unwrap(), *tactic_idx) {
+                Ok(evs) => {
+                    let n = evs.len();
+                    if n > 0 && holdout_mode {
+                        let tactic = TACTIC_DIRS.get(*tactic_idx).unwrap_or(&"?");
+                        println!(
+                            "  {label}[{tactic}] {} → {n} events",
+                            path.file_name().unwrap().to_str().unwrap()
+                        );
+                    }
+                    events.extend(evs);
+                }
+                Err(e) => eprintln!("  WARN: {e}"),
+            }
+        }
+        events
+    };
+
+    let mut all_events  = parse_set(&train_files, "");
+    let mut holdout_events = parse_set(&test_files, "TEST ");
+
+    if !holdout_mode {
+        // Print per-tactic counts for the non-holdout path.
+        println!();
+        let mut tactic_counts = vec![0usize; TACTIC_DIRS.len()];
+        for (_, y) in &all_events { tactic_counts[*y] += 1; }
+        for (i, tactic) in TACTIC_DIRS.iter().enumerate() {
+            println!("  {i}  {:<25}  {} real events", tactic, tactic_counts[i]);
+        }
+        println!("     {:<25}  {} real total\n", "", all_events.len());
     }
-    for (i, tactic) in TACTIC_DIRS.iter().enumerate() {
-        println!("  {i}  {:<25}  {} real events", tactic, tactic_counts[i]);
-    }
-    println!("     {:<25}  {} real total\n", "", all_events.len());
 
     // Generate synthetic training events from CAR rule templates.
     let syn_events = generate_synthetic_events();
     let mut syn_counts = vec![0usize; TACTIC_DIRS.len()];
-    for (_, y) in &syn_events {
-        syn_counts[*y] += 1;
-    }
+    for (_, y) in &syn_events { syn_counts[*y] += 1; }
     println!("synthetic events generated from CAR templates:");
     for (i, tactic) in TACTIC_DIRS.iter().enumerate() {
         if syn_counts[i] > 0 {
@@ -661,23 +706,58 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Shuffle real events, 80/20 split — synthetic events go to training only.
-    let mut rng = Rng::new(42);
-    for i in (1..all_events.len()).rev() {
-        let j = rng.below(i + 1);
-        all_events.swap(i, j);
-    }
-    let cut = all_events.len() * 4 / 5;
-    let (train_real, test_all) = all_events.split_at(cut);
+    // Derive train_real + test_all depending on split mode.
+    let train_combined: Vec<(Vec<String>, usize)>;
+    let test_vec: Vec<(Vec<String>, usize)>;
 
-    // Merge real training + synthetic into one training set.
-    let mut train_combined: Vec<(Vec<String>, usize)> = train_real.to_vec();
-    train_combined.extend(syn_events);
+    if holdout_mode {
+        // Shuffle training events; test = the held-out scenario files.
+        let mut rng = Rng::new(42);
+        for i in (1..all_events.len()).rev() {
+            let j = rng.below(i + 1);
+            all_events.swap(i, j);
+        }
+        // Shuffle holdout events too so per-tactic ordering is random.
+        for i in (1..holdout_events.len()).rev() {
+            let j = rng.below(i + 1);
+            holdout_events.swap(i, j);
+        }
+        let mut tc = all_events.clone();
+        tc.extend(syn_events);
+        train_combined = tc;
+        test_vec = holdout_events;
+
+        // Print counts.
+        let mut tr_counts = vec![0usize; TACTIC_DIRS.len()];
+        let mut te_counts = vec![0usize; TACTIC_DIRS.len()];
+        for (_, y) in &train_combined { tr_counts[*y] += 1; }
+        for (_, y) in &test_vec       { te_counts[*y] += 1; }
+        println!("scenario-level holdout split:");
+        println!("  {:<25}  {:>10}  {:>10}", "tactic", "train", "test (holdout)");
+        for (i, tactic) in TACTIC_DIRS.iter().enumerate() {
+            println!("  {i}  {:<25}  {:>10}  {:>10}", tactic, tr_counts[i], te_counts[i]);
+        }
+        println!();
+    } else {
+        // Default: event-level 80/20 shuffle split.
+        let mut rng = Rng::new(42);
+        for i in (1..all_events.len()).rev() {
+            let j = rng.below(i + 1);
+            all_events.swap(i, j);
+        }
+        let cut = all_events.len() * 4 / 5;
+        let mut tc = all_events[..cut].to_vec();
+        tc.extend(syn_events);
+        train_combined = tc;
+        test_vec = all_events[cut..].to_vec();
+    }
+
     let train_all = &train_combined[..];
+    let test_all  = &test_vec[..];
 
     // test_all is always real-only (never contains synthetic events).
-    let (test_tokens, test_y): (Vec<_>, Vec<_>) = test_all.iter().map(|(t, y)| (t, *y)).unzip();
-    let te_owned: Vec<Vec<String>> = test_tokens.iter().map(|t| (*t).clone()).collect();
+    let test_y: Vec<usize>       = test_all.iter().map(|(_, y)| *y).collect();
+    let te_owned: Vec<Vec<String>> = test_all.iter().map(|(t, _)| t.clone()).collect();
     let te_inner: Vec<Vec<&str>> = te_owned
         .iter()
         .map(|t| t.iter().map(String::as_str).collect())
@@ -690,9 +770,17 @@ fn main() {
     };
 
     if compare_mode {
-        // Build two independent training sets: real-only and real+synthetic.
-        let tr_real_owned: Vec<Vec<String>> = train_real.iter().map(|(t, _)| t.clone()).collect();
-        let tr_real_y: Vec<usize>           = train_real.iter().map(|(_, y)| *y).collect();
+        // Build two independent training sets: real-only (no syn) and real+synthetic.
+        // "real-only" = train_all minus the synthetic events = first len(all_events_train) entries.
+        // We reuse all_events which after the split above holds the real training events.
+        let real_only_slice = if holdout_mode {
+            &train_combined[..train_combined.len().saturating_sub(syn_counts.iter().sum::<usize>())]
+        } else {
+            let syn_total: usize = syn_counts.iter().sum();
+            &train_combined[..train_combined.len().saturating_sub(syn_total)]
+        };
+        let tr_real_owned: Vec<Vec<String>> = real_only_slice.iter().map(|(t, _)| t.clone()).collect();
+        let tr_real_y: Vec<usize>           = real_only_slice.iter().map(|(_, y)| *y).collect();
         let tr_real_inner: Vec<Vec<&str>>   = tr_real_owned.iter().map(|t| t.iter().map(String::as_str).collect()).collect();
         let tr_real_refs: Vec<&[&str]>      = tr_real_inner.iter().map(|v| v.as_slice()).collect();
         let enc_real = Encoder::fit_categorical(&tr_real_refs);
