@@ -591,12 +591,16 @@ fn generate_synthetic_events() -> Vec<(Vec<String>, usize)> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let fast_mode = args.iter().any(|a| a == "--fast");
+    let fast_mode    = args.iter().any(|a| a == "--fast");
+    let compare_mode = args.iter().any(|a| a == "--compare");
 
     if fast_mode {
         println!("Mordor Tactic Classifier — FAST MODE (n_clauses=64, T=20, n_literals=4, 5 epochs)\n");
     } else {
         println!("Mordor Tactic Classifier — 8-class ATT&CK tactic prediction from Sysmon events\n");
+    }
+    if compare_mode {
+        println!("COMPARE MODE: trains two TMs in parallel — real-only vs real+synthetic — same test set\n");
     }
     println!("Downloading / verifying Mordor datasets…");
     discover_and_download();
@@ -671,21 +675,170 @@ fn main() {
     train_combined.extend(syn_events);
     let train_all = &train_combined[..];
 
-    let (train_tokens, train_y): (Vec<_>, Vec<_>) = train_all.iter().map(|(t, y)| (t, *y)).unzip();
+    // test_all is always real-only (never contains synthetic events).
     let (test_tokens, test_y): (Vec<_>, Vec<_>) = test_all.iter().map(|(t, y)| (t, *y)).unzip();
-
-    let tr_inner: Vec<Vec<&str>> = train_tokens
+    let te_owned: Vec<Vec<String>> = test_tokens.iter().map(|t| (*t).clone()).collect();
+    let te_inner: Vec<Vec<&str>> = te_owned
         .iter()
         .map(|t| t.iter().map(String::as_str).collect())
         .collect();
-    let tr_refs: Vec<&[&str]> = tr_inner.iter().map(|v| v.as_slice()).collect();
-    let te_inner: Vec<Vec<&str>> = test_tokens
-        .iter()
-        .map(|t| t.iter().map(String::as_str).collect())
-        .collect();
-    let te_refs: Vec<&[&str]> = te_inner.iter().map(|v| v.as_slice()).collect();
 
+    let (n_clauses, threshold, n_literals, n_epochs) = if fast_mode {
+        (64usize, 20i32, 4usize, 5usize)
+    } else {
+        (256usize, 50i32, 8usize, 10usize)
+    };
+
+    if compare_mode {
+        // Build two independent training sets: real-only and real+synthetic.
+        let tr_real_owned: Vec<Vec<String>> = train_real.iter().map(|(t, _)| t.clone()).collect();
+        let tr_real_y: Vec<usize>           = train_real.iter().map(|(_, y)| *y).collect();
+        let tr_real_inner: Vec<Vec<&str>>   = tr_real_owned.iter().map(|t| t.iter().map(String::as_str).collect()).collect();
+        let tr_real_refs: Vec<&[&str]>      = tr_real_inner.iter().map(|v| v.as_slice()).collect();
+        let enc_real = Encoder::fit_categorical(&tr_real_refs);
+
+        let tr_syn_owned: Vec<Vec<String>> = train_all.iter().map(|(t, _)| t.clone()).collect();
+        let tr_syn_y: Vec<usize>           = train_all.iter().map(|(_, y)| *y).collect();
+        let tr_syn_inner: Vec<Vec<&str>>   = tr_syn_owned.iter().map(|t| t.iter().map(String::as_str).collect()).collect();
+        let tr_syn_refs: Vec<&[&str]>      = tr_syn_inner.iter().map(|v| v.as_slice()).collect();
+        let enc_syn = Encoder::fit_categorical(&tr_syn_refs);
+
+        let te_refs_real: Vec<&[&str]> = te_inner.iter().map(|v| v.as_slice()).collect();
+        let te_refs_syn:  Vec<&[&str]> = te_inner.iter().map(|v| v.as_slice()).collect();
+        let test_x_real = enc_real.encode_batch_categorical(&te_refs_real);
+        let test_x_syn  = enc_syn.encode_batch_categorical(&te_refs_syn);
+
+        let n_tactics = TACTIC_DIRS.len();
+        let mut tm_real = CoalescedTsetlinMachine::with_config(
+            n_tactics, enc_real.n_features(), n_clauses, threshold, 5.0, n_literals as u8, true, 42,
+        );
+        let mut tm_syn = CoalescedTsetlinMachine::with_config(
+            n_tactics, enc_syn.n_features(), n_clauses, threshold, 5.0, n_literals as u8, true, 42,
+        );
+
+        let mut ci_real: Vec<Vec<usize>> = vec![Vec::new(); n_tactics];
+        for (i, &y) in tr_real_y.iter().enumerate() { ci_real[y].push(i); }
+        let mut ci_syn: Vec<Vec<usize>> = vec![Vec::new(); n_tactics];
+        for (i, &y) in tr_syn_y.iter().enumerate() { ci_syn[y].push(i); }
+
+        println!("{:<25}  {:>10}  {:>10}", "tactic", "real-only", "real+syn");
+        println!("{}", "─".repeat(50));
+        for (i, tactic) in TACTIC_DIRS.iter().enumerate() {
+            println!("  {i}  {:<25}  {:>6} train  {:>6} train",
+                tactic, ci_real[i].len(), ci_syn[i].len());
+        }
+        println!();
+        println!("  real-only  encoder: {} features", enc_real.n_features());
+        println!("  real+syn   encoder: {} features\n", enc_syn.n_features());
+
+        let per_class = MINI_BATCH_SIZE / n_tactics;
+        let n_batches_real = tr_real_inner.len().div_ceil(MINI_BATCH_SIZE);
+        let n_batches_syn  = tr_syn_inner.len().div_ceil(MINI_BATCH_SIZE);
+        let mut shuffle_rng = Rng::new(0xDEAD_BEEF);
+
+        for epoch in 1..=n_epochs {
+            let t0 = std::time::Instant::now();
+
+            // Train real-only TM.
+            for ci in 0..n_tactics {
+                let len = ci_real[ci].len();
+                for i in (1..len).rev() {
+                    let j = shuffle_rng.below(i + 1);
+                    ci_real[ci].swap(i, j);
+                }
+            }
+            for b in 0..n_batches_real {
+                let mut batch: Vec<usize> = Vec::with_capacity(MINI_BATCH_SIZE);
+                for ci in 0..n_tactics {
+                    let ci_len = ci_real[ci].len();
+                    for k in 0..per_class {
+                        batch.push(ci_real[ci][(b * per_class + k) % ci_len]);
+                    }
+                }
+                for i in (1..batch.len()).rev() {
+                    let j = shuffle_rng.below(i + 1);
+                    batch.swap(i, j);
+                }
+                let slices: Vec<&[&str]> = batch.iter().map(|&i| tr_real_inner[i].as_slice()).collect();
+                let mini_x = enc_real.encode_batch_categorical(&slices);
+                let mini_y: Vec<usize> = batch.iter().map(|&i| tr_real_y[i]).collect();
+                tm_real.fit_epoch(&mini_x, &mini_y);
+            }
+
+            // Train real+syn TM.
+            for ci in 0..n_tactics {
+                let len = ci_syn[ci].len();
+                for i in (1..len).rev() {
+                    let j = shuffle_rng.below(i + 1);
+                    ci_syn[ci].swap(i, j);
+                }
+            }
+            for b in 0..n_batches_syn {
+                let mut batch: Vec<usize> = Vec::with_capacity(MINI_BATCH_SIZE);
+                for ci in 0..n_tactics {
+                    let ci_len = ci_syn[ci].len();
+                    for k in 0..per_class {
+                        batch.push(ci_syn[ci][(b * per_class + k) % ci_len]);
+                    }
+                }
+                for i in (1..batch.len()).rev() {
+                    let j = shuffle_rng.below(i + 1);
+                    batch.swap(i, j);
+                }
+                let slices: Vec<&[&str]> = batch.iter().map(|&i| tr_syn_inner[i].as_slice()).collect();
+                let mini_x = enc_syn.encode_batch_categorical(&slices);
+                let mini_y: Vec<usize> = batch.iter().map(|&i| tr_syn_y[i]).collect();
+                tm_syn.fit_epoch(&mini_x, &mini_y);
+            }
+
+            let elapsed = t0.elapsed();
+            let acc_real = tm_real.accuracy(&test_x_real, &test_y) * 100.0;
+            let acc_syn  = tm_syn.accuracy(&test_x_syn,  &test_y) * 100.0;
+            let delta = acc_syn - acc_real;
+            let sign = if delta >= 0.0 { "+" } else { "" };
+            println!(
+                "epoch {epoch:>2}  real-only={acc_real:.2}%  real+syn={acc_syn:.2}%  delta={sign}{delta:.2}%  ({:.1}s)",
+                elapsed.as_secs_f32()
+            );
+
+            // Per-tactic breakdown side by side.
+            println!("  {:<25}  {:>9}  {:>9}  {:>7}", "tactic", "real-only", "real+syn", "delta");
+            for (class, tactic) in TACTIC_DIRS.iter().enumerate() {
+                let indices: Vec<usize> = test_y.iter().enumerate()
+                    .filter(|(_, &y)| y == class).map(|(i, _)| i).collect();
+                if indices.is_empty() { continue; }
+                let n = indices.len();
+                let correct_real = indices.iter().filter(|&&i| {
+                    let s = enc_real.encode_one_categorical(&te_inner[i]);
+                    tm_real.predict(&s) == class
+                }).count();
+                let correct_syn = indices.iter().filter(|&&i| {
+                    let s = enc_syn.encode_one_categorical(&te_inner[i]);
+                    tm_syn.predict(&s) == class
+                }).count();
+                let pct_real = correct_real as f64 / n as f64 * 100.0;
+                let pct_syn  = correct_syn  as f64 / n as f64 * 100.0;
+                let d = pct_syn - pct_real;
+                let sign = if d >= 0.0 { "+" } else { "" };
+                println!(
+                    "  {class}  {:<25}  {:>5.1}% ({correct_real:>4}/{n})  {:>5.1}% ({correct_syn:>4}/{n})  {sign}{d:.1}%",
+                    tactic, pct_real, pct_syn,
+                );
+            }
+            println!();
+        }
+        return;
+    }
+
+    // ── Standard single-TM training (non-compare mode) ────────────────────────
+
+    let tr_owned: Vec<Vec<String>> = train_all.iter().map(|(t, _)| t.clone()).collect();
+    let train_y: Vec<usize>        = train_all.iter().map(|(_, y)| *y).collect();
+    let tr_inner: Vec<Vec<&str>>   = tr_owned.iter().map(|t| t.iter().map(String::as_str).collect()).collect();
+    let tr_refs: Vec<&[&str]>      = tr_inner.iter().map(|v| v.as_slice()).collect();
+    let te_refs: Vec<&[&str]>      = te_inner.iter().map(|v| v.as_slice()).collect();
     let encoder = Encoder::fit_categorical(&tr_refs);
+
     println!(
         "train={} test={} | vocabulary: {} ECS features\n",
         tr_refs.len(),
@@ -709,12 +862,6 @@ fn main() {
     }
     println!();
 
-    // CoalescedTsetlinMachine: n_clauses shared across all classes.
-    let (n_clauses, threshold, n_literals, n_epochs) = if fast_mode {
-        (64usize, 20i32, 4usize, 5usize)
-    } else {
-        (256usize, 50i32, 8usize, 10usize)
-    };
     let mut tm = CoalescedTsetlinMachine::with_config(
         n_tactics, encoder.n_features(), n_clauses, threshold, 5.0, n_literals as u8, true, 42,
     );
