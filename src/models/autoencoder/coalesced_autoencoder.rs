@@ -8,7 +8,8 @@
 use crate::clause_bank::dense::PARALLEL_MIN;
 use crate::clause_bank::dense::{
     bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, rebuild_include,
-    type_i_update_bytes, type_ii_update_bytes, words_for, GOLDEN, MASK_BITS, WORD_BITS,
+    type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for, GOLDEN, MASK_BITS,
+    WORD_BITS,
 };
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
@@ -57,6 +58,11 @@ pub struct TMCoalescedAutoEncoder {
     valid: Vec<u64>,
     dig_inv: Vec<u8>,
     dig_keep: Vec<u8>,
+
+    ind: Vec<u8>,
+    cat: Vec<u64>,
+    d: f64,
+    type_iii: bool,
 
     literals: Vec<u64>,
     rng: Rng,
@@ -239,6 +245,10 @@ impl TMCoalescedAutoEncoder {
             valid,
             dig_inv: digits_of(1.0 / s, MASK_BITS),
             dig_keep: digits_of((s - 1.0) / s, MASK_BITS),
+            ind: vec![half; n_clauses * n_literals],
+            cat: vec![0u64; n_clauses * words],
+            d: 200.0,
+            type_iii: false,
             literals: vec![0u64; words],
             rng,
         }
@@ -264,6 +274,14 @@ impl TMCoalescedAutoEncoder {
         assert!((0.0..1.0).contains(&p), "literal_drop_p must be in [0, 1)");
         self.literal_drop_p = p;
         self.dig_lit_active = digits_of(1.0 - p, MASK_BITS);
+        self
+    }
+
+    /// Enable Type III feedback with indicator strength `d` (must be > 1.0).
+    pub fn type_iii_feedback(mut self, d: f64) -> Self {
+        assert!(d > 1.0, "d must be > 1.0");
+        self.d = d;
+        self.type_iii = true;
         self
     }
 
@@ -373,6 +391,8 @@ impl TMCoalescedAutoEncoder {
         clause_outputs: &[bool],
         lit_b: &[u8],
         active_b: &[u8],
+        lit: &[u64],
+        lit_active: &[u64],
     ) {
         let nc = self.n_clauses;
         let words = self.words;
@@ -382,6 +402,9 @@ impl TMCoalescedAutoEncoder {
         let half = self.half;
         let max_state = self.max_state;
         let drop_p = self.clause_drop_p;
+        let type_iii_en = self.type_iii;
+        let d_val = self.d;
+        let target_bool = target == 1;
 
         let t = self.threshold as f64;
         let v = sum as f64;
@@ -400,6 +423,8 @@ impl TMCoalescedAutoEncoder {
             valid,
             dig_inv,
             dig_keep,
+            ind,
+            cat,
             ..
         } = self;
         let val = valid.as_slice();
@@ -421,34 +446,43 @@ impl TMCoalescedAutoEncoder {
         #[cfg(feature = "parallel")]
         if nc >= PARALLEL_MIN {
             use rayon::prelude::*;
-            ta.par_chunks_mut(n_literals)
-                .zip(include.par_chunks_mut(words))
-                .zip(out_w.par_iter_mut())
-                .zip(rngs.par_iter_mut())
-                .enumerate()
-                .for_each(|(j, (((ta_j, inc_j), w), rng))| {
-                    apply_one_clause_coalesced(
-                        ta_j,
-                        inc_j,
-                        w,
-                        rng,
-                        target,
-                        p,
-                        clause_outputs[j],
-                        clause_active[j],
-                        val,
-                        words,
-                        lit_b,
-                        &inv_b,
-                        &keep_b,
-                        active_b,
-                        n_literals,
-                        boost,
-                        max_inc,
-                        half,
-                        max_state,
-                    );
-                });
+            if type_iii_en {
+                ta.par_chunks_mut(n_literals)
+                    .zip(include.par_chunks_mut(words))
+                    .zip(out_w.par_iter_mut())
+                    .zip(rngs.par_iter_mut())
+                    .zip(ind.par_chunks_mut(n_literals))
+                    .zip(cat.par_chunks_mut(words))
+                    .enumerate()
+                    .for_each(|(j, (((((ta_j, inc_j), w), rng), ind_j), cat_j))| {
+                        apply_one_clause_coalesced(
+                            ta_j, inc_j, w, rng, target, p, clause_outputs[j], clause_active[j],
+                            val, words, lit_b, &inv_b, &keep_b, active_b, n_literals, boost,
+                            max_inc, half, max_state,
+                        );
+                        if clause_active[j] {
+                            if type_iii_update(
+                                ta_j, ind_j, cat_j, inc_j, lit, val, lit_active, words, n_literals,
+                                d_val, p, target_bool, rng, half, max_state,
+                            ) {
+                                rebuild_include(ta_j, inc_j, val, words, n_literals, half);
+                            }
+                        }
+                    });
+            } else {
+                ta.par_chunks_mut(n_literals)
+                    .zip(include.par_chunks_mut(words))
+                    .zip(out_w.par_iter_mut())
+                    .zip(rngs.par_iter_mut())
+                    .enumerate()
+                    .for_each(|(j, (((ta_j, inc_j), w), rng))| {
+                        apply_one_clause_coalesced(
+                            ta_j, inc_j, w, rng, target, p, clause_outputs[j], clause_active[j],
+                            val, words, lit_b, &inv_b, &keep_b, active_b, n_literals, boost,
+                            max_inc, half, max_state,
+                        );
+                    });
+            }
             return;
         }
 
@@ -474,6 +508,34 @@ impl TMCoalescedAutoEncoder {
                 half,
                 max_state,
             );
+            if type_iii_en && clause_active[j] {
+                if type_iii_update(
+                    &mut ta[j * n_literals..(j + 1) * n_literals],
+                    &mut ind[j * n_literals..(j + 1) * n_literals],
+                    &mut cat[j * words..(j + 1) * words],
+                    &include[j * words..(j + 1) * words],
+                    lit,
+                    val,
+                    lit_active,
+                    words,
+                    n_literals,
+                    d_val,
+                    p,
+                    target_bool,
+                    &mut rngs[j],
+                    half,
+                    max_state,
+                ) {
+                    rebuild_include(
+                        &ta[j * n_literals..(j + 1) * n_literals],
+                        &mut include[j * words..(j + 1) * words],
+                        val,
+                        words,
+                        n_literals,
+                        half,
+                    );
+                }
+            }
         }
     }
 
@@ -543,7 +605,7 @@ impl TMCoalescedAutoEncoder {
                 s.clamp(-self.threshold, self.threshold)
             };
 
-            self.update_output_coalesced(o, target, sum, &clause_outputs, &lit_b, &active_b);
+            self.update_output_coalesced(o, target, sum, &clause_outputs, &lit_b, &active_b, lit, &lit_active);
 
             // Restore feature mask for the next output's iteration.
             lit_active[word_o] = save_word_o;
@@ -837,5 +899,32 @@ mod tests {
         let mut buf = Vec::new();
         serial::write_header(&mut buf, serial::TAG_VANILLA).unwrap();
         assert!(TMCoalescedAutoEncoder::read_from(&mut buf.as_slice()).is_err());
+    }
+
+    #[test]
+    fn type_iii_constructs_without_panic() {
+        let _ae = TMCoalescedAutoEncoder::with_config(12, 10, 10, 3.0, 8, true, 42)
+            .type_iii_feedback(200.0);
+    }
+
+    #[test]
+    fn type_iii_d_must_be_greater_than_one() {
+        let result = std::panic::catch_unwind(|| {
+            TMCoalescedAutoEncoder::with_config(12, 10, 10, 3.0, 8, true, 42)
+                .type_iii_feedback(0.5)
+        });
+        assert!(result.is_err(), "expected panic for d <= 1.0");
+    }
+
+    #[test]
+    fn type_iii_trains_without_panic() {
+        let xs = make_mirrored(300, 6, 7);
+        let e = enc(12);
+        let batch = e.encode_batch(&as_slices(&xs));
+        let mut ae = TMCoalescedAutoEncoder::with_config(12, 10, 10, 3.0, 8, true, 42)
+            .type_iii_feedback(200.0);
+        for _ in 0..5 {
+            ae.fit_epoch(&batch);
+        }
     }
 }
