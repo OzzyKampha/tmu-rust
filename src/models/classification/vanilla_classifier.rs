@@ -611,7 +611,7 @@ impl TsetlinMachine {
                         );
                         if drop_mask.is_empty() || !drop_mask[j] {
                             if type_iii_update(
-                                ta_c, ind_c, cat_c, inc_c, lit, val, lit_active, words, n_literals,
+                                ta_c, ind_c, cat_c, inc_c, lit, val, lit_active, active_b, words, n_literals,
                                 d_val, p, target_bool, rng, half, max_state,
                             ) {
                                 rebuild_include(ta_c, inc_c, val, words, n_literals, half);
@@ -670,6 +670,7 @@ impl TsetlinMachine {
                     lit,
                     val,
                     lit_active,
+                    active_b,
                     words,
                     n_literals,
                     d_val,

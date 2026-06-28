@@ -600,7 +600,7 @@ impl CoalescedTsetlinMachine {
                         );
                         if clause_active[j] {
                             if type_iii_update(
-                                ta_j, ind_j, cat_j, inc_j, lit, val, lit_active, words, n_literals,
+                                ta_j, ind_j, cat_j, inc_j, lit, val, lit_active, active_b, words, n_literals,
                                 d_val, p, target_bool, rng, half, max_state,
                             ) {
                                 rebuild_include(ta_j, inc_j, val, words, n_literals, half);
@@ -655,6 +655,7 @@ impl CoalescedTsetlinMachine {
                     lit,
                     val,
                     lit_active,
+                    active_b,
                     words,
                     n_literals,
                     d_val,

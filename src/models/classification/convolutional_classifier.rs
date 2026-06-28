@@ -783,7 +783,7 @@ impl ConvolutionalTsetlinMachine {
                         if drop_mask.is_empty() || !drop_mask[j] {
                             let patch_lit = &patches_buf[p_idx * words..(p_idx + 1) * words];
                             if type_iii_update(
-                                ta_c, ind_c, cat_c, inc_c, patch_lit, val, lit_active, words,
+                                ta_c, ind_c, cat_c, inc_c, patch_lit, val, lit_active, &active_b, words,
                                 n_literals, d_val, p, target_bool, rng_c, half, max_state,
                             ) {
                                 rebuild_include(ta_c, inc_c, val, words, n_literals, half);
@@ -880,6 +880,7 @@ impl ConvolutionalTsetlinMachine {
                     patch_lit,
                     val,
                     lit_active,
+                    &active_b,
                     words,
                     n_literals,
                     d_val,
