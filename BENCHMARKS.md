@@ -351,6 +351,63 @@ Measured on a 4-core cloud VM, single-threaded release build (`cargo build --rel
 
 ---
 
+## Dense vs Sparse clause bank
+
+`TMSparseClassifier` stores each clause as included / excluded literal **index
+lists** rather than a dense per-literal counter array, and **absorbing actions**
+permanently remove literals once they reach the exclude floor. This trades
+constant-factor overhead (a 4-byte index + 1-byte state per *tracked* literal,
+plus scalar list iteration instead of bit-parallel / AVX2 sweeps) for a footprint
+that shrinks as irrelevant literals are absorbed away. It therefore wins only when
+the feature space is large and most literals get absorbed.
+
+Run it yourself: `cargo run --release --example sparse_vs_dense`.
+
+Representative numbers (noisy XOR, 2 relevant features, 20 clauses/class, T=15,
+s=3.9, `max_included=8`, single-threaded release build):
+
+| features | epochs | dense acc | sparse acc | dense mem | sparse mem | mem ratio | absorbed |
+|---|---|---|---|---|---|---|---|
+| 32  | 40  | 0.995 | 0.994 | 2 880 B  | 5 955 B | 0.5× (dense smaller) | 54% |
+| 128 | 150 | 0.988 | 0.978 | 11 520 B | 4 900 B | **2.4× smaller** | 90% |
+
+**Takeaways:**
+
+- **Accuracy is at parity** in both regimes — the sparse port is algorithmically
+  correct, not just smaller. (The `sparse_matches_dense_accuracy` test enforces
+  this within a 0.05 margin.)
+- **Memory crossover** happens around ~78% absorption: below it, dense's 1-byte
+  bit-packed counters beat the sparse 5-byte-per-literal index storage; above it,
+  sparse pulls ahead (2.4× smaller at 128 features / 90% absorbed).
+- **Sparse single-thread is slower** than dense at these sizes — dense uses AVX2 on
+  contiguous counters, while the sparse hot path is per-index bit gathers + scalar
+  RNG + list mutation. Sparse's advantage is memory and asymptotic per-clause
+  evaluation cost in high-dimensional, sparsely-relevant problems, not raw
+  single-thread speed at small scale.
+
+### Sparse parallelism (`--features parallel`)
+
+Training parallelises over clauses and inference over samples (Rayon), gated by
+`PARALLEL_MIN` like the dense model. Each clause owns disjoint state, so parallel
+training is **bit-identical** to scalar (verified by a weight/rule checksum). As
+with dense, it only pays off at **large clause counts** — at small counts the
+per-clause work is too light to amortise Rayon's per-region dispatch overhead
+(training enters a parallel region twice per sample).
+
+Sparse training, 64 features, 5000 samples, single-thread vs Rayon (4-core VM):
+
+| clauses/class | epochs | scalar | parallel | speedup |
+|---|---|---|---|---|
+| 200  | 30 | 8.8 s  | 15.9 s | **0.55× (slower)** |
+| 2000 | 6  | 20.5 s | 10.5 s | **1.9× faster** |
+
+So enable `--features parallel` for sparse only with large models; for small/medium
+clause counts the scalar build is faster. **AVX2 is not implemented for the sparse
+bank** (the gather/RNG/`swap_remove` hot path doesn't vectorise; upstream `cair/tmu`'s
+sparse C is also scalar) — see `PORTING_STATUS.md`.
+
+---
+
 ### tmu Python accuracy note
 
 Python `tmu` versions tested (0.7.9, 0.8.3) do not converge on the small accuracy config
