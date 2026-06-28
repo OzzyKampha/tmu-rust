@@ -1,0 +1,1720 @@
+MITRE CAR COMPLETE EXTRACTION - SYSMON DETECTION DATA
+================================================================================
+Source: https://github.com/mitre-attack/car/tree/master/analytics
+Date: 2026-06-26
+Total: 102 analytics | Sysmon-relevant: 89 | With pseudocode: 90
+
+DATA MODEL DISTRIBUTION (Sysmon Event Types marked with *):
+  * process              67 analytics
+    flow                 14 analytics
+  * registry             8 analytics
+  * file                 5 analytics
+    user_session         2 analytics
+  * thread               2 analytics
+  * service              2 analytics
+
+TACTIC DISTRIBUTION:
+  TA0001 Initial Access                 1 analytics
+  TA0002 Execution                      20 analytics
+  TA0003 Persistence                    26 analytics
+  TA0004 Privilege Escalation           23 analytics
+  TA0005 Defense Evasion                40 analytics
+  TA0006 Credential Access              12 analytics
+  TA0007 Discovery                      7 analytics
+  TA0008 Lateral Movement               15 analytics
+  TA0009 Collection                     1 analytics
+  TA0010 Exfiltration                   2 analytics
+  TA0011 Command and Control            4 analytics
+  TA0040 Impact                         2 analytics
+
+================================================================================
+COMPLETE ANALYTICS BY TACTIC (Sysmon-relevant with pseudocode)
+================================================================================
+
+############################################################
+TACTIC TA0001: Initial Access  [1 total, 0 Sysmon+pseudocode]
+############################################################
+
+[OTHER]    CAR-2013-02-008 | Simultaneous Logins on a Host
+           Techniques: T1078, T1078.002, T1078.003
+           DataModel:  user_session/login/user, user_session/login/hostname
+           PSEUDOCODE:
+             users_list = search UserSession:Login
+             users_grouped = group users_list by hostname
+             users_grouped = from users_grouped select min(time) as earliest_time, max(time) as latest_time count(user) as user_count
+             multiple_logins = filter users_grouped where (latest_time - earliest_time <= 1 hour and user_count > 1)
+             output multiple_logins
+
+############################################################
+TACTIC TA0002: Execution  [20 total, 15 Sysmon+pseudocode]
+############################################################
+
+[OTHER]    CAR-2013-01-002 | Autorun Differences
+           Techniques: T1543, T1543.003, T1053, T1053.005, T1547, T1547.001, T1547.010, T1547.004 ...
+           DataModel:  
+
+[SYSMON+PS] CAR-2013-02-003 | Processes Spawning cmd.exe
+           Techniques: T1059, T1059.003
+           DataModel:  process/create/exe, process/create/parent_exe
+           PSEUDOCODE:
+             process = search Process:Create
+             cmd = filter process where (exe == "cmd.exe")
+             output cmd
+
+[SYSMON+PS] CAR-2013-04-002 | Quick execution of a series of suspicious commands
+           Techniques: T1087, T1087.001, T1087.002, T1003, T1003.002, T1069, T1069.001, T1069.002 ...
+           DataModel:  process/create/hostname, process/create/ppid, process/create/exe
+           PSEUDOCODE:
+             processes = search Process:Create
+             reg_processes = filter processes where (exe == "arp.exe" or exe == "at.exe" or exe == "attrib.exe"
+              or exe == "cscript.exe" or exe == "dsquery.exe" or exe == "hostname.exe"
+              or exe == "ipconfig.exe" or exe == "mimikatz.exe" or exe == "nbstat.exe"
+              or exe == "net.exe" or exe == "netsh.exe" or exe == "nslookup.exe"
+              or exe == "ping.exe" or exe == "quser.exe" or exe == "qwinsta.exe"
+              or exe == "reg.exe" or exe == "runas.exe" or exe == "sc.exe"
+              or exe == "schtasks.exe" or exe == "ssh.exe" or exe == "systeminfo.exe"
+              or exe == "taskkill.exe" or exe == "telnet.exe" or exe == "tracert.exe"
+              or exe == "wscript.exe" or exe == "xcopy.exe")
+             reg_grouped = group reg by hostname, ppid where(max time between two events is 30 minutes)
+             output reg_grouped
+
+[SYSMON+PS] CAR-2013-05-004 | Execution with AT
+           Techniques: T1053, T1053.002
+           DataModel:  process/create/command_line, process/create/exe
+           PSEUDOCODE:
+             process = search Process:Create
+             at = filter process where (exe == "at.exe")
+             output at
+
+[SYSMON+PS] CAR-2014-02-001 | Service Binary Modifications
+           Techniques: T1543, T1543.003, T1574, T1574.010, T1569, T1569.002
+           DataModel:  file/create/file_path, file/create/image_path, process/create/image_path, process/create/parent_exe
+           PSEUDOCODE:
+             legitimate_installers = ["C:\windows\system32\msiexec.exe", "C:\windows\syswow64\msiexec.exe", ...]
+             
+             file_change = search File:Create,Modify
+             process = search Process:Create
+             service_process = filter processes where (parent_exe == "services.exe")
+             modified_service = join (search, filter) where (
+              file_change.time < service_process.time and
+              file_change.file_path == service_process.image_path
+             )
+             
+             modified_service = filter modified_service where (modified_service.file_change.image_path not in legitimate_installers)
+             output modified_service
+
+[SYSMON+PS] CAR-2014-03-005 | Remotely Launched Executables via Services
+           Techniques: T1543, T1543.003, T1569, T1569.002
+           DataModel:  flow/start/pid, process/create/parent_exe, process/create/pid
+           PSEUDOCODE:
+             process = search Process:Create
+             flow = search Flow:Start
+             service = filter process where (parent_exe == "services.exe")
+             remote_start = join (flow, service ) where (
+              flow.hostname == service.hostname and
+              flow.pid == service.pid and
+              (flow.time < service.time < flow.time + 1 second)
+             )
+             output remote_start
+
+[SYSMON+PS] CAR-2014-04-003 | Powershell Execution
+           Techniques: T1059, T1059.001
+           DataModel:  process/create/exe, process/create/parent_exe
+           PSEUDOCODE:
+             process = search Process:Create
+             powershell = filter process where (exe == "powershell.exe" AND parent_exe != "explorer.exe" )
+             output powershell
+
+[SYSMON+PS] CAR-2014-11-002 | Outlier Parents of Cmd
+           Techniques: T1059, T1059.003
+           DataModel:  process/create/exe, process/create/parent_exe
+           PSEUDOCODE:
+             processes = search Process:Create
+             cmd = filter processes where (exe == "cmd.exe")
+             cmd = from cmd select parent_exe
+             historic_cmd = filter cmd (where timestamp < now - 1 day AND timestamp > now - 1 day)
+             current_cmd = filter cmd (where timestamp >= now - 1 day)
+             new_cmd = historic_cmd - current_cmd
+             output new_cmd
+
+[SYSMON+PS] CAR-2014-11-004 | Remote PowerShell Sessions
+           Techniques: T1059, T1059.001, T1021, T1021.006
+           DataModel:  process/create/exe, process/create/parent_exe
+           PSEUDOCODE:
+             process = search Process:Create
+             wsmprovhost = filter process where (exe == "wsmprovhost.exe" and parent_exe == "svchost.exe")
+
+[OTHER]    CAR-2014-11-007 | Remote Windows Management Instrumentation (WMI) over RPC
+           Techniques: T1047
+           DataModel:  flow/message/proto_info
+           PSEUDOCODE:
+             flows = search Flow:Message
+             wmi_flow = filter flows where (dest_port == 135 and proto_info.rpc_interface == "IRemUnknown2")
+             output wmi_flow
+
+[SYSMON+PS] CAR-2014-12-001 | Remotely Launched Executables via WMI
+           Techniques: T1047
+           DataModel:  flow/message/dest_port, flow/message/proto_info, flow/message/src_port, process/create/command_line, process/create/exe ...
+           PSEUDOCODE:
+             processes = search Process:Create
+             wmi_children = filter processes where (parent_exe == "wmiprvse.exe")
+             
+             flows = search Flow:Message
+             wmi_flow = filter flows where (src_port >= 49152 and dest_port >= 49152 and proto_info.rpc_interface == "IRemUnknown2")
+             
+             remote_wmi_process = join wmi_children, wmi_flow where (
+              wmi_flow.time < wmi_children.time < wmi_flow.time + 1sec and
+              wmi_flow.hostname == wmi_children.hostname
+             )
+             
+             output remote_wmi_process
+
+[OTHER]    CAR-2015-04-001 | Remotely Scheduled Tasks via AT
+           Techniques: T1053, T1053.002
+           DataModel:  flow/message/proto_info
+           PSEUDOCODE:
+             flows = search Flow:Message
+             at_proto = filter flows where (dest_port == 445 and proto_info.pipe == "ATSVC")
+             at_create = filter flows where (proto_info.function == "JobAdd")
+             
+             output at_create
+
+[OTHER]    CAR-2015-04-002 | Remotely Scheduled Tasks via Schtasks
+           Techniques: T1053, T1053.005
+           DataModel:  flow/message/dest_port, flow/message/src_port, flow/message/proto_info
+           PSEUDOCODE:
+             flows = search Flow:Message
+             schtasks_rpc = filter flows where (
+              src_port >= 49152 and dest_port >= 49152 and
+              proto_info.rpc_interface == "ITaskSchedulerService"
+             )
+             
+             output schtasks_rpc
+
+[SYSMON+PS] CAR-2016-03-002 | Create Remote Process via WMIC
+           Techniques: T1047
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             wmic = filter processes where (exe == "wmic.exe" and command_line == "* process call create *" and command_line == "* /node:*")
+             output wmic
+
+[SYSMON+PS] CAR-2020-09-001 | Scheduled Task - FileAccess
+           Techniques: T1053, T1053.005
+           DataModel:  file/create/file_path, file/create/image_path
+           PSEUDOCODE:
+             files = search File:Create
+             task_files = filter files where (
+               (file_path = "C:\Windows\System32\Tasks\*" or file_path = "C:\Windows\Tasks\*")  and
+               image_path != "C:\WINDOWS\system32\svchost.exe")
+             output task_files
+
+[SYSMON]   CAR-2021-01-002 | Unusually Long Command Line Strings
+           Techniques: T1059
+           DataModel:  process/create/command_line
+
+[SYSMON+PS] CAR-2021-01-006 | Unusual Child Process spawned using DDE exploit
+           Techniques: T1559, T1559.002
+           DataModel:  process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             target_processes = filter processes where (
+                  (parent_image="*excel.exe" OR parent_image="*word.exe" OR parent_image="*outlook.exe")
+                  AND image="*.exe"
+                  )
+
+[SYSMON+PS] CAR-2021-05-002 | Batch File Write to System32
+           Techniques: T1204, T1204.002
+           DataModel:  file/create/extension, file/create/file_path
+           PSEUDOCODE:
+             files = search File:create
+             batch_files = filter files where (
+               extension =".bat" AND file_path = "C:\Windows\system32*" )
+             output batch_files
+
+[SYSMON+PS] CAR-2021-05-012 | Create Service In Suspicious File Path
+           Techniques: T1569, T1569.001, T1569.002
+           DataModel:  service/create/image_path
+           PSEUDOCODE:
+             services = search Service:create
+             suspicious_services = filter services where image_path = "*\.exe" AND image_path does not contain ["C:\\Windows\\*", "%windir%\\*", "C:\\Program File*", "C:\\Programdata\\*", "%systemroot%\\*"] )
+             output suspicious_services
+
+[SYSMON+PS] CAR-2021-12-001 | Scheduled Task Creation or Modification Containing Suspicious Scripts, Extensions or User Writable Paths
+           Techniques: T1053, T1053.005
+           DataModel:  process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:create
+             susp_tasks_processes = filter processes where command_line CONTAINS("*SCHTASKS*") AND (command_line CONTAINS("*/CREATE*") OR command_line CONTAINS("*/CHANGE*")) AND (command_line CONTAINS("*.cmd*") OR command_line CONTAINS("*.ps1*") OR command_line CONTAINS("*.vbs*") OR command_line CONTAINS("*.py*") OR command_line CONTAINS("*.js*") OR command_line CONTAINS("*.exe*") OR command_line CONTAINS("*.bat*") OR (command_line CONTAINS("*javascript*") OR command_line CONTAINS("*powershell*") OR command_line CONTAINS("*wmic*") OR command_line CONTAINS("*rundll32*") OR command_line CONTAINS("*cmd*") OR command_line CONTAINS("*cscript*") OR command_line CONTAINS("*wscript*") OR command_line CONTAINS("*regsvr32*") OR command_line CONTAINS("*mshta*") OR command_line CONTAINS("*bitsadmin*") OR command_line CONTAINS("*certutil*") OR command_line CONTAINS("*msiexec*") OR command_line CONTAINS("*javaw*") OR (command_line CONTAINS("*%APPDATA%*") OR command_line CONTAINS("*\\AppData\\Roaming*") OR command_line CONTAINS("*%PUBLIC%*") OR command_line CONTAINS("*C:\\Users\\Public*") OR command_line CONTAINS("*%ProgramData%*") OR command_line CONTAINS("*C:\\ProgramData*") OR command_line CONTAINS("*%TEMP%*") OR command_line CONTAINS("*\\AppData\\Local\\Temp*") OR command_line CONTAINS("*\\Windows\\PLA\\System*") OR command_line CONTAINS("*\\tasks*") OR command_line CONTAINS("*\\Registration\\CRMLog*") OR command_line CONTAINS("*\\FxsTmp*") OR command_line CONTAINS("*\\spool\\drivers\\color*") OR command_line CONTAINS("*\\tracing*"))))
+             tasks = search Task:create
+             susp_tasks = filter tasks where (task_content CONTAINS("*.cmd*") OR task_content CONTAINS("*.ps1*") OR task_content CONTAINS("*.vbs*") OR task_content CONTAINS("*.py*") OR task_content CONTAINS("*.js*") OR task_content CONTAINS("*.exe*") OR task_content CONTAINS("*.bat*") OR (task_content CONTAINS("*javascript*") OR task_content CONTAINS("*powershell*") OR task_content CONTAINS("*wmic*") OR task_content CONTAINS("*rundll32*") OR task_content CONTAINS("*cmd*") OR task_content CONTAINS("*cscript*") OR task_content CONTAINS("*wscript*") OR task_content CONTAINS("*regsvr32*") OR task_content CONTAINS("*mshta*") OR task_content CONTAINS("*bitsadmin*") OR task_content CONTAINS("*certutil*") OR task_content CONTAINS("*msiexec*") OR task_content CONTAINS("*javaw*") OR (task_content CONTAINS("*%APPDATA%*") OR task_content CONTAINS("*\\AppData\\Roaming*") OR task_content CONTAINS("*%PUBLIC%*") OR task_content CONTAINS("*C:\\Users\\Public*") OR task_content CONTAINS("*%ProgramData%*") OR task_content CONTAINS("*C:\\ProgramData*") OR task_content CONTAINS("*%TEMP%*") OR task_content CONTAINS("*\\AppData\\Local\\Temp*") OR task_content CONTAINS("*\\Windows\\PLA\\System*") OR task_content CONTAINS("*\\tasks*") OR task_content CONTAINS("*\\Registration\\CRMLog*") OR task_content CONTAINS("*\\FxsTmp*") OR task_content CONTAINS("*\\spool\\drivers\\color*") OR task_content CONTAINS("*\\tracing*"))))
+             output susp_tasks_processes, susp_tasks
+
+############################################################
+TACTIC TA0003: Persistence  [26 total, 24 Sysmon+pseudocode]
+############################################################
+
+[OTHER]    CAR-2013-01-002 | Autorun Differences
+           Techniques: T1543, T1543.003, T1053, T1053.005, T1547, T1547.001, T1547.010, T1547.004 ...
+           DataModel:  
+
+[SYSMON+PS] CAR-2013-03-001 | Reg.exe called from Command Shell
+           Techniques: T1012, T1112, T1547, T1547.001, T1574, T1574.011
+           DataModel:  process/create/command_line, process/create/hostname, process/create/exe, process/create/parent_exe, process/create/pid ...
+           PSEUDOCODE:
+             processes = search Process:Create
+             reg = filter processes where (exe == "reg.exe" and parent_exe == "cmd.exe")
+             cmd = filter processes where (exe == "cmd.exe" and parent_exe != "explorer.exe"")
+             reg_and_cmd = join (reg, cmd) where (reg.ppid == cmd.pid and reg.hostname == cmd.hostname)
+             output reg_and_cmd
+
+[SYSMON+PS] CAR-2013-04-002 | Quick execution of a series of suspicious commands
+           Techniques: T1087, T1087.001, T1087.002, T1003, T1003.002, T1069, T1069.001, T1069.002 ...
+           DataModel:  process/create/hostname, process/create/ppid, process/create/exe
+           PSEUDOCODE:
+             processes = search Process:Create
+             reg_processes = filter processes where (exe == "arp.exe" or exe == "at.exe" or exe == "attrib.exe"
+              or exe == "cscript.exe" or exe == "dsquery.exe" or exe == "hostname.exe"
+              or exe == "ipconfig.exe" or exe == "mimikatz.exe" or exe == "nbstat.exe"
+              or exe == "net.exe" or exe == "netsh.exe" or exe == "nslookup.exe"
+              or exe == "ping.exe" or exe == "quser.exe" or exe == "qwinsta.exe"
+              or exe == "reg.exe" or exe == "runas.exe" or exe == "sc.exe"
+              or exe == "schtasks.exe" or exe == "ssh.exe" or exe == "systeminfo.exe"
+              or exe == "taskkill.exe" or exe == "telnet.exe" or exe == "tracert.exe"
+              or exe == "wscript.exe" or exe == "xcopy.exe")
+             reg_grouped = group reg by hostname, ppid where(max time between two events is 30 minutes)
+             output reg_grouped
+
+[SYSMON+PS] CAR-2013-05-004 | Execution with AT
+           Techniques: T1053, T1053.002
+           DataModel:  process/create/command_line, process/create/exe
+           PSEUDOCODE:
+             process = search Process:Create
+             at = filter process where (exe == "at.exe")
+             output at
+
+[SYSMON+PS] CAR-2013-08-001 | Execution with schtasks
+           Techniques: T1053, T1053.005
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             process = search Process:Create
+             schtasks = filter process where (exe == "schtasks.exe")
+             output schtasks
+
+[SYSMON+PS] CAR-2013-09-005 | Service Outlier Executables
+           Techniques: T1543, T1543.003
+           DataModel:  process/create/parent_image_path
+           PSEUDOCODE:
+             processes = search Process:Create
+             services = filter processes where (parent_image_path == "C:\Windows\System32\services.exe")
+             historic_services = filter services (where timestamp < now - 1 day AND timestamp > now - 1 day)
+             current_services = filter services (where timestamp >= now - 1 day)
+             new_services = historic_services - current_services
+             output new_services
+
+[SYSMON+PS] CAR-2014-02-001 | Service Binary Modifications
+           Techniques: T1543, T1543.003, T1574, T1574.010, T1569, T1569.002
+           DataModel:  file/create/file_path, file/create/image_path, process/create/image_path, process/create/parent_exe
+           PSEUDOCODE:
+             legitimate_installers = ["C:\windows\system32\msiexec.exe", "C:\windows\syswow64\msiexec.exe", ...]
+             
+             file_change = search File:Create,Modify
+             process = search Process:Create
+             service_process = filter processes where (parent_exe == "services.exe")
+             modified_service = join (search, filter) where (
+              file_change.time < service_process.time and
+              file_change.file_path == service_process.image_path
+             )
+             
+             modified_service = filter modified_service where (modified_service.file_change.image_path not in legitimate_installers)
+             output modified_service
+
+[SYSMON+PS] CAR-2014-03-005 | Remotely Launched Executables via Services
+           Techniques: T1543, T1543.003, T1569, T1569.002
+           DataModel:  flow/start/pid, process/create/parent_exe, process/create/pid
+           PSEUDOCODE:
+             process = search Process:Create
+             flow = search Flow:Start
+             service = filter process where (parent_exe == "services.exe")
+             remote_start = join (flow, service ) where (
+              flow.hostname == service.hostname and
+              flow.pid == service.pid and
+              (flow.time < service.time < flow.time + 1 second)
+             )
+             output remote_start
+
+[SYSMON+PS] CAR-2014-05-002 | Services launching Cmd
+           Techniques: T1543, T1543.003
+           DataModel:  process/create/exe, process/create/parent_exe
+           PSEUDOCODE:
+             process = search Process:Create
+             cmd = filter process where (exe == "cmd.exe" and parent_exe == "services.exe")
+             output cmd
+
+[SYSMON+PS] CAR-2014-07-001 | Service Search Path Interception
+           Techniques: T1574, T1574.009
+           DataModel:  process/create/command_line, process/create/image_path, process/create/parent_exe
+           PSEUDOCODE:
+             process = search Process:Create
+             services = filter processes where (parent_exe == "services.exe")
+             unquoted_services = filter services where (command_line != "\"*" and command_line == "* *")
+             intercepted_service = filter unquoted_service where (image_path != "* *" and exe not in command_line)
+             output intercepted_service
+
+[SYSMON+PS] CAR-2014-11-003 | Debuggers for Accessibility Applications
+           Techniques: T1546, T1546.008
+           DataModel:  process/create/command_line, process/create/exe
+           PSEUDOCODE:
+             process = search Process:Create
+             debuggers = filter process where (command_line match "$.* .*(sethc{{pipe}}utilman{{pipe}}osk{{pipe}}narrator{{pipe}}magnify)\.exe")
+             output debuggers
+
+[SYSMON+PS] CAR-2014-11-008 | Command Launched from WinLogon
+           Techniques: T1546, T1546.008
+           DataModel:  process/create/exe, process/create/parent_exe
+           PSEUDOCODE:
+             processes = search Process:Create
+             winlogon_cmd = filter processes where (parent_exe == "winlogon.exe" and exe == "cmd.exe")
+             output winlogon_cmd
+
+[OTHER]    CAR-2020-05-003 | Rare LolBAS Command Lines
+           Techniques: T1012, T1112, T1547, T1547.001, T1574, T1574.011
+           DataModel:  
+           PSEUDOCODE:
+             processes = search Process:Create
+             lolbas_processes = filter processes where (exe = "At.exe" OR exe = "Atbroker.exe" OR exe = "Bash.exe" OR exe = "Bitsadmin.exe" OR exe = "Certutil.exe" OR exe = "Cmd.exe" OR exe = "Cmdkey.exe" OR exe = "Cmstp.exe" OR exe = "Control.exe" OR exe = "Csc.exe" OR exe = "Cscript.exe" OR exe = "Dfsvc.exe" OR exe = "Diskshadow.exe" OR exe = "Dnscmd.exe" OR exe = "Esentutl.exe" OR exe = "Eventvwr.exe" OR exe = "Expand.exe" OR exe = "Extexport.exe" OR exe = "Extrac32.exe" OR exe = "Findstr.exe" OR exe = "Forfiles.exe" OR exe = "Ftp.exe" OR exe = "Gpscript.exe" OR exe = "Hh.exe" OR exe = "Ie4uinit.exe" OR exe = "Ieexec.exe" OR exe = "Infdefaultinstall.exe" OR exe = "Installutil.exe" OR exe = "Jsc.exe" OR exe = "Makecab.exe" OR exe = "Mavinject.exe" OR exe = "Microsoft.Workflow.r.exe" OR exe = "Mmc.exe" OR exe = "Msbuild.exe" OR exe = "Msconfig.exe" OR exe = "Msdt.exe" OR exe = "Mshta.exe" OR exe = "Msiexec.exe" OR exe = "Odbcconf.exe" OR exe = "Pcalua.exe" OR exe = "Pcwrun.exe" OR exe = "Presentationhost.exe" OR exe = "Print.exe" OR exe = "Reg.exe" OR exe = "Regasm.exe" OR exe = "Regedit.exe" OR exe = "Register-cimprovider.exe" OR exe = "Regsvcs.exe" OR exe = "Regsvr32.exe" OR exe = "Replace.exe" OR exe = "Rpcping.exe" OR exe = "Rundll32.exe" OR exe = "Runonce.exe" OR exe = "Runscripthelper.exe" OR exe = "Sc.exe" OR exe = "Schtasks.exe" OR exe = "Scriptrunner.exe" OR exe = "SyncAppvPublishingServer.exe" OR exe = "Tttracer.exe" OR exe = "Verclsid.exe" OR exe = "Wab.exe" OR exe = "Wmic.exe" OR exe = "Wscript.exe" OR exe = "Wsreset.exe" OR exe = "Xwizard.exe" OR exe = "Advpack.dll OR exe = "Comsvcs.dll OR exe = "Ieadvpack.dll OR exe = "Ieaframe.dll OR exe = "Mshtml.dll OR exe = "Pcwutl.dll OR exe = "Setupapi.dll OR exe = "Shdocvw.dll OR exe = "Shell32.dll OR exe = "Syssetup.dll OR exe = "Url.dll OR exe = "Zipfldr.dll OR exe = "Appvlp.exe" OR exe = "Bginfo.exe" OR exe = "Cdb.exe" OR exe = "csi.exe" OR exe = "Devtoolslauncher.exe" OR exe = "dnx.exe" OR exe = "Dxcap.exe" OR exe = "Excel.exe" OR exe = "Mftrace.exe" OR exe = "Msdeploy.exe" OR exe = "msxsl.exe" OR exe = "Powerpnt.exe" OR exe = "rcsi.exe" OR exe = "Sqler.exe" OR exe = "Sqlps.exe" OR exe = "SQLToolsPS.exe" OR exe = "Squirrel.exe" OR exe = "te.exe" OR exe = "Tracker.exe" OR exe = "Update.exe" OR exe = "vsjitdebugger.exe" OR exe = "Winword.exe" OR exe = "Wsl.exe" OR exe = "CL_Mutexverifiers.ps1 OR exe = "CL_Invocation.ps1 OR exe = "Manage-bde.wsf OR exe = "Pubprn.vbs OR exe = "Slmgr.vbs OR exe = "Syncappvpublishingserver.vbs OR exe = "winrm.vbs OR exe = "Pester.bat)
+             process_count = count(lolbas_processes) by process
+             process_count_avg = average(process_count)
+             process_count_stdev = standard_deviation(process_count)
+             lower_bound = process_count_avg - stdev * 1.5
+             outliers = filter lolbas_processes where (process_count < lower_bound)
+             return outliers
+
+[SYSMON+PS] CAR-2020-09-001 | Scheduled Task - FileAccess
+           Techniques: T1053, T1053.005
+           DataModel:  file/create/file_path, file/create/image_path
+           PSEUDOCODE:
+             files = search File:Create
+             task_files = filter files where (
+               (file_path = "C:\Windows\System32\Tasks\*" or file_path = "C:\Windows\Tasks\*")  and
+               image_path != "C:\WINDOWS\system32\svchost.exe")
+             output task_files
+
+[SYSMON+PS] CAR-2020-09-002 | Component Object Model Hijacking
+           Techniques: T1546, T1546.015
+           DataModel:  registry/add/key, registry/remove/key, registry/edit/key
+           PSEUDOCODE:
+             registry_keys = search (Registry:Create AND Registry:Remove AND Registry:Edit)
+             clsid_keys = filter registry_keys where (
+               key = "*\Software\Classes\CLSID\*")
+             output clsid_keys
+
+[SYSMON+PS] CAR-2020-09-005 | AppInit DLLs
+           Techniques: T1546, T1546.010
+           DataModel:  registry/add/key, registry/remove/key, registry/edit/key
+           PSEUDOCODE:
+             registry_keys = search (Registry:Create AND Registry:Remove AND Registry:Edit)
+             appinit_keys = filter registry_keys where (
+               key = "*\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows\Appinit_Dlls\*" OR
+               key = "*\SOFTWARE\\Wow6432Node\Microsoft\Windows NT\CurrentVersion\Windows\Appinit_Dlls\*""
+               )
+             output clsid_keys
+
+[SYSMON+PS] CAR-2020-11-001 | Boot or Logon Initialization Scripts
+           Techniques: T1037, T1037.001
+           DataModel:  process/create/command_line, process/create/exe, registry/add/key, registry/edit/key
+           PSEUDOCODE:
+             processes = search Process:Create
+             logon_script_key_processes = filter processes where (
+               command_line = "*reg*add*\Environment*UserInitMprLogonScript")
+             registry = search (Registry:Add OR Registry:Edit)
+             registry_logon_key_events = filter registry where (
+               key = "*\Environment*UserInitMprLogonScript")
+             output (logon_script_key_processes, registry_logon_key_events)
+
+[SYSMON+PS] CAR-2020-11-011 | Registry Edit from Screensaver
+           Techniques: T1546, T1546.002
+           DataModel:  registry/edit/key, registry/add/key
+           PSEUDOCODE:
+             reg_events = search Registry:add or Registry:edit
+             scr_reg_events = filter processes where (
+               key="*\\Software\\Policies\\Microsoft\\Windows\\Control Panel\\Desktop\\SCRNSAVE.EXE" AND
+             output scr_reg_events
+
+[SYSMON+PS] CAR-2021-02-001 | Webshell-Indicative Process Tree
+           Techniques: T1505, T1505.003
+           DataModel:  process/create/exe, process/create/parent_exe
+           PSEUDOCODE:
+             processes = search Process:Create
+             suspicious_processes = filter processes where (
+               (parent_exe == "w3wp.exe" OR
+                parent_exe == "httpd.exe" OR
+                parent_exe == "tomcat*.exe" OR
+                parent_exe == "nginx.exe" ) AND
+               (exe == "cmd.exe" OR
+                exe == "powershell.exe" OR
+                exe == "net.exe" OR
+                exe == "whoami.exe" OR
+                exe == "hostname.exe" OR
+                exe == "systeminfo.exe" OR
+                exe == "ipconfig.exe) )
+             output suspicious_processes
+
+[SYSMON+PS] CAR-2021-05-004 | BITS Job Persistence
+           Techniques: T1197
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             bitsadmin_commands = filter processes where (
+               exe ="C:\Windows\System32\bitsadmin.exe" AND command_line includes one of [*create*, *addfile*, *setnotifyflags*, *setnotifycmdline*, *setminretrydelay*, *setcustomheaders*,*resume*])
+             output bitsadmin_commands
+
+[SYSMON+PS] CAR-2021-05-005 | BITSAdmin Download File
+           Techniques: T1197, T1105
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             bitsadmin_commands = filter processes where (
+               exe ="C:\Windows\System32\bitsadmin.exe" AND command_line = *transfer*)
+             output bitsadmin_commands
+
+[SYSMON+PS] CAR-2021-05-010 | Create local admin accounts using net exe
+           Techniques: T1136, T1136.001
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             certutil_downloads = filter processes where (
+               (exe = C:\Windows\System32\net.exe OR exe = C:\Windows\System32\net1.exe ) AND (command_line = *localgroup* OR command_line = */add* OR command_line = *user* ))
+             output certutil_downloads
+
+[SYSMON+PS] CAR-2021-11-001 | Registry Edit with Creation of SafeDllSearchMode Key Set to 0
+           Techniques: T1574, T1574.001, T1112
+           DataModel:  process/create/command_line, registry/add/key
+           PSEUDOCODE:
+             processes = search Process:create
+             safe_dll_search_processes = filter processes where command_line CONTAINS("*SafeDllSearchMode*") AND ((command_line CONTAINS("*reg*") AND command_line CONTAINS("*add*") AND command_line CONTAINS("*/d*")) OR (command_line CONTAINS("*Set-ItemProperty*") AND command_line CONTAINS(*-value*)) OR ((command_line CONTAINS("*00000000*") AND command_line CONTAINS(*0*)))
+             reg_keys = search Registry:value_edit
+             safe_dll_reg_keys = filter reg_keys where value="SafeDllSearchMode" AND value_data="0"
+             output safe_dll_search_processes, safe_dll_reg_keys
+
+[SYSMON+PS] CAR-2021-11-002 | Registry Edit with Modification of Userinit, Shell or Notify
+           Techniques: T1547, T1547.004, T1112
+           DataModel:  process/create/command_line, registry/add/key
+           PSEUDOCODE:
+             processes = search Process:create
+             logon_reg_processes = filter processes where command_line CONTAINS("*\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon*") AND (command_line CONTAINS("*Userinit*") OR command_line CONTAINS("*Shell*") OR command_line CONTAINS("*Notify*")) AND (((command_line CONTAINS("*reg*") OR command_line CONTAINS("*add*") OR command_line CONTAINS("*/d*")) OR (command_line CONTAINS("*Set-ItemProperty*") OR command_line CONTAINS("*New-ItemProperty*") OR command_line CONTAINS("*-value*"))))
+             reg_keys = search Registry:value_edit
+             logon_reg_keys = filter reg_keys where (value="Userinit" OR value="Shell" OR value="Notify")
+             output logon_reg_processes, logon_reg_keys
+
+[SYSMON+PS] CAR-2021-12-001 | Scheduled Task Creation or Modification Containing Suspicious Scripts, Extensions or User Writable Paths
+           Techniques: T1053, T1053.005
+           DataModel:  process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:create
+             susp_tasks_processes = filter processes where command_line CONTAINS("*SCHTASKS*") AND (command_line CONTAINS("*/CREATE*") OR command_line CONTAINS("*/CHANGE*")) AND (command_line CONTAINS("*.cmd*") OR command_line CONTAINS("*.ps1*") OR command_line CONTAINS("*.vbs*") OR command_line CONTAINS("*.py*") OR command_line CONTAINS("*.js*") OR command_line CONTAINS("*.exe*") OR command_line CONTAINS("*.bat*") OR (command_line CONTAINS("*javascript*") OR command_line CONTAINS("*powershell*") OR command_line CONTAINS("*wmic*") OR command_line CONTAINS("*rundll32*") OR command_line CONTAINS("*cmd*") OR command_line CONTAINS("*cscript*") OR command_line CONTAINS("*wscript*") OR command_line CONTAINS("*regsvr32*") OR command_line CONTAINS("*mshta*") OR command_line CONTAINS("*bitsadmin*") OR command_line CONTAINS("*certutil*") OR command_line CONTAINS("*msiexec*") OR command_line CONTAINS("*javaw*") OR (command_line CONTAINS("*%APPDATA%*") OR command_line CONTAINS("*\\AppData\\Roaming*") OR command_line CONTAINS("*%PUBLIC%*") OR command_line CONTAINS("*C:\\Users\\Public*") OR command_line CONTAINS("*%ProgramData%*") OR command_line CONTAINS("*C:\\ProgramData*") OR command_line CONTAINS("*%TEMP%*") OR command_line CONTAINS("*\\AppData\\Local\\Temp*") OR command_line CONTAINS("*\\Windows\\PLA\\System*") OR command_line CONTAINS("*\\tasks*") OR command_line CONTAINS("*\\Registration\\CRMLog*") OR command_line CONTAINS("*\\FxsTmp*") OR command_line CONTAINS("*\\spool\\drivers\\color*") OR command_line CONTAINS("*\\tracing*"))))
+             tasks = search Task:create
+             susp_tasks = filter tasks where (task_content CONTAINS("*.cmd*") OR task_content CONTAINS("*.ps1*") OR task_content CONTAINS("*.vbs*") OR task_content CONTAINS("*.py*") OR task_content CONTAINS("*.js*") OR task_content CONTAINS("*.exe*") OR task_content CONTAINS("*.bat*") OR (task_content CONTAINS("*javascript*") OR task_content CONTAINS("*powershell*") OR task_content CONTAINS("*wmic*") OR task_content CONTAINS("*rundll32*") OR task_content CONTAINS("*cmd*") OR task_content CONTAINS("*cscript*") OR task_content CONTAINS("*wscript*") OR task_content CONTAINS("*regsvr32*") OR task_content CONTAINS("*mshta*") OR task_content CONTAINS("*bitsadmin*") OR task_content CONTAINS("*certutil*") OR task_content CONTAINS("*msiexec*") OR task_content CONTAINS("*javaw*") OR (task_content CONTAINS("*%APPDATA%*") OR task_content CONTAINS("*\\AppData\\Roaming*") OR task_content CONTAINS("*%PUBLIC%*") OR task_content CONTAINS("*C:\\Users\\Public*") OR task_content CONTAINS("*%ProgramData%*") OR task_content CONTAINS("*C:\\ProgramData*") OR task_content CONTAINS("*%TEMP%*") OR task_content CONTAINS("*\\AppData\\Local\\Temp*") OR task_content CONTAINS("*\\Windows\\PLA\\System*") OR task_content CONTAINS("*\\tasks*") OR task_content CONTAINS("*\\Registration\\CRMLog*") OR task_content CONTAINS("*\\FxsTmp*") OR task_content CONTAINS("*\\spool\\drivers\\color*") OR task_content CONTAINS("*\\tracing*"))))
+             output susp_tasks_processes, susp_tasks
+
+[SYSMON+PS] CAR-2021-12-002 | Modification of Default Startup Folder in the Registry Key 'Common Startup'
+           Techniques: T1547, T1547.001, T1112
+           DataModel:  process/create/command_line, registry/add/key
+           PSEUDOCODE:
+             processes = search Process:create
+             logon_reg_processes = filter processes where (command_line CONTAINS("*reg*") AND command_line CONTAINS("*add*") AND command_line CONTAINS("*/d*") OR (command_line CONTAINS("*Set-ItemProperty*") AND command_line CONTAINS("*-value*")) AND command_line CONTAINS("*Common Startup*"))
+             reg_keys = search Registry:value_edit
+             logon_reg_keys = filter reg_keys where value="Common Startup"
+             output logon_reg_processes, logon_reg_keys
+
+############################################################
+TACTIC TA0004: Privilege Escalation  [23 total, 20 Sysmon+pseudocode]
+############################################################
+
+[OTHER]    CAR-2013-01-002 | Autorun Differences
+           Techniques: T1543, T1543.003, T1053, T1053.005, T1547, T1547.001, T1547.010, T1547.004 ...
+           DataModel:  
+
+[SYSMON+PS] CAR-2013-03-001 | Reg.exe called from Command Shell
+           Techniques: T1012, T1112, T1547, T1547.001, T1574, T1574.011
+           DataModel:  process/create/command_line, process/create/hostname, process/create/exe, process/create/parent_exe, process/create/pid ...
+           PSEUDOCODE:
+             processes = search Process:Create
+             reg = filter processes where (exe == "reg.exe" and parent_exe == "cmd.exe")
+             cmd = filter processes where (exe == "cmd.exe" and parent_exe != "explorer.exe"")
+             reg_and_cmd = join (reg, cmd) where (reg.ppid == cmd.pid and reg.hostname == cmd.hostname)
+             output reg_and_cmd
+
+[SYSMON+PS] CAR-2013-04-002 | Quick execution of a series of suspicious commands
+           Techniques: T1087, T1087.001, T1087.002, T1003, T1003.002, T1069, T1069.001, T1069.002 ...
+           DataModel:  process/create/hostname, process/create/ppid, process/create/exe
+           PSEUDOCODE:
+             processes = search Process:Create
+             reg_processes = filter processes where (exe == "arp.exe" or exe == "at.exe" or exe == "attrib.exe"
+              or exe == "cscript.exe" or exe == "dsquery.exe" or exe == "hostname.exe"
+              or exe == "ipconfig.exe" or exe == "mimikatz.exe" or exe == "nbstat.exe"
+              or exe == "net.exe" or exe == "netsh.exe" or exe == "nslookup.exe"
+              or exe == "ping.exe" or exe == "quser.exe" or exe == "qwinsta.exe"
+              or exe == "reg.exe" or exe == "runas.exe" or exe == "sc.exe"
+              or exe == "schtasks.exe" or exe == "ssh.exe" or exe == "systeminfo.exe"
+              or exe == "taskkill.exe" or exe == "telnet.exe" or exe == "tracert.exe"
+              or exe == "wscript.exe" or exe == "xcopy.exe")
+             reg_grouped = group reg by hostname, ppid where(max time between two events is 30 minutes)
+             output reg_grouped
+
+[SYSMON+PS] CAR-2013-05-004 | Execution with AT
+           Techniques: T1053, T1053.002
+           DataModel:  process/create/command_line, process/create/exe
+           PSEUDOCODE:
+             process = search Process:Create
+             at = filter process where (exe == "at.exe")
+             output at
+
+[SYSMON+PS] CAR-2013-10-002 | DLL Injection via Load Library
+           Techniques: T1055, T1055.001, T1548, T1548.002
+           DataModel:  thread/remote_create/src_pid, thread/remote_create/start_function
+           PSEUDOCODE:
+             remote_thread = search Thread:RemoteCreate
+             remote_thread = filter (start_function == "LoadLibraryA" or start_function == "LoadLibraryW")
+             remote_thread = filter (src_image_path != "C:\Path\To\TrustedProgram.exe")
+             
+             output remote_thread
+
+[SYSMON+PS] CAR-2014-02-001 | Service Binary Modifications
+           Techniques: T1543, T1543.003, T1574, T1574.010, T1569, T1569.002
+           DataModel:  file/create/file_path, file/create/image_path, process/create/image_path, process/create/parent_exe
+           PSEUDOCODE:
+             legitimate_installers = ["C:\windows\system32\msiexec.exe", "C:\windows\syswow64\msiexec.exe", ...]
+             
+             file_change = search File:Create,Modify
+             process = search Process:Create
+             service_process = filter processes where (parent_exe == "services.exe")
+             modified_service = join (search, filter) where (
+              file_change.time < service_process.time and
+              file_change.file_path == service_process.image_path
+             )
+             
+             modified_service = filter modified_service where (modified_service.file_change.image_path not in legitimate_installers)
+             output modified_service
+
+[SYSMON+PS] CAR-2014-05-002 | Services launching Cmd
+           Techniques: T1543, T1543.003
+           DataModel:  process/create/exe, process/create/parent_exe
+           PSEUDOCODE:
+             process = search Process:Create
+             cmd = filter process where (exe == "cmd.exe" and parent_exe == "services.exe")
+             output cmd
+
+[SYSMON+PS] CAR-2014-07-001 | Service Search Path Interception
+           Techniques: T1574, T1574.009
+           DataModel:  process/create/command_line, process/create/image_path, process/create/parent_exe
+           PSEUDOCODE:
+             process = search Process:Create
+             services = filter processes where (parent_exe == "services.exe")
+             unquoted_services = filter services where (command_line != "\"*" and command_line == "* *")
+             intercepted_service = filter unquoted_service where (image_path != "* *" and exe not in command_line)
+             output intercepted_service
+
+[SYSMON+PS] CAR-2014-11-003 | Debuggers for Accessibility Applications
+           Techniques: T1546, T1546.008
+           DataModel:  process/create/command_line, process/create/exe
+           PSEUDOCODE:
+             process = search Process:Create
+             debuggers = filter process where (command_line match "$.* .*(sethc{{pipe}}utilman{{pipe}}osk{{pipe}}narrator{{pipe}}magnify)\.exe")
+             output debuggers
+
+[SYSMON+PS] CAR-2014-11-008 | Command Launched from WinLogon
+           Techniques: T1546, T1546.008
+           DataModel:  process/create/exe, process/create/parent_exe
+           PSEUDOCODE:
+             processes = search Process:Create
+             winlogon_cmd = filter processes where (parent_exe == "winlogon.exe" and exe == "cmd.exe")
+             output winlogon_cmd
+
+[OTHER]    CAR-2020-05-003 | Rare LolBAS Command Lines
+           Techniques: T1012, T1112, T1547, T1547.001, T1574, T1574.011
+           DataModel:  
+           PSEUDOCODE:
+             processes = search Process:Create
+             lolbas_processes = filter processes where (exe = "At.exe" OR exe = "Atbroker.exe" OR exe = "Bash.exe" OR exe = "Bitsadmin.exe" OR exe = "Certutil.exe" OR exe = "Cmd.exe" OR exe = "Cmdkey.exe" OR exe = "Cmstp.exe" OR exe = "Control.exe" OR exe = "Csc.exe" OR exe = "Cscript.exe" OR exe = "Dfsvc.exe" OR exe = "Diskshadow.exe" OR exe = "Dnscmd.exe" OR exe = "Esentutl.exe" OR exe = "Eventvwr.exe" OR exe = "Expand.exe" OR exe = "Extexport.exe" OR exe = "Extrac32.exe" OR exe = "Findstr.exe" OR exe = "Forfiles.exe" OR exe = "Ftp.exe" OR exe = "Gpscript.exe" OR exe = "Hh.exe" OR exe = "Ie4uinit.exe" OR exe = "Ieexec.exe" OR exe = "Infdefaultinstall.exe" OR exe = "Installutil.exe" OR exe = "Jsc.exe" OR exe = "Makecab.exe" OR exe = "Mavinject.exe" OR exe = "Microsoft.Workflow.r.exe" OR exe = "Mmc.exe" OR exe = "Msbuild.exe" OR exe = "Msconfig.exe" OR exe = "Msdt.exe" OR exe = "Mshta.exe" OR exe = "Msiexec.exe" OR exe = "Odbcconf.exe" OR exe = "Pcalua.exe" OR exe = "Pcwrun.exe" OR exe = "Presentationhost.exe" OR exe = "Print.exe" OR exe = "Reg.exe" OR exe = "Regasm.exe" OR exe = "Regedit.exe" OR exe = "Register-cimprovider.exe" OR exe = "Regsvcs.exe" OR exe = "Regsvr32.exe" OR exe = "Replace.exe" OR exe = "Rpcping.exe" OR exe = "Rundll32.exe" OR exe = "Runonce.exe" OR exe = "Runscripthelper.exe" OR exe = "Sc.exe" OR exe = "Schtasks.exe" OR exe = "Scriptrunner.exe" OR exe = "SyncAppvPublishingServer.exe" OR exe = "Tttracer.exe" OR exe = "Verclsid.exe" OR exe = "Wab.exe" OR exe = "Wmic.exe" OR exe = "Wscript.exe" OR exe = "Wsreset.exe" OR exe = "Xwizard.exe" OR exe = "Advpack.dll OR exe = "Comsvcs.dll OR exe = "Ieadvpack.dll OR exe = "Ieaframe.dll OR exe = "Mshtml.dll OR exe = "Pcwutl.dll OR exe = "Setupapi.dll OR exe = "Shdocvw.dll OR exe = "Shell32.dll OR exe = "Syssetup.dll OR exe = "Url.dll OR exe = "Zipfldr.dll OR exe = "Appvlp.exe" OR exe = "Bginfo.exe" OR exe = "Cdb.exe" OR exe = "csi.exe" OR exe = "Devtoolslauncher.exe" OR exe = "dnx.exe" OR exe = "Dxcap.exe" OR exe = "Excel.exe" OR exe = "Mftrace.exe" OR exe = "Msdeploy.exe" OR exe = "msxsl.exe" OR exe = "Powerpnt.exe" OR exe = "rcsi.exe" OR exe = "Sqler.exe" OR exe = "Sqlps.exe" OR exe = "SQLToolsPS.exe" OR exe = "Squirrel.exe" OR exe = "te.exe" OR exe = "Tracker.exe" OR exe = "Update.exe" OR exe = "vsjitdebugger.exe" OR exe = "Winword.exe" OR exe = "Wsl.exe" OR exe = "CL_Mutexverifiers.ps1 OR exe = "CL_Invocation.ps1 OR exe = "Manage-bde.wsf OR exe = "Pubprn.vbs OR exe = "Slmgr.vbs OR exe = "Syncappvpublishingserver.vbs OR exe = "winrm.vbs OR exe = "Pester.bat)
+             process_count = count(lolbas_processes) by process
+             process_count_avg = average(process_count)
+             process_count_stdev = standard_deviation(process_count)
+             lower_bound = process_count_avg - stdev * 1.5
+             outliers = filter lolbas_processes where (process_count < lower_bound)
+             return outliers
+
+[SYSMON+PS] CAR-2020-09-001 | Scheduled Task - FileAccess
+           Techniques: T1053, T1053.005
+           DataModel:  file/create/file_path, file/create/image_path
+           PSEUDOCODE:
+             files = search File:Create
+             task_files = filter files where (
+               (file_path = "C:\Windows\System32\Tasks\*" or file_path = "C:\Windows\Tasks\*")  and
+               image_path != "C:\WINDOWS\system32\svchost.exe")
+             output task_files
+
+[SYSMON+PS] CAR-2020-09-002 | Component Object Model Hijacking
+           Techniques: T1546, T1546.015
+           DataModel:  registry/add/key, registry/remove/key, registry/edit/key
+           PSEUDOCODE:
+             registry_keys = search (Registry:Create AND Registry:Remove AND Registry:Edit)
+             clsid_keys = filter registry_keys where (
+               key = "*\Software\Classes\CLSID\*")
+             output clsid_keys
+
+[SYSMON+PS] CAR-2020-09-005 | AppInit DLLs
+           Techniques: T1546, T1546.010
+           DataModel:  registry/add/key, registry/remove/key, registry/edit/key
+           PSEUDOCODE:
+             registry_keys = search (Registry:Create AND Registry:Remove AND Registry:Edit)
+             appinit_keys = filter registry_keys where (
+               key = "*\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows\Appinit_Dlls\*" OR
+               key = "*\SOFTWARE\\Wow6432Node\Microsoft\Windows NT\CurrentVersion\Windows\Appinit_Dlls\*""
+               )
+             output clsid_keys
+
+[SYSMON+PS] CAR-2020-11-003 | DLL Injection with Mavinject
+           Techniques: T1055, T1055.001
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             mavinject_processes = filter processes where (
+               exe = "C:\\Windows\\SysWOW64\\mavinject.exe" OR Image="C:\\Windows\\System32\\mavinject.exe" OR command_line = "*/INJECTRUNNING*"
+             output mavinject_processes
+
+[SYSMON+PS] CAR-2020-11-011 | Registry Edit from Screensaver
+           Techniques: T1546, T1546.002
+           DataModel:  registry/edit/key, registry/add/key
+           PSEUDOCODE:
+             reg_events = search Registry:add or Registry:edit
+             scr_reg_events = filter processes where (
+               key="*\\Software\\Policies\\Microsoft\\Windows\\Control Panel\\Desktop\\SCRNSAVE.EXE" AND
+             output scr_reg_events
+
+[SYSMON]   CAR-2021-01-004 | Unusual Child Process for Spoolsv.Exe or Connhost.Exe
+           Techniques: T1068
+           DataModel:  process/create/command_line
+
+[SYSMON+PS] CAR-2021-01-008 | Disable UAC
+           Techniques: T1548, T1548.002
+           DataModel:  process/create/image_path, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             cmd_processes = filter processes where (
+                             (parent_image = "C:\\Windows\\System32\\cmd.exe") AND (command_line = "reg.exe%HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System%REG_DWORD /d 0%")
+                             )
+
+[SYSMON+PS] CAR-2021-02-002 | Get System Elevation
+           Techniques: T1548
+           DataModel:  process/create/exe, process/create/parent_exe, process/create/command_line, service/create/command_line
+           PSEUDOCODE:
+             processes = search Process
+             suspicious_processes = filter processes where (
+               (parent_image_path == C:\Windows\System32\services.exe" AND
+                image_path == "C:\Windows\System32\cmd.exe" AND
+                command_line == "*echo*" AND
+                command_line == "*\pipe\*") OR
+               (image_path == "C:\Windows\System32\rundll32.exe" AND
+                command_line == "*,a /p:*"))
+             output suspicious_processes
+           PSEUDOCODE:
+             processes = search Process
+             suspicious_processes = filter processes where (
+               (image_path == "C:\Windows\System32\cmd.exe" OR
+                command_line == "*%COMSPEC%*") AND
+                command_line == "*echo*" AND
+                command_line == "*\pipe\*"))
+             output suspicious_processes
+
+[SYSMON+PS] CAR-2021-11-001 | Registry Edit with Creation of SafeDllSearchMode Key Set to 0
+           Techniques: T1574, T1574.001, T1112
+           DataModel:  process/create/command_line, registry/add/key
+           PSEUDOCODE:
+             processes = search Process:create
+             safe_dll_search_processes = filter processes where command_line CONTAINS("*SafeDllSearchMode*") AND ((command_line CONTAINS("*reg*") AND command_line CONTAINS("*add*") AND command_line CONTAINS("*/d*")) OR (command_line CONTAINS("*Set-ItemProperty*") AND command_line CONTAINS(*-value*)) OR ((command_line CONTAINS("*00000000*") AND command_line CONTAINS(*0*)))
+             reg_keys = search Registry:value_edit
+             safe_dll_reg_keys = filter reg_keys where value="SafeDllSearchMode" AND value_data="0"
+             output safe_dll_search_processes, safe_dll_reg_keys
+
+[SYSMON+PS] CAR-2021-11-002 | Registry Edit with Modification of Userinit, Shell or Notify
+           Techniques: T1547, T1547.004, T1112
+           DataModel:  process/create/command_line, registry/add/key
+           PSEUDOCODE:
+             processes = search Process:create
+             logon_reg_processes = filter processes where command_line CONTAINS("*\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon*") AND (command_line CONTAINS("*Userinit*") OR command_line CONTAINS("*Shell*") OR command_line CONTAINS("*Notify*")) AND (((command_line CONTAINS("*reg*") OR command_line CONTAINS("*add*") OR command_line CONTAINS("*/d*")) OR (command_line CONTAINS("*Set-ItemProperty*") OR command_line CONTAINS("*New-ItemProperty*") OR command_line CONTAINS("*-value*"))))
+             reg_keys = search Registry:value_edit
+             logon_reg_keys = filter reg_keys where (value="Userinit" OR value="Shell" OR value="Notify")
+             output logon_reg_processes, logon_reg_keys
+
+[SYSMON+PS] CAR-2021-12-001 | Scheduled Task Creation or Modification Containing Suspicious Scripts, Extensions or User Writable Paths
+           Techniques: T1053, T1053.005
+           DataModel:  process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:create
+             susp_tasks_processes = filter processes where command_line CONTAINS("*SCHTASKS*") AND (command_line CONTAINS("*/CREATE*") OR command_line CONTAINS("*/CHANGE*")) AND (command_line CONTAINS("*.cmd*") OR command_line CONTAINS("*.ps1*") OR command_line CONTAINS("*.vbs*") OR command_line CONTAINS("*.py*") OR command_line CONTAINS("*.js*") OR command_line CONTAINS("*.exe*") OR command_line CONTAINS("*.bat*") OR (command_line CONTAINS("*javascript*") OR command_line CONTAINS("*powershell*") OR command_line CONTAINS("*wmic*") OR command_line CONTAINS("*rundll32*") OR command_line CONTAINS("*cmd*") OR command_line CONTAINS("*cscript*") OR command_line CONTAINS("*wscript*") OR command_line CONTAINS("*regsvr32*") OR command_line CONTAINS("*mshta*") OR command_line CONTAINS("*bitsadmin*") OR command_line CONTAINS("*certutil*") OR command_line CONTAINS("*msiexec*") OR command_line CONTAINS("*javaw*") OR (command_line CONTAINS("*%APPDATA%*") OR command_line CONTAINS("*\\AppData\\Roaming*") OR command_line CONTAINS("*%PUBLIC%*") OR command_line CONTAINS("*C:\\Users\\Public*") OR command_line CONTAINS("*%ProgramData%*") OR command_line CONTAINS("*C:\\ProgramData*") OR command_line CONTAINS("*%TEMP%*") OR command_line CONTAINS("*\\AppData\\Local\\Temp*") OR command_line CONTAINS("*\\Windows\\PLA\\System*") OR command_line CONTAINS("*\\tasks*") OR command_line CONTAINS("*\\Registration\\CRMLog*") OR command_line CONTAINS("*\\FxsTmp*") OR command_line CONTAINS("*\\spool\\drivers\\color*") OR command_line CONTAINS("*\\tracing*"))))
+             tasks = search Task:create
+             susp_tasks = filter tasks where (task_content CONTAINS("*.cmd*") OR task_content CONTAINS("*.ps1*") OR task_content CONTAINS("*.vbs*") OR task_content CONTAINS("*.py*") OR task_content CONTAINS("*.js*") OR task_content CONTAINS("*.exe*") OR task_content CONTAINS("*.bat*") OR (task_content CONTAINS("*javascript*") OR task_content CONTAINS("*powershell*") OR task_content CONTAINS("*wmic*") OR task_content CONTAINS("*rundll32*") OR task_content CONTAINS("*cmd*") OR task_content CONTAINS("*cscript*") OR task_content CONTAINS("*wscript*") OR task_content CONTAINS("*regsvr32*") OR task_content CONTAINS("*mshta*") OR task_content CONTAINS("*bitsadmin*") OR task_content CONTAINS("*certutil*") OR task_content CONTAINS("*msiexec*") OR task_content CONTAINS("*javaw*") OR (task_content CONTAINS("*%APPDATA%*") OR task_content CONTAINS("*\\AppData\\Roaming*") OR task_content CONTAINS("*%PUBLIC%*") OR task_content CONTAINS("*C:\\Users\\Public*") OR task_content CONTAINS("*%ProgramData%*") OR task_content CONTAINS("*C:\\ProgramData*") OR task_content CONTAINS("*%TEMP%*") OR task_content CONTAINS("*\\AppData\\Local\\Temp*") OR task_content CONTAINS("*\\Windows\\PLA\\System*") OR task_content CONTAINS("*\\tasks*") OR task_content CONTAINS("*\\Registration\\CRMLog*") OR task_content CONTAINS("*\\FxsTmp*") OR task_content CONTAINS("*\\spool\\drivers\\color*") OR task_content CONTAINS("*\\tracing*"))))
+             output susp_tasks_processes, susp_tasks
+
+[SYSMON+PS] CAR-2021-12-002 | Modification of Default Startup Folder in the Registry Key 'Common Startup'
+           Techniques: T1547, T1547.001, T1112
+           DataModel:  process/create/command_line, registry/add/key
+           PSEUDOCODE:
+             processes = search Process:create
+             logon_reg_processes = filter processes where (command_line CONTAINS("*reg*") AND command_line CONTAINS("*add*") AND command_line CONTAINS("*/d*") OR (command_line CONTAINS("*Set-ItemProperty*") AND command_line CONTAINS("*-value*")) AND command_line CONTAINS("*Common Startup*"))
+             reg_keys = search Registry:value_edit
+             logon_reg_keys = filter reg_keys where value="Common Startup"
+             output logon_reg_processes, logon_reg_keys
+
+############################################################
+TACTIC TA0005: Defense Evasion  [40 total, 31 Sysmon+pseudocode]
+############################################################
+
+[SYSMON+PS] CAR-2013-03-001 | Reg.exe called from Command Shell
+           Techniques: T1012, T1112, T1547, T1547.001, T1574, T1574.011
+           DataModel:  process/create/command_line, process/create/hostname, process/create/exe, process/create/parent_exe, process/create/pid ...
+           PSEUDOCODE:
+             processes = search Process:Create
+             reg = filter processes where (exe == "reg.exe" and parent_exe == "cmd.exe")
+             cmd = filter processes where (exe == "cmd.exe" and parent_exe != "explorer.exe"")
+             reg_and_cmd = join (reg, cmd) where (reg.ppid == cmd.pid and reg.hostname == cmd.hostname)
+             output reg_and_cmd
+
+[SYSMON+PS] CAR-2013-04-002 | Quick execution of a series of suspicious commands
+           Techniques: T1087, T1087.001, T1087.002, T1003, T1003.002, T1069, T1069.001, T1069.002 ...
+           DataModel:  process/create/hostname, process/create/ppid, process/create/exe
+           PSEUDOCODE:
+             processes = search Process:Create
+             reg_processes = filter processes where (exe == "arp.exe" or exe == "at.exe" or exe == "attrib.exe"
+              or exe == "cscript.exe" or exe == "dsquery.exe" or exe == "hostname.exe"
+              or exe == "ipconfig.exe" or exe == "mimikatz.exe" or exe == "nbstat.exe"
+              or exe == "net.exe" or exe == "netsh.exe" or exe == "nslookup.exe"
+              or exe == "ping.exe" or exe == "quser.exe" or exe == "qwinsta.exe"
+              or exe == "reg.exe" or exe == "runas.exe" or exe == "sc.exe"
+              or exe == "schtasks.exe" or exe == "ssh.exe" or exe == "systeminfo.exe"
+              or exe == "taskkill.exe" or exe == "telnet.exe" or exe == "tracert.exe"
+              or exe == "wscript.exe" or exe == "xcopy.exe")
+             reg_grouped = group reg by hostname, ppid where(max time between two events is 30 minutes)
+             output reg_grouped
+
+[SYSMON+PS] CAR-2013-05-002 | Suspicious Run Locations
+           Techniques: T1036
+           DataModel:  process/create/image_path
+           PSEUDOCODE:
+             processes = search Process:Create
+             suspicious_locations = filter process where (
+              image_path == "*:\RECYCLER\*" or
+              image_path == "*:\SystemVolumeInformation\*" or
+              image_path == "%windir%\Tasks\*" or
+              image_path == "%systemroot%\debug\*"
+             )
+             output suspicious_locations
+
+[OTHER]    CAR-2013-05-003 | SMB Write Request
+           Techniques: T1570, T1021, T1021.002, T1078, T1078.002, T1078.003
+           DataModel:  flow/message/proto_info, flow/message/dest_port
+           PSEUDOCODE:
+             flow = search Flow:Message
+             smb_write = filter flow where (dest_port == "445" and protocol == "smb.write")
+             smb_write.file_name = smb_write.proto_info.file_name
+             output smb_write
+
+[SYSMON+PS] CAR-2013-05-005 | SMB Copy and Execution
+           Techniques: T1021, T1021.002, T1078, T1078.002, T1078.003, T1570
+           DataModel:  process/create/image_path, process/create/proto_info, process/create/hostname
+           PSEUDOCODE:
+             process = search Process:Create
+             smb_write = run Analytic:CAR-2013-05-003
+             remote_start = join (smb_write, process) where (
+              smb_write.hostname == process.hostname and
+              smb_write.file_path == process.image_path
+              (smb_write.time < process.time)
+             )
+             output remote_start
+
+[SYSMON]   CAR-2013-05-009 | Running executables with same hash and different names
+           Techniques: T1036, T1036.003
+           DataModel:  process/create/exe, process/create/md5_hash
+
+[OTHER]    CAR-2013-10-001 | User Login Activity Monitoring
+           Techniques: T1021, T1021.001, T1078, T1078.002, T1078.003
+           DataModel:  
+           PSEUDOCODE:
+             logon_events = search User_Session:Login
+             filtered_logons = filter logon_events where (
+               user NOT IN TOP30(user))
+             output filtered_logons
+
+[SYSMON+PS] CAR-2013-10-002 | DLL Injection via Load Library
+           Techniques: T1055, T1055.001, T1548, T1548.002
+           DataModel:  thread/remote_create/src_pid, thread/remote_create/start_function
+           PSEUDOCODE:
+             remote_thread = search Thread:RemoteCreate
+             remote_thread = filter (start_function == "LoadLibraryA" or start_function == "LoadLibraryW")
+             remote_thread = filter (src_image_path != "C:\Path\To\TrustedProgram.exe")
+             
+             output remote_thread
+
+[SYSMON+PS] CAR-2014-03-006 | RunDLL32.exe monitoring
+           Techniques: T1218, T1218.011
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             process = search Process:Create
+             rundll32 = filter process where (exe == "rundll32.exe")
+             output rundll32
+
+[SYSMON+PS] CAR-2014-04-003 | Powershell Execution
+           Techniques: T1059, T1059.001
+           DataModel:  process/create/exe, process/create/parent_exe
+           PSEUDOCODE:
+             process = search Process:Create
+             powershell = filter process where (exe == "powershell.exe" AND parent_exe != "explorer.exe" )
+             output powershell
+
+[OTHER]    CAR-2014-11-005 | Remote Registry
+           Techniques: T1112
+           DataModel:  flow/message/dest_port, flow/message/proto_info
+           PSEUDOCODE:
+             flows = search Flow:Message
+             winreg = filter flows where (dest_port == 445 and proto_info.pipe == "WINREG")
+             winreg_modify = filter flows where (proto_info.function == "Create*" or proto_info.function == "SetValue*")
+             
+             output winreg_modify
+
+[SYSMON+PS] CAR-2016-04-002 | User Activity from Clearing Event Logs
+           Techniques: T1070, T1070.001
+           DataModel:  process/create/command_line
+           PSEUDOCODE:
+             ([log_name] == "Security" and [event_code] in [1100, 1102, 1104]) or
+             ([log_name] == "System" and [event_code] == 104)
+
+[OTHER]    CAR-2016-04-003 | User Activity from Stopping Windows Defensive Services
+           Techniques: T1562, T1562.001
+           DataModel:  
+           PSEUDOCODE:
+             log_name == "System" AND
+             event_code == "7036"
+             param1 in ["Windows Defender", "Windows Firewall"] AND
+             param2 == "stopped"
+
+[SYSMON+PS] CAR-2019-04-001 | UAC Bypass
+           Techniques: T1548, T1548.002
+           DataModel:  process/create/image_path, process/create/parent_image_path, process/create/integrity_level, process/create/user, process/create/parent_command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             possible_uac_bypass = filter processes where (
+               integrity_level == "High" and
+               (parent_image_path == "c:\windows\system32\fodhelper.exe") or
+               (command_line == "*.exe\"*cleanmgr.exe /autoclean*") or
+               (image_path == "c:\program files\windows media player\osk.exe") or
+               (parent_image_path == "c:\windows\system32\slui.exe") or
+               (parent_command_line == '"c:\windows\system32\dism.exe"*""*.xml"' and image_path != "c:\users\*\appdata\local\temp\*\dismhost.exe") or
+               (command_line == '"c:\windows\system32\wusa.exe"*/quiet*' and user != "NOT_TRANSLATED" and current_working_directory == "c:\windows\system32\" and parent_image_path != "c:\windows\explorer.exe") or
+               (parent_image_path == "c:\windows\*dccw.exe" and image_path != "c:\windows\system32\cttune.exe")
+             )
+             output possible_uac_bypass
+
+[SYSMON+PS] CAR-2019-04-002 | Generic Regsvr32
+           Techniques: T1218, T1218.010
+           DataModel:  process/create/exe, process/create/parent_exe, process/create/command_line, process/create/image, process/create/parent_image
+           PSEUDOCODE:
+             processes = search Process:Create
+             regsvr_processes = filter processes where (
+               parent_image_path == "*regsvr32.exe" and image_path != "*regsvr32.exe*"
+              )
+             output regsvr_processes
+           PSEUDOCODE:
+             processes = search Process:Create
+             regsvr_processes = filter processes where (
+               (parent_image_path == "C:\Windows\System32\regsvr32.exe" or parent_image_path == "C:\Windows\SysWOW64\regsvr32.exe") and
+               image_path != "C:\Windows\System32\regsvr32.exe" and
+               image_path != "C:\Windows\SysWOW64\regsvr32.exe" and
+               image_path != "C:\Windows\SysWOW64\WerFault.exe" and
+               image_path != "C:\Windows\System32\WerFault.exe" and
+               image_path != "C:\Windows\System32\wevtutil.exe"
+              )
+             output regsvr_processes
+           PSEUDOCODE:
+             modules = search Module:Load
+             unsigned_modules = filter modules where (
+               (image_path == "C:\Windows\System32\regsvr32.exe" or image_path == "C:\Windows\SysWOW64\regsvr32.exe") and
+               signer == null and
+               module_path != "C:\Program Files*" and
+               module_path != "C:\Windows\*"
+             )
+             output unsigned_modules
+
+[SYSMON]   CAR-2019-04-003 | Squiblydoo
+           Techniques: T1218, T1218.010
+           DataModel:  process/create/exe, process/create/command_line
+
+[OTHER]    CAR-2019-07-001 | Access Permission Modification
+           Techniques: T1222, T1222.001, T1222.002
+           DataModel:  
+           PSEUDOCODE:
+             log_name == "Security" AND
+             event_code == "4670" AND
+             object_type == "File" AND
+             subject_security_id != "NT AUTHORITY\SYSTEM"
+           PSEUDOCODE:
+             processes = search Process:Create
+             chmod_processes = filter processes where command_line == "chmod *"
+             output chmod_processes
+
+[OTHER]    CAR-2020-05-003 | Rare LolBAS Command Lines
+           Techniques: T1012, T1112, T1547, T1547.001, T1574, T1574.011
+           DataModel:  
+           PSEUDOCODE:
+             processes = search Process:Create
+             lolbas_processes = filter processes where (exe = "At.exe" OR exe = "Atbroker.exe" OR exe = "Bash.exe" OR exe = "Bitsadmin.exe" OR exe = "Certutil.exe" OR exe = "Cmd.exe" OR exe = "Cmdkey.exe" OR exe = "Cmstp.exe" OR exe = "Control.exe" OR exe = "Csc.exe" OR exe = "Cscript.exe" OR exe = "Dfsvc.exe" OR exe = "Diskshadow.exe" OR exe = "Dnscmd.exe" OR exe = "Esentutl.exe" OR exe = "Eventvwr.exe" OR exe = "Expand.exe" OR exe = "Extexport.exe" OR exe = "Extrac32.exe" OR exe = "Findstr.exe" OR exe = "Forfiles.exe" OR exe = "Ftp.exe" OR exe = "Gpscript.exe" OR exe = "Hh.exe" OR exe = "Ie4uinit.exe" OR exe = "Ieexec.exe" OR exe = "Infdefaultinstall.exe" OR exe = "Installutil.exe" OR exe = "Jsc.exe" OR exe = "Makecab.exe" OR exe = "Mavinject.exe" OR exe = "Microsoft.Workflow.r.exe" OR exe = "Mmc.exe" OR exe = "Msbuild.exe" OR exe = "Msconfig.exe" OR exe = "Msdt.exe" OR exe = "Mshta.exe" OR exe = "Msiexec.exe" OR exe = "Odbcconf.exe" OR exe = "Pcalua.exe" OR exe = "Pcwrun.exe" OR exe = "Presentationhost.exe" OR exe = "Print.exe" OR exe = "Reg.exe" OR exe = "Regasm.exe" OR exe = "Regedit.exe" OR exe = "Register-cimprovider.exe" OR exe = "Regsvcs.exe" OR exe = "Regsvr32.exe" OR exe = "Replace.exe" OR exe = "Rpcping.exe" OR exe = "Rundll32.exe" OR exe = "Runonce.exe" OR exe = "Runscripthelper.exe" OR exe = "Sc.exe" OR exe = "Schtasks.exe" OR exe = "Scriptrunner.exe" OR exe = "SyncAppvPublishingServer.exe" OR exe = "Tttracer.exe" OR exe = "Verclsid.exe" OR exe = "Wab.exe" OR exe = "Wmic.exe" OR exe = "Wscript.exe" OR exe = "Wsreset.exe" OR exe = "Xwizard.exe" OR exe = "Advpack.dll OR exe = "Comsvcs.dll OR exe = "Ieadvpack.dll OR exe = "Ieaframe.dll OR exe = "Mshtml.dll OR exe = "Pcwutl.dll OR exe = "Setupapi.dll OR exe = "Shdocvw.dll OR exe = "Shell32.dll OR exe = "Syssetup.dll OR exe = "Url.dll OR exe = "Zipfldr.dll OR exe = "Appvlp.exe" OR exe = "Bginfo.exe" OR exe = "Cdb.exe" OR exe = "csi.exe" OR exe = "Devtoolslauncher.exe" OR exe = "dnx.exe" OR exe = "Dxcap.exe" OR exe = "Excel.exe" OR exe = "Mftrace.exe" OR exe = "Msdeploy.exe" OR exe = "msxsl.exe" OR exe = "Powerpnt.exe" OR exe = "rcsi.exe" OR exe = "Sqler.exe" OR exe = "Sqlps.exe" OR exe = "SQLToolsPS.exe" OR exe = "Squirrel.exe" OR exe = "te.exe" OR exe = "Tracker.exe" OR exe = "Update.exe" OR exe = "vsjitdebugger.exe" OR exe = "Winword.exe" OR exe = "Wsl.exe" OR exe = "CL_Mutexverifiers.ps1 OR exe = "CL_Invocation.ps1 OR exe = "Manage-bde.wsf OR exe = "Pubprn.vbs OR exe = "Slmgr.vbs OR exe = "Syncappvpublishingserver.vbs OR exe = "winrm.vbs OR exe = "Pester.bat)
+             process_count = count(lolbas_processes) by process
+             process_count_avg = average(process_count)
+             process_count_stdev = standard_deviation(process_count)
+             lower_bound = process_count_avg - stdev * 1.5
+             outliers = filter lolbas_processes where (process_count < lower_bound)
+             return outliers
+
+[SYSMON+PS] CAR-2020-08-001 | NTFS Alternate Data Stream Execution - System Utilities
+           Techniques: T1564, T1564.004
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             ads_processes = filter processes where (
+             exe == "powershell.exe OR rundll32.exe OR wmic.exe OR wscript.exe OR cscript.exe" and command_line.matches("__some_regex__")
+             )
+             output ads_processes
+
+[SYSMON+PS] CAR-2020-08-002 | NTFS Alternate Data Stream Execution - LOLBAS
+           Techniques: T1564, T1564.004
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             ads_processes = filter processes where (
+             exe == "control.exe OR appvlp.exe OR cmd.exe OR ftp.exe OR bash.exe OR mavinject.exe OR bitsadmin.exe" and command_line.matches("__some_regex__")
+             )
+             output ads_processes
+
+[SYSMON+PS] CAR-2020-09-003 | Indicator Blocking - Driver Unloaded
+           Techniques: T1562, T1562.006
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             fltmc_processes = filter processes where (
+               exe = "fltmc.exe" AND command_line = "*unload*")
+             output fltmc_processes
+
+[SYSMON+PS] CAR-2020-11-003 | DLL Injection with Mavinject
+           Techniques: T1055, T1055.001
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             mavinject_processes = filter processes where (
+               exe = "C:\\Windows\\SysWOW64\\mavinject.exe" OR Image="C:\\Windows\\System32\\mavinject.exe" OR command_line = "*/INJECTRUNNING*"
+             output mavinject_processes
+
+[SYSMON+PS] CAR-2020-11-004 | Processes Started From Irregular Parent
+           Techniques: T1055, T1055.012
+           DataModel:  process/create/exe, process/create/parent_exe
+           PSEUDOCODE:
+             processes = search Process:Create
+             mismatch_processes = filter processes where ( parent_exe exists AND
+               (exe="smss.exe" AND (parent_exe!="smss.exe" AND parent_exe!="System") OR
+               (exe="csrss.exe" AND (parent_exe!="smss.exe" AND parent_exe!="svchost.exe")) OR
+               (exe="wininit.exe" AND parent_exe!="smss.exe") OR
+               (exe="winlogon.exe" AND parent_exe!="smss.exe") OR
+               (exe="lsass.exe" AND (parent_exe!="wininit.exe" AND parent_exe!="winlogon.exe")) OR
+               (exe="LogonUI.exe" AND (parent_exe!="winlogon.exe" AND parent_exe!="wininit.exe")) OR
+               (exe="services.exe" AND parent_exe!="wininit.exe") OR
+               (exe="spoolsv.exe" AND parent_exe!="services.exe") OR
+               (exe="taskhost.exe" AND (parent_exe!="services.exe" AND parent_exe!="svchost.exe")) OR
+               (exe="taskhostw.exe" AND (parent_exe!="services.exe" AND parent_exe!="svchost.exe")) OR
+               (exe="userinit.exe" AND (parent_exe!="dwm.exe" AND parent_exe!="winlogon.exe"))
+             output mismatch_processes
+
+[SYSMON+PS] CAR-2020-11-005 | Clear Powershell Console Command History
+           Techniques: T1070, T1070.003
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             clear_commands = filter processes where (
+               command_line ="*rm (Get-PSReadlineOption).HistorySavePath*" OR command_line="*del (Get-PSReadlineOption).HistorySavePath*" OR command_line="*Set-PSReadlineOption –HistorySaveStyle SaveNothing*" OR command_line="*Remove-Item (Get-PSReadlineOption).HistorySavePath*")  OR command_linee="del*Microsoft\Windows\Powershell\PSReadline\ConsoleHost_history.txt")
+             output clear_commands
+
+[SYSMON+PS] CAR-2020-11-007 | Network Share Connection Removal
+           Techniques: T1070, T1070.005
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             target_processes = filter processes where (
+               (exe="C:\\Windows\\System32\\net.exe" AND command_line="*delete*") OR
+               command_line="*Remove-SmbShare*" OR
+               comman_line="*Remove-FileShare*" )
+             output target_processes
+
+[SYSMON+PS] CAR-2020-11-008 | MSBuild and msxsl
+           Techniques: T1127, T1127.001
+           DataModel:  process/create/exe, process/create/image_path
+           PSEUDOCODE:
+             processes = search Process:Create
+             target_processes = filter processes where (
+               (exe="C:\Program Files (x86)\Microsoft Visual Studio\*\bin\MSBuild.exe" OR exe="C:\Windows\Microsoft.NET\Framework*\msbuild.exe" OR exe="C:\users\*\appdata\roaming\microsoft\msxsl.exe") AND
+               image_path!="*Microsoft Visual Studio*")
+             output target_processes
+
+[SYSMON+PS] CAR-2020-11-009 | Compiled HTML Access
+           Techniques: T1218, T1218.001
+           DataModel:  process/create/exe
+           PSEUDOCODE:
+             processes = search Process:Create
+             target_processes = filter processes where (exe="C:\Windows\syswow64\hh.exe" OR exe="C:\Windows\system32\hh.exe")
+             output target_processes
+
+[SYSMON+PS] CAR-2020-11-010 | CMSTP
+           Techniques: T1218, T1218.003
+           DataModel:  process/create/exe, process/create/src_ip
+           PSEUDOCODE:
+             processes = search Process:Create
+             target_processes = filter processes where (
+               exe="C:\Windows\System32\CMSTP.exe" AND
+               src_ip NOT IN [10.0.0.0/8,192.168.0.0/16, 172.16.0.0/12] )
+             output target_processes
+
+[SYSMON]   CAR-2021-01-003 | Clearing Windows Logs with Wevtutil
+           Techniques: T1070, T1070.001
+           DataModel:  process/create/command_line
+
+[SYSMON+PS] CAR-2021-01-007 | Detecting Tampering of Windows Defender Command Prompt
+           Techniques: T1562, T1562.001
+           DataModel:  process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             target_processes = filter processes where (
+                                (exe="C:\\Windows\\System32\\sc.exe") AND (command_line="sc *config*" OR command_line="sc *stop*" OR command_line="sc *query*")
+                                )
+             output target_processes
+
+[SYSMON+PS] CAR-2021-02-002 | Get System Elevation
+           Techniques: T1548
+           DataModel:  process/create/exe, process/create/parent_exe, process/create/command_line, service/create/command_line
+           PSEUDOCODE:
+             processes = search Process
+             suspicious_processes = filter processes where (
+               (parent_image_path == C:\Windows\System32\services.exe" AND
+                image_path == "C:\Windows\System32\cmd.exe" AND
+                command_line == "*echo*" AND
+                command_line == "*\pipe\*") OR
+               (image_path == "C:\Windows\System32\rundll32.exe" AND
+                command_line == "*,a /p:*"))
+             output suspicious_processes
+           PSEUDOCODE:
+             processes = search Process
+             suspicious_processes = filter processes where (
+               (image_path == "C:\Windows\System32\cmd.exe" OR
+                command_line == "*%COMSPEC%*") AND
+                command_line == "*echo*" AND
+                command_line == "*\pipe\*"))
+             output suspicious_processes
+
+[SYSMON+PS] CAR-2021-04-001 | Common Windows Process Masquerading
+           Techniques: T1036, T1036.005
+           DataModel:  process/create/exe, process/create/image_path, process/access/exe, process/access/image_path, process/terminate/exe ...
+           PSEUDOCODE:
+             processes = search Process:*
+             suspicious_processes = filter processes where (
+               (exe=svchost.exe AND (image_path!="C:\\Windows\\System32\\svchost.exe" OR process_path!="C:\\Windows\\SysWow64\\svchost.exe"))
+               OR (exe=smss.exe AND image_path!="C:\\Windows\\System32\\smss.exe")
+               OR (exe=wininit.exe AND image_path!="C:\\Windows\\System32\\wininit.exe")
+               OR (exe=taskhost.exe AND image_path!="C:\\Windows\\System32\\taskhost.exe")
+               OR (exe=lasass.exe AND image_path!="C:\\Windows\\System32\\lsass.exe")
+               OR (exe=winlogon.exe AND image_path!="C:\\Windows\\System32\\winlogon.exe")
+               OR (exe=csrss.exe AND image_path!="C:\\Windows\\System32\\csrss.exe")
+               OR (exe=services.exe AND image_path!="C:\\Windows\\System32\\services.exe")
+               OR (exe=lsm.exe AND image_path!="C:\\Windows\\System32\\lsm.exe")
+               OR (exe=explorer.exe AND image_path!="C:\\Windows\\explorer.exe")
+               )
+             output suspicious_processes
+
+[SYSMON+PS] CAR-2021-05-001 | Attempt To Add Certificate To Untrusted Store
+           Techniques: T1553, T1553.004
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             addstore_commands = filter processes where (
+               exe =”C:\Windows\System32\certutil.exe” AND command_line="*-addstore*” )
+             output addstore_commands
+
+[SYSMON+PS] CAR-2021-05-004 | BITS Job Persistence
+           Techniques: T1197
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             bitsadmin_commands = filter processes where (
+               exe ="C:\Windows\System32\bitsadmin.exe" AND command_line includes one of [*create*, *addfile*, *setnotifyflags*, *setnotifycmdline*, *setminretrydelay*, *setcustomheaders*,*resume*])
+             output bitsadmin_commands
+
+[SYSMON+PS] CAR-2021-05-005 | BITSAdmin Download File
+           Techniques: T1197, T1105
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             bitsadmin_commands = filter processes where (
+               exe ="C:\Windows\System32\bitsadmin.exe" AND command_line = *transfer*)
+             output bitsadmin_commands
+
+[SYSMON+PS] CAR-2021-05-009 | CertUtil With Decode Argument
+           Techniques: T1140
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             certutil_downloads = filter processes where (
+               exe =”C:\Windows\System32\certutil.exe” AND command_line = *decode* )
+             output certutil_downloads
+
+[SYSMON+PS] CAR-2021-11-001 | Registry Edit with Creation of SafeDllSearchMode Key Set to 0
+           Techniques: T1574, T1574.001, T1112
+           DataModel:  process/create/command_line, registry/add/key
+           PSEUDOCODE:
+             processes = search Process:create
+             safe_dll_search_processes = filter processes where command_line CONTAINS("*SafeDllSearchMode*") AND ((command_line CONTAINS("*reg*") AND command_line CONTAINS("*add*") AND command_line CONTAINS("*/d*")) OR (command_line CONTAINS("*Set-ItemProperty*") AND command_line CONTAINS(*-value*)) OR ((command_line CONTAINS("*00000000*") AND command_line CONTAINS(*0*)))
+             reg_keys = search Registry:value_edit
+             safe_dll_reg_keys = filter reg_keys where value="SafeDllSearchMode" AND value_data="0"
+             output safe_dll_search_processes, safe_dll_reg_keys
+
+[SYSMON+PS] CAR-2021-11-002 | Registry Edit with Modification of Userinit, Shell or Notify
+           Techniques: T1547, T1547.004, T1112
+           DataModel:  process/create/command_line, registry/add/key
+           PSEUDOCODE:
+             processes = search Process:create
+             logon_reg_processes = filter processes where command_line CONTAINS("*\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon*") AND (command_line CONTAINS("*Userinit*") OR command_line CONTAINS("*Shell*") OR command_line CONTAINS("*Notify*")) AND (((command_line CONTAINS("*reg*") OR command_line CONTAINS("*add*") OR command_line CONTAINS("*/d*")) OR (command_line CONTAINS("*Set-ItemProperty*") OR command_line CONTAINS("*New-ItemProperty*") OR command_line CONTAINS("*-value*"))))
+             reg_keys = search Registry:value_edit
+             logon_reg_keys = filter reg_keys where (value="Userinit" OR value="Shell" OR value="Notify")
+             output logon_reg_processes, logon_reg_keys
+
+[SYSMON+PS] CAR-2021-12-002 | Modification of Default Startup Folder in the Registry Key 'Common Startup'
+           Techniques: T1547, T1547.001, T1112
+           DataModel:  process/create/command_line, registry/add/key
+           PSEUDOCODE:
+             processes = search Process:create
+             logon_reg_processes = filter processes where (command_line CONTAINS("*reg*") AND command_line CONTAINS("*add*") AND command_line CONTAINS("*/d*") OR (command_line CONTAINS("*Set-ItemProperty*") AND command_line CONTAINS("*-value*")) AND command_line CONTAINS("*Common Startup*"))
+             reg_keys = search Registry:value_edit
+             logon_reg_keys = filter reg_keys where value="Common Startup"
+             output logon_reg_processes, logon_reg_keys
+
+[SYSMON+PS] CAR-2022-03-001 | Disable Windows Event Logging
+           Techniques: T1562, T1562.002
+           DataModel:  registry/value_edit/value, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:create
+             susp_processes = filter processes where ((command_line CONTAINS("*New-Item*") OR command_line CONTAINS("*reg add*")) OR command_line CONTAINS("*MiniNt*")) OR (command_line CONTAINS("*Stop-Service*")AND command_line CONTAINS("*EventLog*")) OR (command_line CONTAINS("*EventLog*") AND (command_line CONTAINS("*Set-Service*") OR command_line CONTAINS("*reg add*") OR command_line CONTAINS("*Set-ItemProperty*") OR command_line CONTAINS("*New-ItemProperty*") OR command_line CONTAINS("*sc config*"))) OR (command_line CONTAINS("*auditpol*") AND (command_line CONTAINS("*/set*") OR command_line CONTAINS("*/clear*") OR command_line CONTAINS("*/revove*"))) OR ((command_line CONTAINS("*wevtutil*") AND (command_line CONTAINS("*sl*") OR command_line CONTAINS("*set-log*"))))
+             reg_keys = search Registry:value_edit
+             event_log_reg_keys = filter reg_keys where Key="*EventLog*" AND (value="Start" OR value="File" OR value="MaxSize")
+             output susp_processes, event_log_reg_keys
+
+############################################################
+TACTIC TA0006: Credential Access  [12 total, 9 Sysmon+pseudocode]
+############################################################
+
+[SYSMON+PS] CAR-2013-04-002 | Quick execution of a series of suspicious commands
+           Techniques: T1087, T1087.001, T1087.002, T1003, T1003.002, T1069, T1069.001, T1069.002 ...
+           DataModel:  process/create/hostname, process/create/ppid, process/create/exe
+           PSEUDOCODE:
+             processes = search Process:Create
+             reg_processes = filter processes where (exe == "arp.exe" or exe == "at.exe" or exe == "attrib.exe"
+              or exe == "cscript.exe" or exe == "dsquery.exe" or exe == "hostname.exe"
+              or exe == "ipconfig.exe" or exe == "mimikatz.exe" or exe == "nbstat.exe"
+              or exe == "net.exe" or exe == "netsh.exe" or exe == "nslookup.exe"
+              or exe == "ping.exe" or exe == "quser.exe" or exe == "qwinsta.exe"
+              or exe == "reg.exe" or exe == "runas.exe" or exe == "sc.exe"
+              or exe == "schtasks.exe" or exe == "ssh.exe" or exe == "systeminfo.exe"
+              or exe == "taskkill.exe" or exe == "telnet.exe" or exe == "tracert.exe"
+              or exe == "wscript.exe" or exe == "xcopy.exe")
+             reg_grouped = group reg by hostname, ppid where(max time between two events is 30 minutes)
+             output reg_grouped
+
+[SYSMON+PS] CAR-2013-07-001 | Suspicious Arguments
+           Techniques: T1003, T1003.001, T1021, T1105
+           DataModel:  process/create/command_line, process/create/exe
+           PSEUDOCODE:
+             process = search Process:Create
+             port_fwd = filter process where (command_line match "-R .* -pw")
+             scp = filter process where (command_line match "-pw .* .* .*@.*"
+             mimikatz = filter process where (command_line match "sekurlsa")
+             rar = filter process where (command_line match " -hp ")
+             archive = filter process where (command_line match ".* a .*")
+             ip_addr = filter process where (command_line match \d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})
+             
+             output port_fwd, scp, mimikatz, rar, archive, ip_addr
+
+[OTHER]    CAR-2013-09-003 | SMB Session Setups
+           Techniques: T1187
+           DataModel:  flow/message/dest_port, flow/message/proto_info, flow/message/protocol
+           PSEUDOCODE:
+             flow = search Flow:Message
+             smb_setup = filter flow where (dest_port == 445 and protocol == smb.setup)
+             smb_setup.user = smb_write.proto_info.user_name
+             smb_setup.target_host = smb_write.proto_info.hostname
+             output smb_write
+
+[OTHER]    CAR-2019-04-004 | Credential Dumping via Mimikatz
+           Techniques: T1003, T1003.001
+           DataModel:  
+
+[SYSMON+PS] CAR-2019-07-002 | Lsass Process Dump via Procdump
+           Techniques: T1003, T1003.001
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             procdump_lsass = filter processes where (
+               exe = "procdump*.exe"  and
+               command_line = "*lsass*")
+             output procdump_lsass
+
+[SYSMON+PS] CAR-2019-08-001 | Credential Dumping via Windows Task Manager
+           Techniques: T1003, T1003.001
+           DataModel:  file/create/file_name, file/create/image_path
+           PSEUDOCODE:
+             files = search File:Create
+             lsass_dump = filter files where (
+               file_name = "lsass*.dmp"  and
+               image_path = "C:\Windows\*\taskmgr.exe")
+             output lsass_dump
+
+[SYSMON+PS] CAR-2019-08-002 | Active Directory Dumping via NTDSUtil
+           Techniques: T1003, T1003.003
+           DataModel:  file/create/file_name, file/create/image_path
+           PSEUDOCODE:
+             files = search File:Create
+             ntds_dump = filter files where (
+               file_name = "ntds.dit"  and
+               image_path = "*ntdsutil.exe")
+             output ntds_dump
+
+[OTHER]    CAR-2020-05-001 | MiniDump of LSASS
+           Techniques: T1003, T1003.003
+           DataModel:  
+
+[SYSMON+PS] CAR-2020-09-004 | Credentials in Files & Registry
+           Techniques: T1552, T1552.001, T1552.002
+           DataModel:  process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+               cred_processes = filter processes where (
+               command_line = "*reg* query HKLM /f password /t REG_SZ /s*" OR
+               command_line = "reg* query HKCU /f password /t REG_SZ /s" OR
+               command_line = "*Get-UnattendedInstallFile*" OR
+               command_line = "*Get-Webconfig*" OR
+               command_line = "*Get-ApplicationHost*" OR
+               command_line = "*Get-SiteListPassword*" OR
+               command_line = "*Get-CachedGPPPassword*" OR
+               command_line = "*Get-RegistryAutoLogon*")
+             output cred_processes
+
+[SYSMON+PS] CAR-2020-11-002 | Local Network Sniffing
+           Techniques: T1040
+           DataModel:  process/create/exe, process/create/parent_exe
+           PSEUDOCODE:
+             processes = search Process:Create
+             sniffer_processes = filter processes where (
+               exe = "tshark.exe" OR
+               exe = "windump.exe" OR
+               (exe = "logman.exe" AND parent_exe exists AND parent_exe!="C:\Program Files\Windows Event Reporting\Core\EventReporting.AgentService.exe") OR
+               exe = "tcpdump.exe" OR
+               exe = "wprui.exe" OR
+               exe = "wpr.exe" )
+             output sniffer_processes
+
+[SYSMON+PS] CAR-2021-05-008 | Certutil exe certificate extraction
+           Techniques: T1606, T1606.002
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             certutil_downloads = filter processes where (
+               exe =”C:\Windows\System32\certutil.exe” AND command_line = * -exportPFX * )
+             output certutil_downloads
+
+[SYSMON+PS] CAR-2021-05-011 | Create Remote Thread into LSASS
+           Techniques: T1003, T1003.001
+           DataModel:  thread/remote_create
+           PSEUDOCODE:
+             remote_threads = search Thread:remote_create
+             lsass_remote_create = filter remote_threads where "lsass" in raw event
+             output lsass_remote_create
+
+############################################################
+TACTIC TA0007: Discovery  [7 total, 5 Sysmon+pseudocode]
+############################################################
+
+[SYSMON+PS] CAR-2013-03-001 | Reg.exe called from Command Shell
+           Techniques: T1012, T1112, T1547, T1547.001, T1574, T1574.011
+           DataModel:  process/create/command_line, process/create/hostname, process/create/exe, process/create/parent_exe, process/create/pid ...
+           PSEUDOCODE:
+             processes = search Process:Create
+             reg = filter processes where (exe == "reg.exe" and parent_exe == "cmd.exe")
+             cmd = filter processes where (exe == "cmd.exe" and parent_exe != "explorer.exe"")
+             reg_and_cmd = join (reg, cmd) where (reg.ppid == cmd.pid and reg.hostname == cmd.hostname)
+             output reg_and_cmd
+
+[SYSMON+PS] CAR-2013-04-002 | Quick execution of a series of suspicious commands
+           Techniques: T1087, T1087.001, T1087.002, T1003, T1003.002, T1069, T1069.001, T1069.002 ...
+           DataModel:  process/create/hostname, process/create/ppid, process/create/exe
+           PSEUDOCODE:
+             processes = search Process:Create
+             reg_processes = filter processes where (exe == "arp.exe" or exe == "at.exe" or exe == "attrib.exe"
+              or exe == "cscript.exe" or exe == "dsquery.exe" or exe == "hostname.exe"
+              or exe == "ipconfig.exe" or exe == "mimikatz.exe" or exe == "nbstat.exe"
+              or exe == "net.exe" or exe == "netsh.exe" or exe == "nslookup.exe"
+              or exe == "ping.exe" or exe == "quser.exe" or exe == "qwinsta.exe"
+              or exe == "reg.exe" or exe == "runas.exe" or exe == "sc.exe"
+              or exe == "schtasks.exe" or exe == "ssh.exe" or exe == "systeminfo.exe"
+              or exe == "taskkill.exe" or exe == "telnet.exe" or exe == "tracert.exe"
+              or exe == "wscript.exe" or exe == "xcopy.exe")
+             reg_grouped = group reg by hostname, ppid where(max time between two events is 30 minutes)
+             output reg_grouped
+
+[SYSMON+PS] CAR-2016-03-001 | Host Discovery Commands
+           Techniques: T1087, T1087.001, T1087.002, T1069, T1069.001, T1069.002, T1016, T1082 ...
+           DataModel:  process/create/command_line, process/create/exe
+           PSEUDOCODE:
+             process = search Process:Create
+             info_command = filter process where (
+              exe == "hostname.exe" or
+              exe == "ipconfig.exe" or
+              exe == "net.exe" or
+              exe == "quser.exe" or
+              exe == "qwinsta.exe" or
+              exe == "sc" and (command_line match " query" or command_line match " qc")) or
+              exe == "systeminfo.exe" or
+              exe == "tasklist.exe" or
+              exe == "whoami.exe"
+             )
+             output info_command
+
+[OTHER]    CAR-2020-05-003 | Rare LolBAS Command Lines
+           Techniques: T1012, T1112, T1547, T1547.001, T1574, T1574.011
+           DataModel:  
+           PSEUDOCODE:
+             processes = search Process:Create
+             lolbas_processes = filter processes where (exe = "At.exe" OR exe = "Atbroker.exe" OR exe = "Bash.exe" OR exe = "Bitsadmin.exe" OR exe = "Certutil.exe" OR exe = "Cmd.exe" OR exe = "Cmdkey.exe" OR exe = "Cmstp.exe" OR exe = "Control.exe" OR exe = "Csc.exe" OR exe = "Cscript.exe" OR exe = "Dfsvc.exe" OR exe = "Diskshadow.exe" OR exe = "Dnscmd.exe" OR exe = "Esentutl.exe" OR exe = "Eventvwr.exe" OR exe = "Expand.exe" OR exe = "Extexport.exe" OR exe = "Extrac32.exe" OR exe = "Findstr.exe" OR exe = "Forfiles.exe" OR exe = "Ftp.exe" OR exe = "Gpscript.exe" OR exe = "Hh.exe" OR exe = "Ie4uinit.exe" OR exe = "Ieexec.exe" OR exe = "Infdefaultinstall.exe" OR exe = "Installutil.exe" OR exe = "Jsc.exe" OR exe = "Makecab.exe" OR exe = "Mavinject.exe" OR exe = "Microsoft.Workflow.r.exe" OR exe = "Mmc.exe" OR exe = "Msbuild.exe" OR exe = "Msconfig.exe" OR exe = "Msdt.exe" OR exe = "Mshta.exe" OR exe = "Msiexec.exe" OR exe = "Odbcconf.exe" OR exe = "Pcalua.exe" OR exe = "Pcwrun.exe" OR exe = "Presentationhost.exe" OR exe = "Print.exe" OR exe = "Reg.exe" OR exe = "Regasm.exe" OR exe = "Regedit.exe" OR exe = "Register-cimprovider.exe" OR exe = "Regsvcs.exe" OR exe = "Regsvr32.exe" OR exe = "Replace.exe" OR exe = "Rpcping.exe" OR exe = "Rundll32.exe" OR exe = "Runonce.exe" OR exe = "Runscripthelper.exe" OR exe = "Sc.exe" OR exe = "Schtasks.exe" OR exe = "Scriptrunner.exe" OR exe = "SyncAppvPublishingServer.exe" OR exe = "Tttracer.exe" OR exe = "Verclsid.exe" OR exe = "Wab.exe" OR exe = "Wmic.exe" OR exe = "Wscript.exe" OR exe = "Wsreset.exe" OR exe = "Xwizard.exe" OR exe = "Advpack.dll OR exe = "Comsvcs.dll OR exe = "Ieadvpack.dll OR exe = "Ieaframe.dll OR exe = "Mshtml.dll OR exe = "Pcwutl.dll OR exe = "Setupapi.dll OR exe = "Shdocvw.dll OR exe = "Shell32.dll OR exe = "Syssetup.dll OR exe = "Url.dll OR exe = "Zipfldr.dll OR exe = "Appvlp.exe" OR exe = "Bginfo.exe" OR exe = "Cdb.exe" OR exe = "csi.exe" OR exe = "Devtoolslauncher.exe" OR exe = "dnx.exe" OR exe = "Dxcap.exe" OR exe = "Excel.exe" OR exe = "Mftrace.exe" OR exe = "Msdeploy.exe" OR exe = "msxsl.exe" OR exe = "Powerpnt.exe" OR exe = "rcsi.exe" OR exe = "Sqler.exe" OR exe = "Sqlps.exe" OR exe = "SQLToolsPS.exe" OR exe = "Squirrel.exe" OR exe = "te.exe" OR exe = "Tracker.exe" OR exe = "Update.exe" OR exe = "vsjitdebugger.exe" OR exe = "Winword.exe" OR exe = "Wsl.exe" OR exe = "CL_Mutexverifiers.ps1 OR exe = "CL_Invocation.ps1 OR exe = "Manage-bde.wsf OR exe = "Pubprn.vbs OR exe = "Slmgr.vbs OR exe = "Syncappvpublishingserver.vbs OR exe = "winrm.vbs OR exe = "Pester.bat)
+             process_count = count(lolbas_processes) by process
+             process_count_avg = average(process_count)
+             process_count_stdev = standard_deviation(process_count)
+             lower_bound = process_count_avg - stdev * 1.5
+             outliers = filter lolbas_processes where (process_count < lower_bound)
+             return outliers
+
+[SYSMON+PS] CAR-2020-11-002 | Local Network Sniffing
+           Techniques: T1040
+           DataModel:  process/create/exe, process/create/parent_exe
+           PSEUDOCODE:
+             processes = search Process:Create
+             sniffer_processes = filter processes where (
+               exe = "tshark.exe" OR
+               exe = "windump.exe" OR
+               (exe = "logman.exe" AND parent_exe exists AND parent_exe!="C:\Program Files\Windows Event Reporting\Core\EventReporting.AgentService.exe") OR
+               exe = "tcpdump.exe" OR
+               exe = "wprui.exe" OR
+               exe = "wpr.exe" )
+             output sniffer_processes
+
+[SYSMON+PS] CAR-2020-11-006 | Local Permission Group Discovery
+           Techniques: T1069, T1069.001, T1069.002
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             net_processes = filter processes where (
+               exe = "net.exe" AND (
+               command_line="*net* user*" OR
+               command_line="*net* group*" OR
+               command_line="*net* localgroup*" OR
+               command_line="*get-localgroup*" OR
+               command_line="*get-ADPrincipalGroupMembership*" )
+             output net_processes
+
+[OTHER]    CAR-2021-01-001 | Identifying Port Scanning Activity
+           Techniques: T1046
+           DataModel:  flow/start/dest_ip
+
+############################################################
+TACTIC TA0008: Lateral Movement  [15 total, 5 Sysmon+pseudocode]
+############################################################
+
+[OTHER]    CAR-2013-01-003 | SMB Events Monitoring
+           Techniques: T1039, T1021, T1021.002
+           DataModel:  flow/message/dest_port, flow/message/proto_info
+           PSEUDOCODE:
+             flow = search Flow:Message
+             smb_events = filter flow where (dest_port == "445" and protocol == "smb")
+             smb_events.file_name = smb_events.proto_info.file_name
+             output smb_write
+
+[OTHER]    CAR-2013-02-012 | User Logged in to Multiple Hosts
+           Techniques: T1078, T1078.002, T1078.003
+           DataModel:  
+
+[SYSMON+PS] CAR-2013-04-002 | Quick execution of a series of suspicious commands
+           Techniques: T1087, T1087.001, T1087.002, T1003, T1003.002, T1069, T1069.001, T1069.002 ...
+           DataModel:  process/create/hostname, process/create/ppid, process/create/exe
+           PSEUDOCODE:
+             processes = search Process:Create
+             reg_processes = filter processes where (exe == "arp.exe" or exe == "at.exe" or exe == "attrib.exe"
+              or exe == "cscript.exe" or exe == "dsquery.exe" or exe == "hostname.exe"
+              or exe == "ipconfig.exe" or exe == "mimikatz.exe" or exe == "nbstat.exe"
+              or exe == "net.exe" or exe == "netsh.exe" or exe == "nslookup.exe"
+              or exe == "ping.exe" or exe == "quser.exe" or exe == "qwinsta.exe"
+              or exe == "reg.exe" or exe == "runas.exe" or exe == "sc.exe"
+              or exe == "schtasks.exe" or exe == "ssh.exe" or exe == "systeminfo.exe"
+              or exe == "taskkill.exe" or exe == "telnet.exe" or exe == "tracert.exe"
+              or exe == "wscript.exe" or exe == "xcopy.exe")
+             reg_grouped = group reg by hostname, ppid where(max time between two events is 30 minutes)
+             output reg_grouped
+
+[OTHER]    CAR-2013-05-003 | SMB Write Request
+           Techniques: T1570, T1021, T1021.002, T1078, T1078.002, T1078.003
+           DataModel:  flow/message/proto_info, flow/message/dest_port
+           PSEUDOCODE:
+             flow = search Flow:Message
+             smb_write = filter flow where (dest_port == "445" and protocol == "smb.write")
+             smb_write.file_name = smb_write.proto_info.file_name
+             output smb_write
+
+[SYSMON+PS] CAR-2013-05-005 | SMB Copy and Execution
+           Techniques: T1021, T1021.002, T1078, T1078.002, T1078.003, T1570
+           DataModel:  process/create/image_path, process/create/proto_info, process/create/hostname
+           PSEUDOCODE:
+             process = search Process:Create
+             smb_write = run Analytic:CAR-2013-05-003
+             remote_start = join (smb_write, process) where (
+              smb_write.hostname == process.hostname and
+              smb_write.file_path == process.image_path
+              (smb_write.time < process.time)
+             )
+             output remote_start
+
+[SYSMON+PS] CAR-2013-07-001 | Suspicious Arguments
+           Techniques: T1003, T1003.001, T1021, T1105
+           DataModel:  process/create/command_line, process/create/exe
+           PSEUDOCODE:
+             process = search Process:Create
+             port_fwd = filter process where (command_line match "-R .* -pw")
+             scp = filter process where (command_line match "-pw .* .* .*@.*"
+             mimikatz = filter process where (command_line match "sekurlsa")
+             rar = filter process where (command_line match " -hp ")
+             archive = filter process where (command_line match ".* a .*")
+             ip_addr = filter process where (command_line match \d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})
+             
+             output port_fwd, scp, mimikatz, rar, archive, ip_addr
+
+[OTHER]    CAR-2013-07-002 | RDP Connection Detection
+           Techniques: T1021, T1021.001
+           DataModel:  flow/end/dest_port, flow/start/dest_ip, flow/start/dest_port, flow/start/src_ip
+           PSEUDOCODE:
+             flow_start = search Flow:Start
+             flow_end = search Flow:End
+             rdp_start = filter flow_start where (port == "3389")
+             rdp_end = filter flow_start where (port == "3389")
+             rdp = group flow_start, flow_end by src_ip, src_port, dest_ip, dest_port
+             output rdp
+
+[OTHER]    CAR-2013-10-001 | User Login Activity Monitoring
+           Techniques: T1021, T1021.001, T1078, T1078.002, T1078.003
+           DataModel:  
+           PSEUDOCODE:
+             logon_events = search User_Session:Login
+             filtered_logons = filter logon_events where (
+               user NOT IN TOP30(user))
+             output filtered_logons
+
+[OTHER]    CAR-2014-03-001 | SMB Write Request - NamedPipes
+           Techniques: T1570
+           DataModel:  flow/message/proto_info, flow/start/dest_port
+           PSEUDOCODE:
+             flow = search Flow:Message
+             smb_write = filter flow where (dest_port == "445" and protocol == "smb.write_pipe")
+             smb_write.pipe_name = smb_write.proto_info.pipe_name
+             output smb_write
+
+[OTHER]    CAR-2014-05-001 | RPC Activity
+           Techniques: T1021, T1021.002, T1021.003, T1021.006
+           DataModel:  flow/start/dest_port, flow/start/src_port
+           PSEUDOCODE:
+             flows = search Flow:Start
+             rpc_mapper = filter flows where (dest_port == 135)
+             rpc_endpoint = filter flows where (dest_port >= 49152 and src_port >= 49152)
+             rpc = join rpc_mapper, rpc_endpoint where (
+              (rpc_mapper.time < rpc_endpoint.time < rpc_mapper.time + 2 seconds) and
+              (rpc_mapper.src_ip == rpc_endpoint.src_ip and rpc_mapper.dest_ip == rpc_endpoint.dest_ip)
+             )
+             output rpc
+
+[SYSMON+PS] CAR-2014-11-004 | Remote PowerShell Sessions
+           Techniques: T1059, T1059.001, T1021, T1021.006
+           DataModel:  process/create/exe, process/create/parent_exe
+           PSEUDOCODE:
+             process = search Process:Create
+             wsmprovhost = filter process where (exe == "wsmprovhost.exe" and parent_exe == "svchost.exe")
+
+[OTHER]    CAR-2014-11-006 | Windows Remote Management (WinRM)
+           Techniques: T1021, T1021.006
+           DataModel:  flow/start/dest_port
+           PSEUDOCODE:
+             flow = search Flow:Start
+             winrm = filter flow where (dest_port == 5985)
+             winrm_s = filter flow where (dest_port == 5986)
+             output winrm, winrm_s
+
+[OTHER]    CAR-2016-04-004 | Successful Local Account Login
+           Techniques: T1550, T1550.002
+           DataModel:  
+           PSEUDOCODE:
+             EventCode == 4624 and [target_user_name] != "ANONYMOUS LOGON" and
+             [authentication_package_name] == "NTLM"
+
+[OTHER]    CAR-2016-04-005 | Remote Desktop Logon
+           Techniques: T1021, T1021.001
+           DataModel:  
+           PSEUDOCODE:
+             [EventCode] == 4624 and
+             [AuthenticationPackageName] == 'Negotiate' and
+             [Severity] == "Information" and
+             [LogonType] == 10
+
+[SYSMON+PS] CAR-2020-11-001 | Boot or Logon Initialization Scripts
+           Techniques: T1037, T1037.001
+           DataModel:  process/create/command_line, process/create/exe, registry/add/key, registry/edit/key
+           PSEUDOCODE:
+             processes = search Process:Create
+             logon_script_key_processes = filter processes where (
+               command_line = "*reg*add*\Environment*UserInitMprLogonScript")
+             registry = search (Registry:Add OR Registry:Edit)
+             registry_logon_key_events = filter registry where (
+               key = "*\Environment*UserInitMprLogonScript")
+             output (logon_script_key_processes, registry_logon_key_events)
+
+############################################################
+TACTIC TA0009: Collection  [1 total, 0 Sysmon+pseudocode]
+############################################################
+
+[OTHER]    CAR-2013-01-003 | SMB Events Monitoring
+           Techniques: T1039, T1021, T1021.002
+           DataModel:  flow/message/dest_port, flow/message/proto_info
+           PSEUDOCODE:
+             flow = search Flow:Message
+             smb_events = filter flow where (dest_port == "445" and protocol == "smb")
+             smb_events.file_name = smb_events.proto_info.file_name
+             output smb_write
+
+############################################################
+TACTIC TA0010: Exfiltration  [2 total, 2 Sysmon+pseudocode]
+############################################################
+
+[SYSMON+PS] CAR-2013-04-002 | Quick execution of a series of suspicious commands
+           Techniques: T1087, T1087.001, T1087.002, T1003, T1003.002, T1069, T1069.001, T1069.002 ...
+           DataModel:  process/create/hostname, process/create/ppid, process/create/exe
+           PSEUDOCODE:
+             processes = search Process:Create
+             reg_processes = filter processes where (exe == "arp.exe" or exe == "at.exe" or exe == "attrib.exe"
+              or exe == "cscript.exe" or exe == "dsquery.exe" or exe == "hostname.exe"
+              or exe == "ipconfig.exe" or exe == "mimikatz.exe" or exe == "nbstat.exe"
+              or exe == "net.exe" or exe == "netsh.exe" or exe == "nslookup.exe"
+              or exe == "ping.exe" or exe == "quser.exe" or exe == "qwinsta.exe"
+              or exe == "reg.exe" or exe == "runas.exe" or exe == "sc.exe"
+              or exe == "schtasks.exe" or exe == "ssh.exe" or exe == "systeminfo.exe"
+              or exe == "taskkill.exe" or exe == "telnet.exe" or exe == "tracert.exe"
+              or exe == "wscript.exe" or exe == "xcopy.exe")
+             reg_grouped = group reg by hostname, ppid where(max time between two events is 30 minutes)
+             output reg_grouped
+
+[SYSMON+PS] CAR-2013-07-005 | Command Line Usage of Archiving Software
+           Techniques: T1560, T1560.001
+           DataModel:  process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             rar_argument = filter processes where (command_line == "* a *")
+             output rar_argument
+
+############################################################
+TACTIC TA0011: Command and Control  [4 total, 4 Sysmon+pseudocode]
+############################################################
+
+[SYSMON+PS] CAR-2013-07-001 | Suspicious Arguments
+           Techniques: T1003, T1003.001, T1021, T1105
+           DataModel:  process/create/command_line, process/create/exe
+           PSEUDOCODE:
+             process = search Process:Create
+             port_fwd = filter process where (command_line match "-R .* -pw")
+             scp = filter process where (command_line match "-pw .* .* .*@.*"
+             mimikatz = filter process where (command_line match "sekurlsa")
+             rar = filter process where (command_line match " -hp ")
+             archive = filter process where (command_line match ".* a .*")
+             ip_addr = filter process where (command_line match \d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})
+             
+             output port_fwd, scp, mimikatz, rar, archive, ip_addr
+
+[SYSMON+PS] CAR-2021-05-005 | BITSAdmin Download File
+           Techniques: T1197, T1105
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             bitsadmin_commands = filter processes where (
+               exe ="C:\Windows\System32\bitsadmin.exe" AND command_line = *transfer*)
+             output bitsadmin_commands
+
+[SYSMON+PS] CAR-2021-05-006 | CertUtil Download With URLCache and Split Arguments
+           Techniques: T1105
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             certutil_downloads = filter processes where (
+               exe ="C:\Windows\System32\certutil.exe" AND command_line = *urlcache* AND command_line = *split*)
+             output certutil_downloads
+
+[SYSMON+PS] CAR-2021-05-007 | CertUtil Download With VerifyCtl and Split Arguments
+           Techniques: T1105
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             certutil_downloads = filter processes where (
+               exe = "C:\Windows\System32\certutil.exe" AND command_line = *verifyctl* AND command_line = *split*)
+             output certutil_downloads
+
+############################################################
+TACTIC TA0040: Impact  [2 total, 1 Sysmon+pseudocode]
+############################################################
+
+[SYSMON]   CAR-2021-01-009 | Detecting Shadow Copy Deletion or Resize
+           Techniques: T1490
+           DataModel:  process/create/command_line
+
+[SYSMON+PS] CAR-2021-05-003 | BCDEdit Failure Recovery Modification
+           Techniques: T1490
+           DataModel:  process/create/exe, process/create/command_line
+           PSEUDOCODE:
+             processes = search Process:Create
+             bcdedit_commands = filter processes where (
+               exe = "C:\Windows\System32\bcdedit.exe" AND command_line="*recoveryenabled*" )
+             output bcedit_commands
+
+############################################################
+TACTIC unknown: Unknown  [2 total, 0 Sysmon+pseudocode]
+############################################################
+
+[OTHER]    CAR-2015-07-001 | All Logins Since Last Boot
+           Techniques: 
+           DataModel:  user_session/login/user
+           PSEUDOCODE:
+             input target_host
+             input event_time
+             
+             all_boots = search SystemLogs:BootUp where (hostname == target_host and time < event_time)
+             boot_time = max(all_boots.time)
+             
+             user_logins = search UserSession:Login
+             host_logins = filter user_logins where (hostname == target_host and boot_time < time < event_time)
+             compromised_accounts = unique(user_logins.user)
+             
+             output users
+
+[OTHER]    CAR-2020-04-001 | Shadow Copy Deletion
+           Techniques: 
+           DataModel:  

@@ -453,6 +453,18 @@ impl TsetlinMachine {
         }
     }
 
+    /// Return the indices of all clauses (local to `class`) that fire for `sample`.
+    pub fn fired_clauses(&self, sample: &EncodedSample, class: usize) -> Vec<usize> {
+        let lit = &sample.0;
+        let cps = self.clauses_per_class;
+        let words = self.words;
+        let include = self.include.as_slice();
+        let valid = self.valid.as_slice();
+        (0..cps)
+            .filter(|&j| fire_predict(&include[(class * cps + j) * words..(class * cps + j + 1) * words], lit, valid, words))
+            .collect()
+    }
+
     /// Predict classes for all samples in an encoded batch, returning one class index per sample.
     pub fn predict_batch(&self, batch: &EncodedBatch) -> Vec<usize> {
         debug_assert_eq!(batch.data.len(), batch.n * self.words);

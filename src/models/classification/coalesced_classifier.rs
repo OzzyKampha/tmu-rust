@@ -439,6 +439,16 @@ impl CoalescedTsetlinMachine {
         }
     }
 
+    /// Return the indices of all shared clauses that fire for `sample`.
+    /// The `_output` parameter is accepted for API uniformity but ignored — clauses are shared.
+    pub fn fired_clauses(&self, sample: &EncodedSample, _output: usize) -> Vec<usize> {
+        self.clause_outputs_predict(&sample.0)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(j, fired)| if fired { Some(j) } else { None })
+            .collect()
+    }
+
     /// Predict classes for all samples in an encoded batch.
     pub fn predict_batch(&self, batch: &EncodedBatch) -> Vec<usize> {
         debug_assert_eq!(batch.data.len(), batch.n * self.words);
