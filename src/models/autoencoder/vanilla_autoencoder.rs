@@ -489,7 +489,7 @@ impl TMAutoEncoder {
                         );
                         if drop_mask.is_empty() || !drop_mask[j] {
                             if type_iii_update(
-                                ta_o, ind_o, cat_o, inc_o, lit, val, lit_active, words, n_literals,
+                                ta_o, ind_o, cat_o, inc_o, lit, val, lit_active, active_b, words, n_literals,
                                 d_val, p, target_bool, rng, half, max_state,
                             ) {
                                 rebuild_include(ta_o, inc_o, val, words, n_literals, half);
@@ -548,6 +548,7 @@ impl TMAutoEncoder {
                     lit,
                     val,
                     lit_active,
+                    active_b,
                     words,
                     n_literals,
                     d_val,

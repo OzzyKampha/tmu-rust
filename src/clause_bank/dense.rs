@@ -746,72 +746,160 @@ pub(crate) fn first_false_literal(
 ///
 /// **Scalar fallback**: branchless per-literal saturating arithmetic.
 #[inline(always)]
-fn type_iii_ind_bytes(ind: &mut [u8], n_literals: usize, inc_b: &[u8], dec_b: &[u8], max_ind: u8) {
+/// Update per-literal indicator `ind` directly from bitset words — zero allocation.
+///
+/// Replaces the old expand-to-bytes pipeline: no `Vec` is allocated.
+///
+/// - Inc: `ind[l] += 1` (saturating, ≤ `max_ind`) where `lit_active & cat & lit`.
+/// - Dec: `ind[l] -= 1` (saturating) where `lit_active & !cat & lit & valid`.
+///
+/// The AVX2 path expands 32 bits at a time to 32 byte lanes via `vpshufb` + bit isolation,
+/// then applies the same saturating arithmetic as [`type_iii_ind_bytes_avx2`].
+fn type_iii_ind_words(
+    ind: &mut [u8],
+    n_literals: usize,
+    lit_active: &[u64],
+    cat: &[u64],
+    lit: &[u64],
+    valid: &[u64],
+    do_inc: bool,
+    max_ind: u8,
+) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            // SAFETY: avx2 presence verified by the runtime check above.
-            return unsafe { type_iii_ind_bytes_avx2(ind, n_literals, inc_b, dec_b, max_ind) };
+            return unsafe {
+                type_iii_ind_words_avx2(ind, n_literals, lit_active, cat, lit, valid, do_inc, max_ind)
+            };
         }
     }
-    type_iii_ind_bytes_scalar(ind, n_literals, inc_b, dec_b, max_ind);
+    type_iii_ind_words_scalar(ind, n_literals, lit_active, cat, lit, valid, do_inc, max_ind);
 }
 
 #[inline]
-fn type_iii_ind_bytes_scalar(
+fn type_iii_ind_words_scalar(
     ind: &mut [u8],
     n_literals: usize,
-    inc_b: &[u8],
-    dec_b: &[u8],
+    lit_active: &[u64],
+    cat: &[u64],
+    lit: &[u64],
+    valid: &[u64],
+    do_inc: bool,
     max_ind: u8,
 ) {
     for l in 0..n_literals {
-        ind[l] = ind[l].saturating_add(inc_b[l]).min(max_ind).saturating_sub(dec_b[l]);
+        let w = l / WORD_BITS;
+        let b = l % WORD_BITS;
+        let active = (lit_active[w] >> b) & 1;
+        let cat_b = (cat[w] >> b) & 1;
+        let lit_b = (lit[w] >> b) & 1;
+        let valid_b = (valid[w] >> b) & 1;
+        let inc = if do_inc { (active & cat_b & lit_b) as u8 } else { 0u8 };
+        let dec = (active & (1 - cat_b) & lit_b & valid_b) as u8;
+        ind[l] = ind[l].saturating_add(inc).min(max_ind).saturating_sub(dec);
     }
 }
 
-/// AVX2 implementation of [`type_iii_ind_bytes`]: 32 literals per iteration.
+/// AVX2 path for [`type_iii_ind_words`]: expands 32 bits per iteration via `vpshufb`.
 ///
-/// `inc_b` and `dec_b` are guaranteed disjoint (a literal cannot be in both `cat` and `¬cat`),
-/// so the order — add first, then subtract — is safe.
+/// For each group of 32 literals, computes `inc_bits` and `dec_bits` as `u32` values from the
+/// raw bitset words, then uses a shuffle-based bit-to-byte expansion to produce 32-byte SIMD
+/// vectors, and applies saturating arithmetic — exactly like `type_iii_ind_bytes_avx2` but
+/// without any intermediate `Vec` allocation.
 ///
 /// # Safety
 /// Caller must verify AVX2 is available.  Pointer reads/writes stay within the
 /// `ind` slice (loop guard: `l + 32 <= n_literals`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn type_iii_ind_bytes_avx2(
+unsafe fn type_iii_ind_words_avx2(
     ind: &mut [u8],
     n_literals: usize,
-    inc_b: &[u8],
-    dec_b: &[u8],
+    lit_active: &[u64],
+    cat: &[u64],
+    lit: &[u64],
+    valid: &[u64],
+    do_inc: bool,
     max_ind: u8,
 ) {
     use std::arch::x86_64::*;
 
     let max_ind_v = _mm256_set1_epi8(max_ind as i8);
+    let zero = _mm256_setzero_si256();
+    let ones_v = _mm256_set1_epi8(1i8);
 
-    macro_rules! load32 {
-        ($slice:expr, $off:expr) => {
-            _mm256_loadu_si256($slice.as_ptr().add($off) as *const __m256i)
-        };
+    // Shuffle control: within each 128-bit lane, route source bytes so that
+    // output bytes 0-7 all hold source byte 0, bytes 8-15 hold byte 1, etc.
+    // _mm256_set_epi8 order: (e31, e30, ..., e1, e0) where e0 is byte 0.
+    let shuf = _mm256_set_epi8(
+        3, 3, 3, 3, 3, 3, 3, 3,
+        2, 2, 2, 2, 2, 2, 2, 2,
+        1, 1, 1, 1, 1, 1, 1, 1,
+        0, 0, 0, 0, 0, 0, 0, 0,
+    );
+    // Bit-isolation masks: lane i gets the mask for bit (i % 8).
+    let bit_masks = _mm256_set_epi8(
+        0x80u8 as i8, 0x40u8 as i8, 0x20u8 as i8, 0x10u8 as i8,
+        0x08u8 as i8, 0x04u8 as i8, 0x02u8 as i8, 0x01u8 as i8,
+        0x80u8 as i8, 0x40u8 as i8, 0x20u8 as i8, 0x10u8 as i8,
+        0x08u8 as i8, 0x04u8 as i8, 0x02u8 as i8, 0x01u8 as i8,
+        0x80u8 as i8, 0x40u8 as i8, 0x20u8 as i8, 0x10u8 as i8,
+        0x08u8 as i8, 0x04u8 as i8, 0x02u8 as i8, 0x01u8 as i8,
+        0x80u8 as i8, 0x40u8 as i8, 0x20u8 as i8, 0x10u8 as i8,
+        0x08u8 as i8, 0x04u8 as i8, 0x02u8 as i8, 0x01u8 as i8,
+    );
+
+    // Expand a u32 mask to a __m256i with 0x01 per set bit, 0x00 per clear bit.
+    macro_rules! bits32_to_vec {
+        ($bits:expr) => {{
+            let v = _mm256_set1_epi32($bits as i32);
+            let spread = _mm256_shuffle_epi8(v, shuf);
+            let masked = _mm256_and_si256(spread, bit_masks);
+            let is_zero = _mm256_cmpeq_epi8(masked, zero);
+            _mm256_andnot_si256(is_zero, ones_v)
+        }};
     }
 
     let mut l = 0usize;
     while l + 32 <= n_literals {
-        // SAFETY: l + 32 <= n_literals, all reads in-bounds.
-        let v = load32!(ind, l);
-        let inc = load32!(inc_b, l);
-        let dec = load32!(dec_b, l);
-        // saturating-add inc, cap at max_ind, saturating-sub dec
-        let incremented = _mm256_min_epu8(_mm256_adds_epu8(v, inc), max_ind_v);
-        let result = _mm256_subs_epu8(incremented, dec);
-        _mm256_storeu_si256(ind.as_mut_ptr().add(l) as *mut __m256i, result);
+        let widx = l / WORD_BITS;
+        let boff = l % WORD_BITS; // 0 for the low half, 32 for the high half of each word.
+
+        let w_active = lit_active[widx];
+        let w_cat = cat[widx];
+        let w_lit = lit[widx];
+        let w_valid = valid[widx];
+
+        let inc_bits: u32 = if do_inc {
+            ((w_active & w_cat & w_lit) >> boff) as u32
+        } else {
+            0
+        };
+        let dec_bits: u32 = ((w_active & !w_cat & w_lit & w_valid) >> boff) as u32;
+
+        let inc_v = bits32_to_vec!(inc_bits);
+        let dec_v = bits32_to_vec!(dec_bits);
+
+        // SAFETY: l + 32 <= n_literals, all reads/writes in-bounds.
+        let ptr = ind.as_mut_ptr().add(l) as *mut __m256i;
+        let v = _mm256_loadu_si256(ptr as *const __m256i);
+        let incremented = _mm256_min_epu8(_mm256_adds_epu8(v, inc_v), max_ind_v);
+        let result = _mm256_subs_epu8(incremented, dec_v);
+        _mm256_storeu_si256(ptr, result);
+
         l += 32;
     }
     // Scalar tail.
     while l < n_literals {
-        ind[l] = ind[l].saturating_add(inc_b[l]).min(max_ind).saturating_sub(dec_b[l]);
+        let w = l / WORD_BITS;
+        let b = l % WORD_BITS;
+        let active = (lit_active[w] >> b) & 1;
+        let cat_b = (cat[w] >> b) & 1;
+        let lit_b_v = (lit[w] >> b) & 1;
+        let valid_b = (valid[w] >> b) & 1;
+        let inc = if do_inc { (active & cat_b & lit_b_v) as u8 } else { 0u8 };
+        let dec = (active & (1 - cat_b) & lit_b_v & valid_b) as u8;
+        ind[l] = ind[l].saturating_add(inc).min(max_ind).saturating_sub(dec);
         l += 1;
     }
 }
@@ -912,6 +1000,9 @@ unsafe fn type_iii_ta_dec_bytes_avx2(
 /// state stays below `half_ind` have their primary TA counter decremented, gradually excluding
 /// them from the clause and producing smaller, more interpretable rules.
 ///
+/// `active_b` is the byte-expanded form of `lit_active` — pass the value already computed
+/// once per sample in the outer training loop to avoid a per-clause allocation.
+///
 /// Returns `true` when the primary TA state was modified; the caller must then call
 /// [`rebuild_include`].
 ///
@@ -931,9 +1022,9 @@ unsafe fn type_iii_ta_dec_bytes_avx2(
 /// - With probability `update_p`, decrement `ta[l]` for each active literal with
 ///   `ind[l] < half_ind`.
 ///
-/// **AVX2 paths**: the `ind` update and `ta` decrement steps are vectorised via
-/// [`type_iii_ind_bytes`] and [`type_iii_ta_dec_bytes`].  The bitset operations
-/// (`cat` update, `first_false_literal`) remain scalar (they are already 64-bit parallel).
+/// **AVX2 paths**: the `ind` update ([`type_iii_ind_words`]) and `ta` decrement
+/// ([`type_iii_ta_dec_bytes`]) are fully vectorised with zero heap allocation.
+/// The bitset operations (`cat` update, `first_false_literal`) remain scalar.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(crate) fn type_iii_update(
@@ -944,6 +1035,7 @@ pub(crate) fn type_iii_update(
     lit: &[u64],
     valid: &[u64],
     lit_active: &[u64],
+    active_b: &[u8],
     words: usize,
     n_literals: usize,
     d: f64,
@@ -958,22 +1050,8 @@ pub(crate) fn type_iii_update(
     if fires {
         let do_inc = target && rng.next_f64() <= 1.0 - 1.0 / d;
 
-        // Build per-literal inc/dec masks as bitsets, then expand to byte arrays for the
-        // vectorised inner functions.
-        // inc_mask = lit_active & cat & lit              (zero when !do_inc)
-        // dec_mask = lit_active & !cat & lit & valid     (always on fire)
-        // The two masks are disjoint by construction (cat ∧ ¬cat = ∅).
-        let mut inc_mask = vec![0u64; words];
-        let mut dec_mask = vec![0u64; words];
-        for k in 0..words {
-            if do_inc {
-                inc_mask[k] = lit_active[k] & cat[k] & lit[k];
-            }
-            dec_mask[k] = lit_active[k] & !cat[k] & lit[k] & valid[k];
-        }
-        let inc_b = expand_bits_to_bytes(&inc_mask, n_literals);
-        let dec_b = expand_bits_to_bytes(&dec_mask, n_literals);
-        type_iii_ind_bytes(ind, n_literals, &inc_b, &dec_b, max_ind);
+        // Update ind directly from bitset words — no Vec allocation, no expand_bits_to_bytes.
+        type_iii_ind_words(ind, n_literals, lit_active, cat, lit, valid, do_inc, max_ind);
 
         for k in 0..words {
             cat[k] = if target { !cat[k] & valid[k] } else { valid[k] };
@@ -989,8 +1067,8 @@ pub(crate) fn type_iii_update(
     }
 
     if rng.next_f64() <= update_p {
-        let active_b = expand_bits_to_bytes(lit_active, n_literals);
-        type_iii_ta_dec_bytes(ta, ind, n_literals, &active_b, half_ind);
+        // Use the caller's pre-computed active_b — no per-clause allocation.
+        type_iii_ta_dec_bytes(ta, ind, n_literals, active_b, half_ind);
         return true;
     }
 
@@ -1249,9 +1327,10 @@ mod tests {
         let lit_active = vec![!0u64];
         let mut rng = crate::rng::Rng::new(42);
 
+        let active_b = expand_bits_to_bytes(&lit_active, n_literals);
         type_iii_update(
             &mut ta, &mut ind, &mut cat, &inc,
-            &lit, &valid, &lit_active,
+            &lit, &valid, &lit_active, &active_b,
             words, n_literals,
             200.0, 0.0, // update_p=0: TA decrement never fires
             true, &mut rng, 128, 255,
@@ -1275,9 +1354,10 @@ mod tests {
         let lit_active = vec![!0u64];
         let mut rng = crate::rng::Rng::new(42);
 
+        let active_b = expand_bits_to_bytes(&lit_active, n_literals);
         type_iii_update(
             &mut ta, &mut ind, &mut cat, &inc,
-            &lit, &valid, &lit_active,
+            &lit, &valid, &lit_active, &active_b,
             words, n_literals,
             200.0, 0.0, false, &mut rng, 128, 255,
         );
@@ -1303,9 +1383,10 @@ mod tests {
         let lit_active = vec![!0u64];
         let mut rng = crate::rng::Rng::new(42);
 
+        let active_b = expand_bits_to_bytes(&lit_active, n_literals);
         type_iii_update(
             &mut ta, &mut ind, &mut cat, &inc,
-            &lit, &valid, &lit_active,
+            &lit, &valid, &lit_active, &active_b,
             words, n_literals,
             200.0, 0.0, true, &mut rng, 128, 255,
         );
@@ -1330,9 +1411,10 @@ mod tests {
         let lit_active = vec![!0u64];
         let mut rng = crate::rng::Rng::new(0);
 
+        let active_b = expand_bits_to_bytes(&lit_active, n_literals);
         let changed = type_iii_update(
             &mut ta, &mut ind, &mut cat, &inc,
-            &lit, &valid, &lit_active,
+            &lit, &valid, &lit_active, &active_b,
             words, n_literals,
             200.0, 1.0, // update_p=1: always decrement
             false, &mut rng, 4, 7,
