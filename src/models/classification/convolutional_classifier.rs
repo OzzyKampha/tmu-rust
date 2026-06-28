@@ -16,7 +16,8 @@
 use crate::clause_bank::dense::PARALLEL_MIN;
 use crate::clause_bank::dense::{
     bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, pack, rebuild_include,
-    type_i_update_bytes, type_ii_update_bytes, words_for, GOLDEN, MASK_BITS, WORD_BITS,
+    type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for, GOLDEN, MASK_BITS,
+    WORD_BITS,
 };
 use crate::rng::Rng;
 
@@ -86,6 +87,11 @@ pub struct ConvolutionalTsetlinMachine {
     valid: Vec<u64>,
     dig_inv: Vec<u8>,
     dig_keep: Vec<u8>,
+
+    ind: Vec<u8>,
+    cat: Vec<u64>,
+    d: f64,
+    type_iii: bool,
 
     rng: Rng,
 }
@@ -333,6 +339,10 @@ impl ConvolutionalTsetlinMachine {
             valid,
             dig_inv: digits_of(1.0 / s, MASK_BITS),
             dig_keep: digits_of((s - 1.0) / s, MASK_BITS),
+            ind: vec![half; n_clauses * n_literals],
+            cat: vec![0u64; n_clauses * words],
+            d: 200.0,
+            type_iii: false,
             rng,
         }
     }
@@ -447,6 +457,10 @@ impl ConvolutionalTsetlinMachine {
             valid,
             dig_inv: digits_of(1.0 / s, MASK_BITS),
             dig_keep: digits_of((s - 1.0) / s, MASK_BITS),
+            ind: vec![half; n_clauses * n_literals],
+            cat: vec![0u64; n_clauses * words],
+            d: 200.0,
+            type_iii: false,
             rng,
         }
     }
@@ -469,6 +483,14 @@ impl ConvolutionalTsetlinMachine {
         assert!((0.0..1.0).contains(&p));
         self.literal_drop_p = p;
         self.dig_lit_active = digits_of(1.0 - p, MASK_BITS);
+        self
+    }
+
+    /// Enable Type III feedback with indicator strength `d` (must be > 1.0).
+    pub fn type_iii_feedback(mut self, d: f64) -> Self {
+        assert!(d > 1.0, "d must be > 1.0");
+        self.d = d;
+        self.type_iii = true;
         self
     }
 
@@ -674,6 +696,9 @@ impl ConvolutionalTsetlinMachine {
         let max_state = self.max_state;
         let n_patches = self.n_patches;
         let cw = self.class_weights_dummy();
+        let type_iii_en = self.type_iii;
+        let d_val = self.d;
+        let target_bool = target != 0;
 
         let t = wmax as f64;
         let v = sum as f64;
@@ -693,6 +718,8 @@ impl ConvolutionalTsetlinMachine {
             dig_inv,
             dig_keep,
             rng: _,
+            ind,
+            cat,
             ..
         } = self;
 
@@ -715,46 +742,86 @@ impl ConvolutionalTsetlinMachine {
         let class_inc = &mut include[c * cps * words..(c + 1) * cps * words];
         let class_w = &mut weights[c * cps..(c + 1) * cps];
         let class_rng = &mut rngs[c * cps..(c + 1) * cps];
+        let class_ind = &mut ind[c * cps * n_literals..(c + 1) * cps * n_literals];
+        let class_cat = &mut cat[c * cps * words..(c + 1) * cps * words];
 
         #[cfg(feature = "parallel")]
         if cps >= PARALLEL_MIN {
             use rayon::prelude::*;
-            class_ta
-                .par_chunks_mut(n_literals)
-                .zip(class_inc.par_chunks_mut(words))
-                .zip(class_w.par_iter_mut())
-                .zip(class_rng.par_iter_mut())
-                .enumerate()
-                .for_each(|(j, (((ta_c, inc_c), w), rng_c))| {
-                    // Find all patches where this clause fires (TMU: output_one_patches).
-                    let firing: Vec<usize> = (0..n_patches)
-                        .filter(|&pp| {
-                            clause_fire(
-                                inc_c,
-                                &patches_buf[pp * words..(pp + 1) * words],
-                                val,
-                                words,
-                                lit_active,
-                            )
-                        })
-                        .collect();
-                    let fires = !firing.is_empty();
-                    // Pick a random firing patch; for Ib any patch is fine (Xi unused).
-                    let p_idx = if fires {
-                        firing[rng_c.below(firing.len())]
-                    } else {
-                        0
-                    };
-                    let lit_b = expand_bits_to_bytes(
-                        &patches_buf[p_idx * words..(p_idx + 1) * words],
-                        n_literals,
-                    );
-                    apply_one_clause_conv(
-                        j, ta_c, inc_c, w, rng_c, target, p, &drop_mask, val, words, &lit_b,
-                        &inv_b, &keep_b, &active_b, n_literals, boost, wmax, max_inc, half,
-                        max_state, fires,
-                    );
-                });
+            if type_iii_en {
+                class_ta
+                    .par_chunks_mut(n_literals)
+                    .zip(class_inc.par_chunks_mut(words))
+                    .zip(class_w.par_iter_mut())
+                    .zip(class_rng.par_iter_mut())
+                    .zip(class_ind.par_chunks_mut(n_literals))
+                    .zip(class_cat.par_chunks_mut(words))
+                    .enumerate()
+                    .for_each(|(j, (((((ta_c, inc_c), w), rng_c), ind_c), cat_c))| {
+                        let firing: Vec<usize> = (0..n_patches)
+                            .filter(|&pp| {
+                                clause_fire(
+                                    inc_c,
+                                    &patches_buf[pp * words..(pp + 1) * words],
+                                    val,
+                                    words,
+                                    lit_active,
+                                )
+                            })
+                            .collect();
+                        let fires = !firing.is_empty();
+                        let p_idx = if fires { firing[rng_c.below(firing.len())] } else { 0 };
+                        let lit_b = expand_bits_to_bytes(
+                            &patches_buf[p_idx * words..(p_idx + 1) * words],
+                            n_literals,
+                        );
+                        apply_one_clause_conv(
+                            j, ta_c, inc_c, w, rng_c, target, p, &drop_mask, val, words, &lit_b,
+                            &inv_b, &keep_b, &active_b, n_literals, boost, wmax, max_inc, half,
+                            max_state, fires,
+                        );
+                        if drop_mask.is_empty() || !drop_mask[j] {
+                            let patch_lit = &patches_buf[p_idx * words..(p_idx + 1) * words];
+                            if type_iii_update(
+                                ta_c, ind_c, cat_c, inc_c, patch_lit, val, lit_active, words,
+                                n_literals, d_val, p, target_bool, rng_c, half, max_state,
+                            ) {
+                                rebuild_include(ta_c, inc_c, val, words, n_literals, half);
+                            }
+                        }
+                    });
+            } else {
+                class_ta
+                    .par_chunks_mut(n_literals)
+                    .zip(class_inc.par_chunks_mut(words))
+                    .zip(class_w.par_iter_mut())
+                    .zip(class_rng.par_iter_mut())
+                    .enumerate()
+                    .for_each(|(j, (((ta_c, inc_c), w), rng_c))| {
+                        let firing: Vec<usize> = (0..n_patches)
+                            .filter(|&pp| {
+                                clause_fire(
+                                    inc_c,
+                                    &patches_buf[pp * words..(pp + 1) * words],
+                                    val,
+                                    words,
+                                    lit_active,
+                                )
+                            })
+                            .collect();
+                        let fires = !firing.is_empty();
+                        let p_idx = if fires { firing[rng_c.below(firing.len())] } else { 0 };
+                        let lit_b = expand_bits_to_bytes(
+                            &patches_buf[p_idx * words..(p_idx + 1) * words],
+                            n_literals,
+                        );
+                        apply_one_clause_conv(
+                            j, ta_c, inc_c, w, rng_c, target, p, &drop_mask, val, words, &lit_b,
+                            &inv_b, &keep_b, &active_b, n_literals, boost, wmax, max_inc, half,
+                            max_state, fires,
+                        );
+                    });
+            }
             return;
         }
 
@@ -776,12 +843,7 @@ impl ConvolutionalTsetlinMachine {
                     })
                     .collect();
                 fires = !firing.is_empty();
-                // Pick a random firing patch; for Ib any patch is fine (Xi unused).
-                p_idx = if fires {
-                    firing[class_rng[j].below(firing.len())]
-                } else {
-                    0
-                };
+                p_idx = if fires { firing[class_rng[j].below(firing.len())] } else { 0 };
             }
             let lit_b =
                 expand_bits_to_bytes(&patches_buf[p_idx * words..(p_idx + 1) * words], n_literals);
@@ -808,6 +870,35 @@ impl ConvolutionalTsetlinMachine {
                 max_state,
                 fires,
             );
+            if type_iii_en && (drop_mask.is_empty() || !drop_mask[j]) {
+                let patch_lit = &patches_buf[p_idx * words..(p_idx + 1) * words];
+                if type_iii_update(
+                    &mut class_ta[j * n_literals..(j + 1) * n_literals],
+                    &mut class_ind[j * n_literals..(j + 1) * n_literals],
+                    &mut class_cat[j * words..(j + 1) * words],
+                    &class_inc[j * words..(j + 1) * words],
+                    patch_lit,
+                    val,
+                    lit_active,
+                    words,
+                    n_literals,
+                    d_val,
+                    p,
+                    target_bool,
+                    &mut class_rng[j],
+                    half,
+                    max_state,
+                ) {
+                    rebuild_include(
+                        &class_ta[j * n_literals..(j + 1) * n_literals],
+                        &mut class_inc[j * words..(j + 1) * words],
+                        val,
+                        words,
+                        n_literals,
+                        half,
+                    );
+                }
+            }
         }
     }
 
@@ -1039,6 +1130,31 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         for x in &xs[..50] {
             assert_eq!(ctm.predict(x), loaded.predict(x));
+        }
+    }
+
+    #[test]
+    fn type_iii_constructs_without_panic() {
+        let _ctm = ConvolutionalTsetlinMachine::new(2, 8, 2, 1, 10, 20, 3.0)
+            .type_iii_feedback(200.0);
+    }
+
+    #[test]
+    fn type_iii_d_must_be_greater_than_one() {
+        let result = std::panic::catch_unwind(|| {
+            ConvolutionalTsetlinMachine::new(2, 8, 2, 1, 10, 20, 3.0).type_iii_feedback(0.5)
+        });
+        assert!(result.is_err(), "expected panic for d <= 1.0");
+    }
+
+    #[test]
+    fn type_iii_trains_without_panic() {
+        let (xs, ys) = make_xor_sequence(300, 8, 7);
+        let slices = as_slices(&xs);
+        let mut ctm = ConvolutionalTsetlinMachine::new(2, 8, 2, 1, 10, 20, 3.0)
+            .type_iii_feedback(200.0);
+        for _ in 0..5 {
+            ctm.fit_epoch(&slices, &ys);
         }
     }
 }
