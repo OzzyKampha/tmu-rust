@@ -6,9 +6,11 @@
 //! | Module | Role |
 //! |---|---|
 //! | `clause_bank::dense` | Bit-manipulation primitives (fire, inc/dec, type I/II feedback, pack). Mirrors TMU's `clause_bank_dense.py`. |
+//! | `clause_bank::sparse` | Sparse clause bank with absorbing actions (per-clause index lists). Mirrors TMU's `clause_bank_sparse.py`. |
 //! | [`models`] | TM model implementations. |
 //! | [`TsetlinMachine`] | Vanilla weighted multiclass TM. Mirrors TMU's `vanilla_classifier.py`. |
 //! | [`CoalescedTsetlinMachine`] | Coalesced TM: shared clause bank + signed per-class weights. Mirrors TMU's `coalesced_classifier.py`. |
+//! | [`TMSparseClassifier`] | Sparse-clause-bank TM: absorbing actions remove literals as training converges. |
 //! | [`data`] | CSV loaders for binary-valued datasets. |
 //! | [`Booleanizer`] | Feature booleanizer (thresholding / thermometer encoding). |
 //! | [`Rng`] | Fast xoshiro256** RNG used throughout. |
@@ -38,7 +40,7 @@ pub use clause_inspect::ClauseInspect;
 pub use encoder::{EncodedBatch, EncodedSample, Encoder};
 pub use models::{
     CoalescedTsetlinMachine, ConvolutionalTsetlinMachine, TMAutoEncoder, TMCoalescedAutoEncoder,
-    TMCompositeClassifier, TMRegressor, TsetlinMachine,
+    TMCompositeClassifier, TMRegressor, TMSparseClassifier, TsetlinMachine,
 };
 pub use rng::Rng;
 #[cfg(feature = "serde")]

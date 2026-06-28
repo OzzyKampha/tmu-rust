@@ -15,6 +15,7 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | `TMCoalescedAutoEncoder` | ✅ Ported | Coalesced variant: shared clause bank + signed per-output weights |
 | `TMCompositeClassifier` | ✅ Ported | Ensemble of `TsetlinMachine` models; class scores summed at inference |
 | Convolutional TM | ✅ Ported | 1-D receptive-field clauses; weight tying across patch positions |
+| `ClauseBankSparse` / `TMSparseClassifier` | ✅ Ported | Per-clause included/excluded index lists with **absorbing actions** (literals removed at the exclude floor); vanilla-only, scalar, no Type III / parallel / AVX2 in v1 |
 
 ---
 
@@ -125,6 +126,33 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 
 ---
 
+## TMSparseClassifier features
+
+Sparse clause bank with absorbing actions: each clause stores included / excluded
+literal **index lists** instead of a dense per-literal counter array, and literals
+that reach the absorbing exclude floor are permanently removed from the pool.
+
+| Feature | Status | Notes |
+|---|---|---|
+| Per-clause index lists | ✅ | `included` / `excluded` / `unallocated` indices + parallel state arrays |
+| Absorbing exclude (removal) | ✅ | Excluded literal at state 0 is swap-removed into `unallocated`, never revisited |
+| Absorbing include (lock) | ✅ | Included literal at `max_state` is immune to decrement |
+| Weighted clauses | ✅ | Integer weights per clause, >= 1; max weight = threshold |
+| Type Ia / Ib feedback | ✅ | Promote excluded→included at `half`, demote included→excluded below `half` |
+| Type II feedback | ✅ | Excluded-only increments on fired negative-class clauses |
+| Boost true positives | ✅ | `boost_true_positive` option |
+| Clause / literal dropout | ✅ | `clause_drop_p`, `literal_drop_p` builders |
+| Max included literals | ✅ | `max_included_literals` Type Ia growth guard |
+| Configurable TA state bits | ✅ | 2–8 bits per counter (same `half` / `max_state` as dense) |
+| Clause rule extraction | ✅ | `clause_rule()`, `clause_is_positive()` |
+| Absorbing introspection | ✅ | `absorbed_include_fraction()`, `absorbed_exclude_fraction()` (latter = removed fraction) |
+| Save / load | ✅ | `serde` feature; file tag `TAG_SPARSE = 9` |
+| Type III feedback | ❌ Not in v1 | Indicator array conflicts with literal removal |
+| Multi-threaded training | ❌ Not in v1 | Variable-length lists don't fit the `par_chunks_mut` pattern; scalar only |
+| AVX2 SIMD | ❌ Not applicable | List-based, not flat-array bit-parallel |
+
+---
+
 ## Examples (TMU demo ports)
 
 | TMU demo | Rust example | Status | Notes |
@@ -140,6 +168,8 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | `IMDbTextCategorizationDemo` | `imdb` | ✅ Validated | 2000 clauses, T=80, s=10.0 |
 | Convolutional demo | `convolutional` | ✅ Ported | 4 features, kernel=2, stride=1 (3 patches); learns XOR of features 0,1 despite 2 noisy patches; ~77% test accuracy |
 | Composite demo | `composite` | ✅ Ported | 3×20-clause ensemble vs 60-clause single model on 4-class XOR |
+| Sparse demo | `sparse` | ✅ Validated | 12-feature noisy XOR; 100% test accuracy, absorbing fraction climbs as irrelevant literals are dropped |
+| *(extra)* Dense vs sparse | `sparse_vs_dense` | ✅ Complete | Head-to-head accuracy / memory / throughput; at high feature counts sparse reaches ~2.4× smaller memory at near-parity accuracy |
 | Regression demo | `regression` | ✅ Ported | Continuous target (count function scaled to `[0, T]`); MAE + RMSE metrics |
 | Autoencoder demos | `autoencoder`, `coalesced_autoencoder` | ✅ Ported | `TMAutoEncoder` (vanilla) + `TMCoalescedAutoEncoder` (shared-bank) |
 | Coalesced demo | `coalesced` | ✅ Validated | 4-class shared-bank demo; 100% accuracy |

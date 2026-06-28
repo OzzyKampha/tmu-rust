@@ -51,6 +51,14 @@ name = "coalesced"         # TMU TMCoalescedClassifier demo
 path = "examples/coalesced.rs"
 
 [[example]]
+name = "sparse"            # TMSparseClassifier: absorbing actions on noisy XOR
+path = "examples/sparse.rs"
+
+[[example]]
+name = "sparse_vs_dense"   # dense vs sparse head-to-head (accuracy / memory / speed)
+path = "examples/sparse_vs_dense.rs"
+
+[[example]]
 name = "breast_cancer"     # TMU BreastCancerDemo
 path = "examples/breast_cancer.rs"
 

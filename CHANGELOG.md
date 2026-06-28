@@ -4,6 +4,25 @@ All notable changes to tmu-rs are documented here.
 
 ---
 
+## [Unreleased]
+
+### Added
+- **TMSparseClassifier** — sparse clause bank with **absorbing actions** (port of
+  TMU's `ClauseBankSparse`). Each clause stores included / excluded literal index
+  lists instead of a dense per-literal counter array; literals that reach the
+  absorbing exclude floor are permanently removed from the candidate pool, so
+  memory and per-clause evaluation scale with the number of *active* literals.
+  Vanilla-classifier API parity (weighted clauses, Type I/II feedback, dropout,
+  `max_included_literals`, class weights, interpretability, save/load with
+  `TAG_SPARSE = 9`). Type III feedback, Rayon parallelism, and AVX2 are not part
+  of this first cut.
+- **`examples/sparse.rs`** — noisy-XOR demo showing absorbing literal removal.
+- **`examples/sparse_vs_dense.rs`** — dense vs sparse head-to-head (accuracy,
+  memory footprint, train/inference time); see the "Dense vs Sparse" section in
+  `BENCHMARKS.md`.
+
+---
+
 ## [1.0.0] — 2026-06-25
 
 ### Added

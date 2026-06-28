@@ -2,7 +2,7 @@
 
 A Rust port of the [cair/tmu](https://github.com/cair/tmu) Tsetlin Machine library.
 
-Implements five Tsetlin Machine variants — multiclass classifier, regressor, convolutional (1-D and 2-D), autoencoder, and composite classifier — with bit-packed clause banks, bit-parallel training, optional Rayon multi-threading, and a fast type-safe booleanizer.
+Implements the core Tsetlin Machine variants — multiclass classifier, coalesced classifier, regressor, convolutional (1-D and 2-D), autoencoder, composite classifier, and a sparse classifier with absorbing actions — with bit-packed clause banks, bit-parallel training, optional Rayon multi-threading, and a fast type-safe booleanizer.
 
 For a full breakdown of what has been ported and what is missing, see [PORTING_STATUS.md](PORTING_STATUS.md). For a Python vs Rust throughput and accuracy comparison, see [BENCHMARKS.md](BENCHMARKS.md).
 
@@ -55,6 +55,7 @@ let accuracy = tm.accuracy(&test_x, &test_y);
   - `ConvolutionalTsetlinMachine` — 1-D and 2-D sliding-window clause banks (weight-tied patches)
   - `TMCompositeClassifier` — ensemble of per-class Tsetlin Machines with independent clause banks
   - `TMAutoEncoder` — binary reconstruction via positive-only clause banks
+  - `TMSparseClassifier` — sparse clause bank with **absorbing actions**: literals are permanently dropped from each clause as training converges, so memory and per-clause evaluation scale with the number of *active* literals (a big win in high-dimensional, sparsely-relevant feature spaces)
 - Optional multi-threaded training via [Rayon](https://github.com/rayon-rs/rayon) (`--features parallel`)
 - AVX2 fast paths for clause update loops with runtime dispatch — u8 TA counters processed 32-wide (4× smaller working set vs u32; scalar fallback on non-AVX2 targets)
 - Type-safe `Encoder` for binary, numeric (quantile booleanization), and categorical inputs
@@ -106,6 +107,7 @@ The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) demos with 
 | `NoisyXORDemo` | `noisy_xor` | — | `cargo run --release --example noisy_xor` |
 | `InterpretabilityDemo` | `interpretability` | — | `cargo run --release --example interpretability` |
 | `TMCoalescedClassifier` | `coalesced` | — | `cargo run --release --example coalesced` |
+| `TMSparseClassifier` | `sparse` | — | `cargo run --release --example sparse` |
 | `BreastCancerDemo` | `breast_cancer` | scikit-learn | see [Data preparation](#data-preparation) |
 | `MNISTDemo` / `MNISTDemoWeightedClauses` | `mnist` | MNIST | see [Data preparation](#data-preparation) |
 | `IMDbTextCategorizationDemo` | `imdb` | Keras IMDb | see [Data preparation](#data-preparation) |
@@ -125,6 +127,7 @@ The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) demos with 
 
 | Example | Description |
 |---|---|
+| `sparse_vs_dense` | Dense vs sparse head-to-head: accuracy parity, memory footprint, train/inference time |
 | `save_load` | Train → save → load → predict/resume round-trip |
 | `ndr_flows` | Synthetic network-flow detection (booleanizer + rule extraction) |
 | `sysmon` / `sysmon_windows` / `sysmon_mordor` | Sysmon event classification |
