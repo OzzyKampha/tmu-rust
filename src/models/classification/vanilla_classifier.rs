@@ -6,7 +6,8 @@
 use crate::clause_bank::dense::PARALLEL_MIN;
 use crate::clause_bank::dense::{
     bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, rebuild_include,
-    type_i_update_bytes, type_ii_update_bytes, words_for, GOLDEN, MASK_BITS, WORD_BITS,
+    type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for, GOLDEN, MASK_BITS,
+    WORD_BITS,
 };
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
@@ -65,6 +66,16 @@ pub struct TsetlinMachine {
     /// `class_weights[c]` multiplies the feedback probability for class `c`.
     /// Defaults to `1.0` for all classes (no reweighting).
     class_weights: Vec<f64>,
+
+    /// Indicator TA states for Type III feedback (same layout as `ta`).
+    /// Zero-initialised; only meaningful when `type_iii` is `true`.
+    ind: Vec<u8>,
+    /// `clause_and_target` bitsets for Type III feedback (same layout as `include`).
+    cat: Vec<u64>,
+    /// Type III strength: indicator is incremented with probability `1 − 1/d`.
+    d: f64,
+    /// Whether Type III feedback is active during training.
+    type_iii: bool,
 }
 
 #[cfg(feature = "serde")]
@@ -269,6 +280,10 @@ impl TsetlinMachine {
             literals: vec![0u64; words],
             rng,
             class_weights: vec![1.0f64; n_classes],
+            ind: vec![half; n_clauses * n_literals],
+            cat: vec![0u64; n_clauses * words],
+            d: 200.0,
+            type_iii: false,
         }
     }
 
@@ -322,6 +337,22 @@ impl TsetlinMachine {
             "all class weights must be positive"
         );
         self.class_weights = weights;
+        self
+    }
+
+    /// Enable Type III feedback with strength parameter `d` (default: disabled).
+    ///
+    /// Type III feedback maintains a per-literal *indicator state* alongside the primary TA state.
+    /// Each literal accrues indicator credit when it is causally relevant to the target class;
+    /// literals whose indicator state stays below the threshold are gradually excluded from
+    /// clauses, producing smaller and more interpretable rules.
+    ///
+    /// Mirrors Python TMU's `type_iii_feedback=True` with the `d` parameter.
+    /// `d` must be `> 1.0`; typical range is 100–500.
+    pub fn type_iii_feedback(mut self, d: f64) -> Self {
+        assert!(d > 1.0, "d must be > 1.0");
+        self.d = d;
+        self.type_iii = true;
         self
     }
 
@@ -472,7 +503,7 @@ impl TsetlinMachine {
         sum.clamp(-self.threshold, self.threshold)
     }
 
-    /// Apply Type I / II feedback to all clauses of class `c`.
+    /// Apply Type I / II feedback (and optionally Type III) to all clauses of class `c`.
     ///
     /// `target` is 1 for the true class and 0 for the sampled negative class.
     /// `sum` is the pre-computed clamped clause sum from `class_sum_train`.
@@ -498,6 +529,10 @@ impl TsetlinMachine {
         let half = self.half;
         let max_state = self.max_state;
         let cw = self.class_weights[c];
+        // Capture Type III config before the struct destructure.
+        let type_iii_en = self.type_iii;
+        let d_val = self.d;
+        let target_bool = target != 0;
 
         let Self {
             ta,
@@ -509,6 +544,8 @@ impl TsetlinMachine {
             valid,
             dig_inv,
             dig_keep,
+            ind,
+            cat,
             ..
         } = self;
         let lit = literals.as_slice();
@@ -539,23 +576,51 @@ impl TsetlinMachine {
         let class_inc = &mut include[c * cps * words..(c + 1) * cps * words];
         let class_w = &mut weights[c * cps..(c + 1) * cps];
         let class_rng = &mut rngs[c * cps..(c + 1) * cps];
+        let class_ind = &mut ind[c * cps * n_literals..(c + 1) * cps * n_literals];
+        let class_cat = &mut cat[c * cps * words..(c + 1) * cps * words];
 
         #[cfg(feature = "parallel")]
         if cps >= PARALLEL_MIN {
             use rayon::prelude::*;
-            class_ta
-                .par_chunks_mut(n_literals)
-                .zip(class_inc.par_chunks_mut(words))
-                .zip(class_w.par_iter_mut())
-                .zip(class_rng.par_iter_mut())
-                .enumerate()
-                .for_each(|(j, (((ta_c, inc_c), w), rng))| {
-                    apply_one_clause(
-                        j, ta_c, inc_c, w, rng, target, p, &drop_mask, lit, val, lit_active, words,
-                        lit_b, &inv_b, &keep_b, active_b, n_literals, boost, wmax, max_inc, half,
-                        max_state,
-                    );
-                });
+            if type_iii_en {
+                class_ta
+                    .par_chunks_mut(n_literals)
+                    .zip(class_inc.par_chunks_mut(words))
+                    .zip(class_w.par_iter_mut())
+                    .zip(class_rng.par_iter_mut())
+                    .zip(class_ind.par_chunks_mut(n_literals))
+                    .zip(class_cat.par_chunks_mut(words))
+                    .enumerate()
+                    .for_each(|(j, (((((ta_c, inc_c), w), rng), ind_c), cat_c))| {
+                        apply_one_clause(
+                            j, ta_c, inc_c, w, rng, target, p, &drop_mask, lit, val, lit_active,
+                            words, lit_b, &inv_b, &keep_b, active_b, n_literals, boost, wmax,
+                            max_inc, half, max_state,
+                        );
+                        if drop_mask.is_empty() || !drop_mask[j] {
+                            if type_iii_update(
+                                ta_c, ind_c, cat_c, inc_c, lit, val, lit_active, words, n_literals,
+                                d_val, p, target_bool, rng, half, max_state,
+                            ) {
+                                rebuild_include(ta_c, inc_c, val, words, n_literals, half);
+                            }
+                        }
+                    });
+            } else {
+                class_ta
+                    .par_chunks_mut(n_literals)
+                    .zip(class_inc.par_chunks_mut(words))
+                    .zip(class_w.par_iter_mut())
+                    .zip(class_rng.par_iter_mut())
+                    .enumerate()
+                    .for_each(|(j, (((ta_c, inc_c), w), rng))| {
+                        apply_one_clause(
+                            j, ta_c, inc_c, w, rng, target, p, &drop_mask, lit, val, lit_active,
+                            words, lit_b, &inv_b, &keep_b, active_b, n_literals, boost, wmax,
+                            max_inc, half, max_state,
+                        );
+                    });
+            }
             return;
         }
 
@@ -584,6 +649,34 @@ impl TsetlinMachine {
                 half,
                 max_state,
             );
+            if type_iii_en && (drop_mask.is_empty() || !drop_mask[j]) {
+                if type_iii_update(
+                    &mut class_ta[j * n_literals..(j + 1) * n_literals],
+                    &mut class_ind[j * n_literals..(j + 1) * n_literals],
+                    &mut class_cat[j * words..(j + 1) * words],
+                    &class_inc[j * words..(j + 1) * words],
+                    lit,
+                    val,
+                    lit_active,
+                    words,
+                    n_literals,
+                    d_val,
+                    p,
+                    target_bool,
+                    &mut class_rng[j],
+                    half,
+                    max_state,
+                ) {
+                    rebuild_include(
+                        &class_ta[j * n_literals..(j + 1) * n_literals],
+                        &mut class_inc[j * words..(j + 1) * words],
+                        val,
+                        words,
+                        n_literals,
+                        half,
+                    );
+                }
+            }
         }
     }
 
@@ -1881,5 +1974,57 @@ mod tests {
         let mut buf = Vec::new();
         serial::write_header(&mut buf, serial::TAG_COALESCED).unwrap();
         assert!(TsetlinMachine::read_from(&mut buf.as_slice()).is_err());
+    }
+
+    // --- Type III feedback integration tests ---
+
+    #[test]
+    fn type_iii_constructs_without_panic() {
+        let _tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42)
+            .type_iii_feedback(200.0);
+    }
+
+    #[test]
+    fn type_iii_d_must_be_greater_than_one() {
+        let result = std::panic::catch_unwind(|| {
+            TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42).type_iii_feedback(0.5)
+        });
+        assert!(result.is_err(), "expected panic for d <= 1.0");
+    }
+
+    #[test]
+    fn type_iii_trains_without_panic() {
+        let (xtr, ytr) = make_xor(200, 0.0, 7);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let mut tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42)
+            .type_iii_feedback(200.0);
+        for _ in 0..5 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+    }
+
+    #[test]
+    fn type_iii_learns_xor() {
+        let (xtr, ytr) = make_xor(1000, 0.0, 9);
+        let (xte, yte) = make_xor(500, 0.0, 10);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let bte = e.encode_batch(&as_slices(&xte));
+        let mut tm = TsetlinMachine::with_config(2, 12, 20, 10, 3.0, 8, true, 42)
+            .type_iii_feedback(200.0);
+        for _ in 0..20 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+        let acc = tm.accuracy(&bte, &yte);
+        assert!(acc > 0.70, "Type III XOR accuracy too low: {acc:.3}");
+    }
+
+    #[test]
+    fn type_iii_ind_and_cat_same_size_as_ta_and_include() {
+        let tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42)
+            .type_iii_feedback(100.0);
+        assert_eq!(tm.ind.len(), tm.ta.len());
+        assert_eq!(tm.cat.len(), tm.include.len());
     }
 }

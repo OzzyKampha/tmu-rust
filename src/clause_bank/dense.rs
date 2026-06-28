@@ -714,6 +714,127 @@ pub(crate) fn clause_type_ii_bytes(
     rebuild_include(ta, inc, valid, words, n_literals, half);
 }
 
+/// Return the index of the first literal that is included, active, valid, and absent from sample.
+///
+/// Used by [`type_iii_update`] to locate the single blocking literal for `clause_and_target`
+/// toggling when the clause does not fire.  Returns `None` if no such literal exists (clause fires).
+#[inline]
+pub(crate) fn first_false_literal(
+    inc: &[u64],
+    lit: &[u64],
+    valid: &[u64],
+    lit_active: &[u64],
+    words: usize,
+) -> Option<usize> {
+    for k in 0..words {
+        let blocking = inc[k] & valid[k] & lit_active[k] & !lit[k];
+        if blocking != 0 {
+            return Some(k * WORD_BITS + blocking.trailing_zeros() as usize);
+        }
+    }
+    None
+}
+
+/// Apply Type III TA feedback to one clause — mirrors TMU's `cb_type_iii_feedback`.
+///
+/// Maintains a per-literal *indicator state* (`ind`, 8-bit) alongside the primary TA state.
+/// Literals confirmed relevant to the target accumulate indicator credit; those whose indicator
+/// state stays below `half_ind` have their primary TA counter decremented, gradually excluding
+/// them from the clause and producing smaller, more interpretable rules.
+///
+/// Returns `true` when the primary TA state was modified; the caller must then call
+/// [`rebuild_include`].
+///
+/// # Algorithm
+///
+/// **Clause fires:**
+/// - If `target` and random ≤ 1 − 1/d: increment `ind[l]` (saturating at `max_ind`) for
+///   each active literal present in the sample that is also in `cat`.
+/// - Decrement `ind[l]` (saturating at 0) for each active present literal **not** in `cat`.
+/// - Invert `cat`: if `target`, `cat ← ~cat & valid`; otherwise `cat ← valid` (all set).
+///
+/// **Clause does not fire:**
+/// - Find the first blocking literal (included, active, valid, absent from sample).
+/// - If its bit in `cat` is 0, set it; if it is 1 and `target`, clear it.
+///
+/// **TA decrement (probabilistic):**
+/// - With probability `update_p`, decrement `ta[l]` for each active literal with
+///   `ind[l] < half_ind`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn type_iii_update(
+    ta: &mut [u8],
+    ind: &mut [u8],
+    cat: &mut [u64],
+    inc: &[u64],
+    lit: &[u64],
+    valid: &[u64],
+    lit_active: &[u64],
+    words: usize,
+    n_literals: usize,
+    d: f64,
+    update_p: f64,
+    target: bool,
+    rng: &mut Rng,
+    half_ind: u8,
+    max_ind: u8,
+) -> bool {
+    let fires = clause_fire(inc, lit, valid, words, lit_active);
+
+    if fires {
+        if target && rng.next_f64() <= 1.0 - 1.0 / d {
+            for k in 0..words {
+                let base = k * WORD_BITS;
+                let limit = (n_literals - base).min(WORD_BITS);
+                let mut mask = lit_active[k] & cat[k] & lit[k];
+                while mask != 0 {
+                    let bit = mask.trailing_zeros() as usize;
+                    if bit < limit {
+                        ind[base + bit] = ind[base + bit].saturating_add(1).min(max_ind);
+                    }
+                    mask &= mask - 1;
+                }
+            }
+        }
+
+        for k in 0..words {
+            let base = k * WORD_BITS;
+            let limit = (n_literals - base).min(WORD_BITS);
+            let mut mask = lit_active[k] & !cat[k] & lit[k] & valid[k];
+            while mask != 0 {
+                let bit = mask.trailing_zeros() as usize;
+                if bit < limit {
+                    ind[base + bit] = ind[base + bit].saturating_sub(1);
+                }
+                mask &= mask - 1;
+            }
+        }
+
+        for k in 0..words {
+            cat[k] = if target { !cat[k] & valid[k] } else { valid[k] };
+        }
+    } else if let Some(off) = first_false_literal(inc, lit, valid, lit_active, words) {
+        let chunk = off / WORD_BITS;
+        let pos = off % WORD_BITS;
+        if (cat[chunk] >> pos) & 1 == 0 {
+            cat[chunk] |= 1u64 << pos;
+        } else if target {
+            cat[chunk] &= !(1u64 << pos);
+        }
+    }
+
+    if rng.next_f64() <= update_p {
+        for l in 0..n_literals {
+            if (lit_active[l / WORD_BITS] >> (l % WORD_BITS)) & 1 == 1 && ind[l] < half_ind {
+                ta[l] = ta[l].saturating_sub(1);
+            }
+        }
+        return true;
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -908,5 +1029,155 @@ mod tests {
         assert_eq!(ta[2], half, "included (ta≥half) → unchanged");
         assert_eq!(ta[3], 0, "ta=0 (absorbing exclude) → stays at 0");
         assert_eq!(ta[4], half, "absent excluded non-zero incremented to half");
+    }
+
+    // ---- first_false_literal ------------------------------------------------
+
+    #[test]
+    fn first_false_literal_returns_none_when_fires() {
+        // Clause fires when all included, active literals are present.
+        // Bit 0 included, bit 0 present → fires → None.
+        let words = 1usize;
+        let inc = vec![0b0001u64];
+        let lit = vec![0b0111u64]; // bit 0 present
+        let valid = vec![0xFu64];
+        let lit_active = vec![!0u64];
+        assert_eq!(first_false_literal(&inc, &lit, &valid, &lit_active, words), None);
+    }
+
+    #[test]
+    fn first_false_literal_finds_blocking_literal() {
+        // Bits 0 and 2 included; bit 0 present but bit 2 absent → literal 2 blocks.
+        let words = 1usize;
+        let inc = vec![0b0101u64];
+        let lit = vec![0b0001u64];
+        let valid = vec![0xFu64];
+        let lit_active = vec![!0u64];
+        assert_eq!(
+            first_false_literal(&inc, &lit, &valid, &lit_active, words),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn first_false_literal_respects_lit_active() {
+        // Bit 2 included and absent, but inactive (dropped) → not the blocker.
+        // No active blocking literal → None.
+        let words = 1usize;
+        let inc = vec![0b0101u64];
+        let lit = vec![0b0001u64];
+        let valid = vec![0xFu64];
+        let lit_active = vec![0b0001u64]; // only bit 0 active; bit 2 inactive
+        assert_eq!(first_false_literal(&inc, &lit, &valid, &lit_active, words), None);
+    }
+
+    // ---- type_iii_update ----------------------------------------------------
+
+    #[test]
+    fn type_iii_update_inverts_cat_on_target_fire() {
+        // Empty clause fires; target=true → cat should be inverted to all-valid.
+        let words = 1usize;
+        let n_literals = 4usize;
+        let valid = vec![0xFu64];
+        let mut ta = vec![0u8; n_literals];
+        let mut ind = vec![0u8; n_literals];
+        let mut cat = vec![0u64; words]; // cat starts all-zero
+        let inc = vec![0u64; words];     // empty clause always fires
+        let lit = vec![0b0011u64];       // bits 0 and 1 present
+        let lit_active = vec![!0u64];
+        let mut rng = crate::rng::Rng::new(42);
+
+        type_iii_update(
+            &mut ta, &mut ind, &mut cat, &inc,
+            &lit, &valid, &lit_active,
+            words, n_literals,
+            200.0, 0.0, // update_p=0: TA decrement never fires
+            true, &mut rng, 128, 255,
+        );
+
+        // cat was 0; target=true → cat = ~0 & 0xF = 0xF
+        assert_eq!(cat[0] & 0xF, 0xF, "cat should be bitwise-NOT of original (all-valid)");
+    }
+
+    #[test]
+    fn type_iii_update_sets_cat_to_valid_on_non_target_fire() {
+        // Empty clause fires; target=false → cat should become all-valid (0xF).
+        let words = 1usize;
+        let n_literals = 4usize;
+        let valid = vec![0xFu64];
+        let mut ta = vec![0u8; n_literals];
+        let mut ind = vec![0u8; n_literals];
+        let mut cat = vec![0b0011u64]; // cat has bits 0 and 1 set
+        let inc = vec![0u64; words];
+        let lit = vec![0b0011u64];
+        let lit_active = vec![!0u64];
+        let mut rng = crate::rng::Rng::new(42);
+
+        type_iii_update(
+            &mut ta, &mut ind, &mut cat, &inc,
+            &lit, &valid, &lit_active,
+            words, n_literals,
+            200.0, 0.0, false, &mut rng, 128, 255,
+        );
+
+        // non-target fire → cat = valid = 0xF
+        assert_eq!(cat[0] & 0xF, 0xF);
+    }
+
+    #[test]
+    fn type_iii_update_toggles_cat_on_non_fire() {
+        // Clause includes bit 0 but bit 0 is absent → clause does not fire.
+        // cat bit 0 is 0 → it should be set to 1.
+        let words = 1usize;
+        let n_literals = 4usize;
+        let valid = vec![0xFu64];
+        let mut ta = vec![128u8; n_literals]; // all included (ta >= half)
+        let mut ind = vec![0u8; n_literals];
+        let mut cat = vec![0u64; words]; // cat starts all-zero
+        let mut inc = vec![0u64; words];
+        rebuild_include(&ta, &mut inc, &valid, words, n_literals, 128);
+
+        let lit = vec![0b0000u64]; // bit 0 absent → clause fails
+        let lit_active = vec![!0u64];
+        let mut rng = crate::rng::Rng::new(42);
+
+        type_iii_update(
+            &mut ta, &mut ind, &mut cat, &inc,
+            &lit, &valid, &lit_active,
+            words, n_literals,
+            200.0, 0.0, true, &mut rng, 128, 255,
+        );
+
+        // bit 0 was blocking and cat[0] was 0 → cat bit 0 should be set
+        assert_eq!((cat[0]) & 1, 1, "blocking literal cat bit should be set");
+    }
+
+    #[test]
+    fn type_iii_update_ta_decrement_removes_low_ind_literals() {
+        // When update_p=1, TA is decremented for literals with ind < half_ind.
+        let words = 1usize;
+        let n_literals = 2usize;
+        let valid = vec![0x3u64];
+        // Start ta above 0 so decrement is visible
+        let mut ta = vec![5u8, 5u8];
+        // ind[0] is high (above half_ind=4) → protected; ind[1] is low → decremented
+        let mut ind = vec![6u8, 2u8];
+        let mut cat = vec![0u64; words];
+        let inc = vec![0u64; words]; // empty clause, fires
+        let lit = vec![0u64]; // nothing present
+        let lit_active = vec![!0u64];
+        let mut rng = crate::rng::Rng::new(0);
+
+        let changed = type_iii_update(
+            &mut ta, &mut ind, &mut cat, &inc,
+            &lit, &valid, &lit_active,
+            words, n_literals,
+            200.0, 1.0, // update_p=1: always decrement
+            false, &mut rng, 4, 7,
+        );
+
+        assert!(changed, "TA state should have been modified");
+        assert_eq!(ta[0], 5, "ind[0] >= half_ind → ta[0] unchanged");
+        assert_eq!(ta[1], 4, "ind[1] < half_ind → ta[1] decremented");
     }
 }
