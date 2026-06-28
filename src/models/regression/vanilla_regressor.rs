@@ -6,7 +6,8 @@
 use crate::clause_bank::dense::PARALLEL_MIN;
 use crate::clause_bank::dense::{
     bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, rebuild_include,
-    type_i_update_bytes, type_ii_update_bytes, words_for, GOLDEN, MASK_BITS, WORD_BITS,
+    type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for, GOLDEN, MASK_BITS,
+    WORD_BITS,
 };
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
@@ -55,6 +56,11 @@ pub struct TMRegressor {
     valid: Vec<u64>,
     dig_inv: Vec<u8>,
     dig_keep: Vec<u8>,
+
+    ind: Vec<u8>,
+    cat: Vec<u64>,
+    d: f64,
+    type_iii: bool,
 
     rng: Rng,
 }
@@ -223,6 +229,10 @@ impl TMRegressor {
             valid,
             dig_inv: digits_of(1.0 / s, MASK_BITS),
             dig_keep: digits_of((s - 1.0) / s, MASK_BITS),
+            ind: vec![half; n_clauses * n_literals],
+            cat: vec![0u64; n_clauses * words],
+            d: 200.0,
+            type_iii: false,
             rng,
         }
     }
@@ -246,6 +256,18 @@ impl TMRegressor {
         assert!((0.0..1.0).contains(&p), "literal_drop_p must be in [0, 1)");
         self.literal_drop_p = p;
         self.dig_lit_active = digits_of(1.0 - p, MASK_BITS);
+        self
+    }
+
+    /// Enable Type III feedback with indicator strength `d` (must be > 1.0).
+    ///
+    /// Type III prunes spurious literals by tracking per-literal causal relevance
+    /// via an indicator state.  Literals whose indicator falls below the threshold
+    /// are excluded from the clause.  Larger `d` applies stronger exclusion pressure.
+    pub fn type_iii_feedback(mut self, d: f64) -> Self {
+        assert!(d > 1.0, "d must be > 1.0");
+        self.d = d;
+        self.type_iii = true;
         self
     }
 
@@ -342,6 +364,9 @@ impl TMRegressor {
         let half = self.half;
         let max_state = self.max_state;
         let drop_p = self.clause_drop_p;
+        let type_iii_en = self.type_iii;
+        let d_val = self.d;
+        let target_bool = push_up;
 
         let Self {
             ta,
@@ -352,6 +377,8 @@ impl TMRegressor {
             dig_inv,
             dig_keep,
             rng,
+            ind,
+            cat,
             ..
         } = self;
 
@@ -371,37 +398,43 @@ impl TMRegressor {
         #[cfg(feature = "parallel")]
         if n_clauses >= PARALLEL_MIN {
             use rayon::prelude::*;
-            ta.par_chunks_mut(n_literals)
-                .zip(include.par_chunks_mut(words))
-                .zip(weights.par_iter_mut())
-                .zip(rngs.par_iter_mut())
-                .enumerate()
-                .for_each(|(j, (((ta_j, inc_j), w), rng_j))| {
-                    apply_one_clause(
-                        j,
-                        ta_j,
-                        inc_j,
-                        w,
-                        rng_j,
-                        push_up,
-                        update_p,
-                        &drop_mask,
-                        lit,
-                        val,
-                        &lit_active,
-                        words,
-                        &lit_b,
-                        &inv_b,
-                        &keep_b,
-                        &active_b,
-                        n_literals,
-                        boost,
-                        wmax,
-                        max_inc,
-                        half,
-                        max_state,
-                    );
-                });
+            if type_iii_en {
+                ta.par_chunks_mut(n_literals)
+                    .zip(include.par_chunks_mut(words))
+                    .zip(weights.par_iter_mut())
+                    .zip(rngs.par_iter_mut())
+                    .zip(ind.par_chunks_mut(n_literals))
+                    .zip(cat.par_chunks_mut(words))
+                    .enumerate()
+                    .for_each(|(j, (((((ta_j, inc_j), w), rng_j), ind_j), cat_j))| {
+                        apply_one_clause(
+                            j, ta_j, inc_j, w, rng_j, push_up, update_p, &drop_mask, lit, val,
+                            &lit_active, words, &lit_b, &inv_b, &keep_b, &active_b, n_literals,
+                            boost, wmax, max_inc, half, max_state,
+                        );
+                        if drop_mask.is_empty() || !drop_mask[j] {
+                            if type_iii_update(
+                                ta_j, ind_j, cat_j, inc_j, lit, val, &lit_active, words,
+                                n_literals, d_val, update_p, target_bool, rng_j, half, max_state,
+                            ) {
+                                rebuild_include(ta_j, inc_j, val, words, n_literals, half);
+                            }
+                        }
+                    });
+            } else {
+                ta.par_chunks_mut(n_literals)
+                    .zip(include.par_chunks_mut(words))
+                    .zip(weights.par_iter_mut())
+                    .zip(rngs.par_iter_mut())
+                    .enumerate()
+                    .for_each(|(j, (((ta_j, inc_j), w), rng_j))| {
+                        apply_one_clause(
+                            j, ta_j, inc_j, w, rng_j, push_up, update_p, &drop_mask, lit, val,
+                            &lit_active, words, &lit_b, &inv_b, &keep_b, &active_b, n_literals,
+                            boost, wmax, max_inc, half, max_state,
+                        );
+                    });
+            }
             return;
         }
 
@@ -430,6 +463,34 @@ impl TMRegressor {
                 half,
                 max_state,
             );
+            if type_iii_en && (drop_mask.is_empty() || !drop_mask[j]) {
+                if type_iii_update(
+                    &mut ta[j * n_literals..(j + 1) * n_literals],
+                    &mut ind[j * n_literals..(j + 1) * n_literals],
+                    &mut cat[j * words..(j + 1) * words],
+                    &include[j * words..(j + 1) * words],
+                    lit,
+                    val,
+                    &lit_active,
+                    words,
+                    n_literals,
+                    d_val,
+                    update_p,
+                    target_bool,
+                    &mut rngs[j],
+                    half,
+                    max_state,
+                ) {
+                    rebuild_include(
+                        &ta[j * n_literals..(j + 1) * n_literals],
+                        &mut include[j * words..(j + 1) * words],
+                        val,
+                        words,
+                        n_literals,
+                        half,
+                    );
+                }
+            }
         }
     }
 
@@ -629,5 +690,32 @@ mod tests {
         let preds_orig = tm.predict_batch(&batch);
         let preds_loaded = loaded.predict_batch(&batch);
         assert_eq!(preds_orig, preds_loaded);
+    }
+
+    #[test]
+    fn type_iii_constructs_without_panic() {
+        let _tm = TMRegressor::with_config(10, 20, 100, 3.0, 8, true, 42)
+            .type_iii_feedback(200.0);
+    }
+
+    #[test]
+    fn type_iii_d_must_be_greater_than_one() {
+        let result = std::panic::catch_unwind(|| {
+            TMRegressor::with_config(10, 20, 100, 3.0, 8, true, 42).type_iii_feedback(0.5)
+        });
+        assert!(result.is_err(), "expected panic for d <= 1.0");
+    }
+
+    #[test]
+    fn type_iii_trains_without_panic() {
+        let (xs, ys) = make_count_dataset(300, 10, 100, 7);
+        let enc = Encoder::for_binary(10);
+        let rows: Vec<&[u8]> = xs.iter().map(|v| v.as_slice()).collect();
+        let batch = enc.encode_batch(&rows);
+        let mut tm = TMRegressor::with_config(10, 40, 100, 3.0, 8, true, 42)
+            .type_iii_feedback(200.0);
+        for _ in 0..5 {
+            tm.fit_epoch(&batch, &ys);
+        }
     }
 }

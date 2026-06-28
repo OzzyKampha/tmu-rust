@@ -124,6 +124,10 @@ path = "examples/composite.rs"
 name = "mordor_autoencoder"   # TMAutoEncoder + TMCoalescedAutoEncoder: unsupervised anomaly detection on Mordor Sysmon events
 path = "examples/mordor_autoencoder.rs"
 
+[[example]]
+name = "type_iii_demo"        # Type III feedback: clause sparsity demo vs baseline
+path = "examples/type_iii_demo.rs"
+
 [[bench]]
 name = "throughput"
 path = "benches/throughput.rs"
