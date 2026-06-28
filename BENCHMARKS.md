@@ -379,10 +379,32 @@ s=3.9, `max_included=8`, single-threaded release build):
 - **Memory crossover** happens around ~78% absorption: below it, dense's 1-byte
   bit-packed counters beat the sparse 5-byte-per-literal index storage; above it,
   sparse pulls ahead (2.4× smaller at 128 features / 90% absorbed).
-- **Sparse is slower** here — it is scalar with no SIMD / Rayon, where dense uses
-  AVX2 and (optionally) Rayon. Its advantage is memory and asymptotic per-clause
-  evaluation cost in high-dimensional, sparsely-relevant problems, not raw speed
-  at small scale.
+- **Sparse single-thread is slower** than dense at these sizes — dense uses AVX2 on
+  contiguous counters, while the sparse hot path is per-index bit gathers + scalar
+  RNG + list mutation. Sparse's advantage is memory and asymptotic per-clause
+  evaluation cost in high-dimensional, sparsely-relevant problems, not raw
+  single-thread speed at small scale.
+
+### Sparse parallelism (`--features parallel`)
+
+Training parallelises over clauses and inference over samples (Rayon), gated by
+`PARALLEL_MIN` like the dense model. Each clause owns disjoint state, so parallel
+training is **bit-identical** to scalar (verified by a weight/rule checksum). As
+with dense, it only pays off at **large clause counts** — at small counts the
+per-clause work is too light to amortise Rayon's per-region dispatch overhead
+(training enters a parallel region twice per sample).
+
+Sparse training, 64 features, 5000 samples, single-thread vs Rayon (4-core VM):
+
+| clauses/class | epochs | scalar | parallel | speedup |
+|---|---|---|---|---|
+| 200  | 30 | 8.8 s  | 15.9 s | **0.55× (slower)** |
+| 2000 | 6  | 20.5 s | 10.5 s | **1.9× faster** |
+
+So enable `--features parallel` for sparse only with large models; for small/medium
+clause counts the scalar build is faster. **AVX2 is not implemented for the sparse
+bank** (the gather/RNG/`swap_remove` hot path doesn't vectorise; upstream `cair/tmu`'s
+sparse C is also scalar) — see `PORTING_STATUS.md`.
 
 ---
 

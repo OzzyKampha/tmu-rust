@@ -8,9 +8,16 @@
 //!
 //! ## Differences from the dense [`TsetlinMachine`]
 //!
-//! * **Scalar, single-threaded.**  The variable-length per-clause lists don't map
-//!   onto the dense bank's flat-array SIMD / rayon `par_chunks_mut` paths, so this
-//!   model trains sequentially even with `--features parallel`.
+//! * **Rayon-parallel, but no AVX2.**  With `--features parallel`, training
+//!   parallelises over clauses (each clause owns disjoint state, so it's lock-free
+//!   and bit-identical to the scalar result) and inference parallelises over
+//!   samples — both gated by `PARALLEL_MIN` like the dense model. As with dense,
+//!   parallel training only pays off at large clause counts (≈1000+); at small
+//!   counts the per-clause work is too light to amortise Rayon's dispatch overhead.
+//!   AVX2 is deliberately **not** used: the hot path is a variable-length
+//!   excluded-list scan dominated by per-index bit gathers, scalar Bernoulli RNG
+//!   draws (kept scalar to preserve determinism), and mid-loop `swap_remove` — none
+//!   of which vectorise. Upstream `cair/tmu`'s sparse C bank is likewise scalar.
 //! * **No Type III feedback.**  Type III maintains a second per-literal indicator
 //!   array, which conflicts with the sparse bank removing literals; it is omitted.
 //! * **`absorbed_exclude_fraction` means "removed".**  In the dense model it
@@ -21,6 +28,8 @@
 //!
 //! All other public API mirrors [`TsetlinMachine`] one-to-one.
 
+#[cfg(feature = "parallel")]
+use crate::clause_bank::dense::PARALLEL_MIN;
 use crate::clause_bank::dense::{words_for, GOLDEN, WORD_BITS};
 use crate::clause_bank::sparse::SparseClauseBank;
 use crate::encoder::{EncodedBatch, EncodedSample};
@@ -288,6 +297,14 @@ impl TMSparseClassifier {
         let packed = batch.data.as_slice();
         let n = batch.len();
         let w = self.words;
+        #[cfg(feature = "parallel")]
+        if n >= PARALLEL_MIN && self.clauses_per_class >= PARALLEL_MIN {
+            use rayon::prelude::*;
+            return (0..n)
+                .into_par_iter()
+                .map(|i| self.predict_lit(&packed[i * w..(i + 1) * w]))
+                .collect();
+        }
         (0..n)
             .map(|i| self.predict_lit(&packed[i * w..(i + 1) * w]))
             .collect()
@@ -299,6 +316,15 @@ impl TMSparseClassifier {
         let packed = batch.data.as_slice();
         let n = batch.len();
         let w = self.words;
+        #[cfg(feature = "parallel")]
+        if n >= PARALLEL_MIN {
+            use rayon::prelude::*;
+            let correct: usize = (0..n)
+                .into_par_iter()
+                .filter(|&i| self.predict_lit(&packed[i * w..(i + 1) * w]) == ys[i])
+                .count();
+            return correct as f64 / n as f64;
+        }
         let correct = (0..n)
             .filter(|&i| self.predict_lit(&packed[i * w..(i + 1) * w]) == ys[i])
             .count();
@@ -359,26 +385,31 @@ impl TMSparseClassifier {
             Vec::new()
         };
 
-        for j in 0..cps {
+        let (half, max_state) = bank.dims();
+
+        // Per-clause feedback kernel, shared by the scalar and Rayon paths. `j` is
+        // the clause index within the class (determines polarity). Each clause owns
+        // disjoint state (`clause`, `w`, `rng`), so this is lock-free and produces
+        // identical results regardless of evaluation order.
+        let apply = |j: usize,
+                     clause: &mut crate::clause_bank::sparse::SparseClause,
+                     w: &mut i32,
+                     rng: &mut Rng| {
             if !drop_mask.is_empty() && drop_mask[j] {
-                continue;
+                return;
             }
-            let cj = c * cps + j;
-            let rng = &mut rngs[cj];
             if rng.next_f64() > p {
-                continue;
+                return;
             }
             let positive = j & 1 == 0;
             if (target == 1) == positive {
                 // Type I.
-                let fired = bank.fire_train(cj, lit, lit_active);
-                let under_limit = bank.n_included(cj) < max_inc;
-                let fired_under = fired && under_limit;
+                let fired = clause.fire_train(lit, lit_active);
+                let fired_under = fired && clause.n_included() < max_inc;
                 if fired_under {
-                    weights[cj] = (weights[cj] + 1).min(wmax);
+                    *w = (*w + 1).min(wmax);
                 }
-                bank.type_i(
-                    cj,
+                clause.type_i(
                     lit,
                     lit_active,
                     fired_under,
@@ -387,15 +418,37 @@ impl TMSparseClassifier {
                     inv_p,
                     keep_p,
                     max_inc,
+                    half,
+                    max_state,
                 );
             } else {
                 // Type II.
-                if !bank.fire_train(cj, lit, lit_active) {
-                    continue;
+                if !clause.fire_train(lit, lit_active) {
+                    return;
                 }
-                weights[cj] = (weights[cj] - 1).max(1);
-                bank.type_ii(cj, lit, lit_active);
+                *w = (*w - 1).max(1);
+                clause.type_ii(lit, lit_active, half, max_state);
             }
+        };
+
+        let clause_slice = &mut bank.clauses_mut()[c * cps..(c + 1) * cps];
+        let w_slice = &mut weights[c * cps..(c + 1) * cps];
+        let rng_slice = &mut rngs[c * cps..(c + 1) * cps];
+
+        #[cfg(feature = "parallel")]
+        if cps >= PARALLEL_MIN {
+            use rayon::prelude::*;
+            clause_slice
+                .par_iter_mut()
+                .zip(w_slice.par_iter_mut())
+                .zip(rng_slice.par_iter_mut())
+                .enumerate()
+                .for_each(|(j, ((clause, w), rng))| apply(j, clause, w, rng));
+            return;
+        }
+
+        for j in 0..cps {
+            apply(j, &mut clause_slice[j], &mut w_slice[j], &mut rng_slice[j]);
         }
     }
 
@@ -562,6 +615,35 @@ mod tests {
         let (tm, te, yte) = train_sparse(7, 30);
         let acc = tm.accuracy(&te, &yte);
         assert!(acc > 0.95, "sparse XOR accuracy too low: {acc}");
+    }
+
+    /// Exercises the Rayon clause-parallel path: with `clauses_per_class >=
+    /// PARALLEL_MIN` (128), a `--features parallel` build takes the `par_iter_mut`
+    /// branch in `update_class` and the parallel `predict_batch`/`accuracy`. The
+    /// scalar build runs the same logic sequentially; both must learn XOR. Because
+    /// each clause consumes only its own RNG, the result is identical across builds.
+    #[test]
+    fn parallel_path_learns_xor() {
+        let (xtr, ytr) = make_xor(4000, 0.1, 23);
+        let (xte, yte) = make_xor(2000, 0.0, 77);
+        let enc = Encoder::for_binary(N_FEATURES);
+        let tr = encode(&xtr, &enc);
+        let te = encode(&xte, &enc);
+        // 130 clauses/class > PARALLEL_MIN, so the parallel branch runs under
+        // `--features parallel`.
+        let mut tm = TMSparseClassifier::with_config(2, N_FEATURES, 130, 20, 3.9, 8, true, 23)
+            .max_included_literals(8);
+        for _ in 0..15 {
+            tm.fit_epoch(&tr, &ytr);
+        }
+        let acc = tm.accuracy(&te, &yte);
+        assert!(acc > 0.95, "parallel-path XOR accuracy too low: {acc}");
+        // predict_batch (parallel branch) must agree with per-sample predict.
+        let batch = tm.predict_batch(&te);
+        let w = tm.words;
+        for (i, &p) in batch.iter().enumerate() {
+            assert_eq!(p, tm.predict_lit(&te.data[i * w..(i + 1) * w]));
+        }
     }
 
     #[test]

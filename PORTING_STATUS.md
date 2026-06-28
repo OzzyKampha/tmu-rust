@@ -147,9 +147,10 @@ that reach the absorbing exclude floor are permanently removed from the pool.
 | Clause rule extraction | ✅ | `clause_rule()`, `clause_is_positive()` |
 | Absorbing introspection | ✅ | `absorbed_include_fraction()`, `absorbed_exclude_fraction()` (latter = removed fraction) |
 | Save / load | ✅ | `serde` feature; file tag `TAG_SPARSE = 9` |
+| Multi-threaded training | ✅ | `--features parallel` (Rayon); clause-parallel feedback over disjoint per-clause state, bit-identical to scalar. Like the dense model, pays off only at large clause counts (≈1000+) |
+| Multi-threaded inference | ✅ | `--features parallel`; `predict_batch` / `accuracy` parallelise over samples |
 | Type III feedback | ❌ Not in v1 | Indicator array conflicts with literal removal |
-| Multi-threaded training | ❌ Not in v1 | Variable-length lists don't fit the `par_chunks_mut` pattern; scalar only |
-| AVX2 SIMD | ❌ Not applicable | List-based, not flat-array bit-parallel |
+| AVX2 SIMD | ❌ Not applicable | The excluded-list scan is per-index bit gathers + scalar RNG + `swap_remove`, none of which vectorise; upstream `cair/tmu`'s sparse C bank is also scalar |
 
 ---
 

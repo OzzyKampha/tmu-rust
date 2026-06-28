@@ -14,8 +14,13 @@ All notable changes to tmu-rs are documented here.
   memory and per-clause evaluation scale with the number of *active* literals.
   Vanilla-classifier API parity (weighted clauses, Type I/II feedback, dropout,
   `max_included_literals`, class weights, interpretability, save/load with
-  `TAG_SPARSE = 9`). Type III feedback, Rayon parallelism, and AVX2 are not part
-  of this first cut.
+  `TAG_SPARSE = 9`).
+- **`TMSparseClassifier` Rayon support** — `--features parallel` parallelises
+  training over clauses (lock-free; bit-identical to scalar) and inference over
+  samples, gated by `PARALLEL_MIN` like the dense model. As with dense, parallel
+  training pays off only at large clause counts. AVX2 is intentionally not used for
+  the sparse bank (the gather/RNG/`swap_remove` hot path doesn't vectorise; upstream
+  `cair/tmu`'s sparse C is also scalar). Type III feedback remains unsupported.
 - **`examples/sparse.rs`** — noisy-XOR demo showing absorbing literal removal.
 - **`examples/sparse_vs_dense.rs`** — dense vs sparse head-to-head (accuracy,
   memory footprint, train/inference time); see the "Dense vs Sparse" section in

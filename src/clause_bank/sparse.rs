@@ -29,11 +29,13 @@
 //!
 //! ## Scope
 //!
-//! This is a scalar, single-threaded implementation consumed by
-//! [`TMSparseClassifier`](crate::models::TMSparseClassifier).  Type III feedback
-//! and rayon parallelism are intentionally not supported here (see the model
-//! docs); the variable-length per-clause lists don't fit the dense bank's
-//! flat-array SIMD / `par_chunks_mut` patterns.
+//! Consumed by [`TMSparseClassifier`](crate::models::TMSparseClassifier). Per-clause
+//! feedback lives in methods on [`SparseClause`] so the model can run the per-class
+//! clause loop in parallel (Rayon, `--features parallel`) over disjoint clause state.
+//! AVX2 is intentionally not used: the per-clause excluded-list scan is dominated by
+//! per-index bit gathers, scalar RNG draws, and `swap_remove` mutation, which don't
+//! vectorise (upstream `cair/tmu`'s sparse C bank is also scalar). Type III feedback
+//! is likewise unsupported here (its indicator array conflicts with literal removal).
 
 use crate::clause_bank::dense::WORD_BITS;
 use crate::rng::Rng;
@@ -94,6 +96,149 @@ fn lit_active(lit_active: &[u64], l: u32) -> bool {
     (lit_active[l / WORD_BITS] >> (l % WORD_BITS)) & 1 != 0
 }
 
+impl SparseClause {
+    /// Predict-semantics fire check: an **empty** clause returns `false`.
+    #[inline]
+    fn fire_predict(&self, lit: &[u64]) -> bool {
+        if self.included.is_empty() {
+            return false;
+        }
+        self.included.iter().all(|&l| lit_present(lit, l))
+    }
+
+    /// Train-semantics fire check: an **empty** clause returns `true`.
+    #[inline]
+    pub(crate) fn fire_train(&self, lit: &[u64], lit_active_mask: &[u64]) -> bool {
+        self.included
+            .iter()
+            .all(|&l| !lit_active(lit_active_mask, l) || lit_present(lit, l))
+    }
+
+    /// Number of included literals (for the `max_included` gate).
+    #[inline]
+    pub(crate) fn n_included(&self) -> usize {
+        self.included.len()
+    }
+
+    /// Apply Type I feedback to this clause. See [`SparseClauseBank::type_i`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn type_i(
+        &mut self,
+        lit: &[u64],
+        lit_active_mask: &[u64],
+        fired_under_limit: bool,
+        boost: bool,
+        rng: &mut Rng,
+        inv_p: f64,
+        keep_p: f64,
+        max_included: usize,
+        half: u8,
+        max_state: u8,
+    ) {
+        // --- included literals -------------------------------------------
+        // Scan by index; demotions swap-remove, so do NOT advance `i` after one.
+        let mut i = 0;
+        while i < self.included.len() {
+            let l = self.included[i];
+            let active = lit_active(lit_active_mask, l);
+            if !active {
+                i += 1;
+                continue;
+            }
+            let present = lit_present(lit, l);
+            let state = self.included_state[i];
+            if present {
+                if fired_under_limit && state < max_state && (boost || rng.next_f64() <= keep_p) {
+                    // Increment toward the absorbing include state.
+                    self.included_state[i] = state + 1;
+                }
+                i += 1;
+            } else {
+                // Absent: decrement with probability 1/s, unless absorbing-include.
+                if state < max_state && rng.next_f64() <= inv_p {
+                    let new_state = state - 1;
+                    if new_state < half {
+                        // Falls below the inclusion threshold → demote to excluded.
+                        demote_to_excluded(self, i, new_state);
+                        // `swap_remove` moved a new element into slot `i`; revisit it.
+                        continue;
+                    } else {
+                        self.included_state[i] = new_state;
+                    }
+                }
+                i += 1;
+            }
+        }
+
+        // --- excluded literals -------------------------------------------
+        let mut i = 0;
+        while i < self.excluded.len() {
+            let l = self.excluded[i];
+            let active = lit_active(lit_active_mask, l);
+            if !active {
+                i += 1;
+                continue;
+            }
+            let present = lit_present(lit, l);
+            let state = self.excluded_state[i];
+            if present {
+                // Only Type Ia promotes, and only while under the include limit.
+                if fired_under_limit
+                    && self.included.len() < max_included
+                    && (boost || rng.next_f64() <= keep_p)
+                {
+                    let new_state = (state + 1).min(max_state);
+                    if new_state >= half {
+                        promote_to_included(self, i, new_state);
+                        continue;
+                    } else {
+                        self.excluded_state[i] = new_state;
+                    }
+                }
+                i += 1;
+            } else {
+                // Absent: decrement with probability 1/s; absorb out at the floor.
+                if rng.next_f64() <= inv_p {
+                    if state <= ABSORB_EXCLUDE + 1 {
+                        absorb_remove_excluded(self, i);
+                        continue;
+                    } else {
+                        self.excluded_state[i] = state - 1;
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+
+    /// Apply Type II feedback to this clause. See [`SparseClauseBank::type_ii`].
+    pub(crate) fn type_ii(
+        &mut self,
+        lit: &[u64],
+        lit_active_mask: &[u64],
+        half: u8,
+        max_state: u8,
+    ) {
+        let mut i = 0;
+        while i < self.excluded.len() {
+            let l = self.excluded[i];
+            let active = lit_active(lit_active_mask, l);
+            let state = self.excluded_state[i];
+            // Absent, active, and not at the absorbing exclude floor.
+            if active && !lit_present(lit, l) && state > ABSORB_EXCLUDE {
+                let new_state = (state + 1).min(max_state);
+                if new_state >= half {
+                    promote_to_included(self, i, new_state);
+                    continue;
+                } else {
+                    self.excluded_state[i] = new_state;
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
 impl SparseClauseBank {
     /// Create a bank of `n_clauses` clauses over `n_literals` literals.
     ///
@@ -126,32 +271,33 @@ impl SparseClauseBank {
         }
     }
 
-    // ---- firing ----------------------------------------------------------
+    // ---- parallel access -------------------------------------------------
 
-    /// Predict-semantics fire check: an **empty** clause returns `false`.
-    ///
-    /// Mirrors dense [`fire_predict`](crate::clause_bank::dense::fire_predict):
-    /// a clause fires iff it has at least one included literal and every included
-    /// literal is present in `lit`.
-    pub(crate) fn fire_predict(&self, cj: usize, lit: &[u64]) -> bool {
-        let c = &self.clauses[cj];
-        if c.included.is_empty() {
-            return false;
-        }
-        c.included.iter().all(|&l| lit_present(lit, l))
+    /// Mutable slice of all clauses, for clause-parallel feedback (Rayon).
+    pub(crate) fn clauses_mut(&mut self) -> &mut [SparseClause] {
+        &mut self.clauses
     }
 
-    /// Train-semantics fire check: an **empty** clause returns `true`.
-    ///
-    /// Mirrors dense [`clause_fire`](crate::clause_bank::dense::clause_fire) so an
-    /// empty clause still receives Type Ib feedback.  An included literal that is
-    /// inactive under `lit_active` is skipped (treated as non-violating), exactly
-    /// like the dense bank's `lit_active` masking.
+    /// `(half, max_state)` — the inclusion threshold and absorbing include state,
+    /// needed by per-clause feedback when operating on a bare [`SparseClause`].
+    pub(crate) fn dims(&self) -> (u8, u8) {
+        (self.half, self.max_state)
+    }
+
+    // ---- firing ----------------------------------------------------------
+
+    /// Predict-semantics fire check for clause `cj`: an **empty** clause returns
+    /// `false`.  Mirrors dense [`fire_predict`](crate::clause_bank::dense::fire_predict).
+    pub(crate) fn fire_predict(&self, cj: usize, lit: &[u64]) -> bool {
+        self.clauses[cj].fire_predict(lit)
+    }
+
+    /// Train-semantics fire check for clause `cj`: an **empty** clause returns
+    /// `true` (so it still receives Type Ib feedback).  Mirrors dense
+    /// [`clause_fire`](crate::clause_bank::dense::clause_fire); an included literal
+    /// inactive under `lit_active` is skipped.
     pub(crate) fn fire_train(&self, cj: usize, lit: &[u64], lit_active_mask: &[u64]) -> bool {
-        let c = &self.clauses[cj];
-        c.included
-            .iter()
-            .all(|&l| !lit_active(lit_active_mask, l) || lit_present(lit, l))
+        self.clauses[cj].fire_train(lit, lit_active_mask)
     }
 
     // ---- feedback --------------------------------------------------------
@@ -165,6 +311,11 @@ impl SparseClauseBank {
     /// (`1/s`) and `keep_p` the increment-boost probability (`(s-1)/s`).
     /// `max_included` caps the number of included literals (promotions are gated
     /// on the live included count).
+    ///
+    /// Test-only convenience wrapper; production training calls
+    /// [`SparseClause::type_i`] directly on a `&mut SparseClause` (see
+    /// `clauses_mut`) so the per-clause loop can run in parallel.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn type_i(
         &mut self,
@@ -178,84 +329,19 @@ impl SparseClauseBank {
         keep_p: f64,
         max_included: usize,
     ) {
-        let half = self.half;
-        let max_state = self.max_state;
-        let c = &mut self.clauses[cj];
-
-        // --- included literals -------------------------------------------
-        // Scan by index; demotions swap-remove, so do NOT advance `i` after one.
-        let mut i = 0;
-        while i < c.included.len() {
-            let l = c.included[i];
-            let active = lit_active(lit_active_mask, l);
-            if !active {
-                i += 1;
-                continue;
-            }
-            let present = lit_present(lit, l);
-            let state = c.included_state[i];
-            if present {
-                if fired_under_limit && state < max_state && (boost || rng.next_f64() <= keep_p) {
-                    // Increment toward the absorbing include state.
-                    c.included_state[i] = state + 1;
-                }
-                i += 1;
-            } else {
-                // Absent: decrement with probability 1/s, unless absorbing-include.
-                if state < max_state && rng.next_f64() <= inv_p {
-                    let new_state = state - 1;
-                    if new_state < half {
-                        // Falls below the inclusion threshold → demote to excluded.
-                        demote_to_excluded(c, i, new_state);
-                        // `swap_remove` moved a new element into slot `i`; revisit it.
-                        continue;
-                    } else {
-                        c.included_state[i] = new_state;
-                    }
-                }
-                i += 1;
-            }
-        }
-
-        // --- excluded literals -------------------------------------------
-        let mut i = 0;
-        while i < c.excluded.len() {
-            let l = c.excluded[i];
-            let active = lit_active(lit_active_mask, l);
-            if !active {
-                i += 1;
-                continue;
-            }
-            let present = lit_present(lit, l);
-            let state = c.excluded_state[i];
-            if present {
-                // Only Type Ia promotes, and only while under the include limit.
-                if fired_under_limit
-                    && c.included.len() < max_included
-                    && (boost || rng.next_f64() <= keep_p)
-                {
-                    let new_state = (state + 1).min(max_state);
-                    if new_state >= half {
-                        promote_to_included(c, i, new_state);
-                        continue;
-                    } else {
-                        c.excluded_state[i] = new_state;
-                    }
-                }
-                i += 1;
-            } else {
-                // Absent: decrement with probability 1/s; absorb out at the floor.
-                if rng.next_f64() <= inv_p {
-                    if state <= ABSORB_EXCLUDE + 1 {
-                        absorb_remove_excluded(c, i);
-                        continue;
-                    } else {
-                        c.excluded_state[i] = state - 1;
-                    }
-                }
-                i += 1;
-            }
-        }
+        let (half, max_state) = (self.half, self.max_state);
+        self.clauses[cj].type_i(
+            lit,
+            lit_active_mask,
+            fired_under_limit,
+            boost,
+            rng,
+            inv_p,
+            keep_p,
+            max_included,
+            half,
+            max_state,
+        );
     }
 
     /// Apply Type II feedback to clause `cj` (called only when the clause fired on
@@ -265,28 +351,12 @@ impl SparseClauseBank {
     /// absorbing floor, increment its state by 1; if it reaches `half`, promote it
     /// to the included pool (making the clause harder to fire on negatives).
     /// Included literals are never touched, mirroring dense Type II.
+    ///
+    /// Test-only convenience wrapper; see [`SparseClauseBank::type_i`].
+    #[cfg(test)]
     pub(crate) fn type_ii(&mut self, cj: usize, lit: &[u64], lit_active_mask: &[u64]) {
-        let half = self.half;
-        let max_state = self.max_state;
-        let c = &mut self.clauses[cj];
-
-        let mut i = 0;
-        while i < c.excluded.len() {
-            let l = c.excluded[i];
-            let active = lit_active(lit_active_mask, l);
-            let state = c.excluded_state[i];
-            // Absent, active, and not at the absorbing exclude floor.
-            if active && !lit_present(lit, l) && state > ABSORB_EXCLUDE {
-                let new_state = (state + 1).min(max_state);
-                if new_state >= half {
-                    promote_to_included(c, i, new_state);
-                    continue;
-                } else {
-                    c.excluded_state[i] = new_state;
-                }
-            }
-            i += 1;
-        }
+        let (half, max_state) = (self.half, self.max_state);
+        self.clauses[cj].type_ii(lit, lit_active_mask, half, max_state);
     }
 
     // ---- introspection ---------------------------------------------------
@@ -296,7 +366,10 @@ impl SparseClauseBank {
         &self.clauses[cj].included
     }
 
-    /// Number of included literals in clause `cj` (for the `max_included` gate).
+    /// Number of included literals in clause `cj`.
+    ///
+    /// Test-only; production code uses [`SparseClause::n_included`] on a bare clause.
+    #[cfg(test)]
     pub(crate) fn n_included(&self, cj: usize) -> usize {
         self.clauses[cj].included.len()
     }
