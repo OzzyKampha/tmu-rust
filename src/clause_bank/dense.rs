@@ -904,6 +904,198 @@ unsafe fn type_iii_ind_words_avx2(
     }
 }
 
+/// Fused [`type_iii_ind_words`] + [`type_iii_ta_dec_bytes`] in a single pass over `ind`.
+///
+/// When the clause fires and the TA-decrement probability succeeds, calling this instead
+/// of the two functions separately saves one full re-read of `ind` and `active_b` —
+/// the new `ind` values computed by the AVX2 loop are used immediately to decrement `ta`
+/// without writing and re-loading them.
+///
+/// For large `n_literals` (e.g. 16 384 for 8 192 features) this eliminates ~32 KB of
+/// L1-cache pressure per clause update.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn type_iii_ind_words_and_ta_dec(
+    ta: &mut [u8],
+    ind: &mut [u8],
+    n_literals: usize,
+    lit_active: &[u64],
+    cat: &[u64],
+    lit: &[u64],
+    valid: &[u64],
+    active_b: &[u8],
+    do_inc: bool,
+    max_ind: u8,
+    half_ind: u8,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe {
+                type_iii_ind_words_and_ta_dec_avx2(
+                    ta, ind, n_literals, lit_active, cat, lit, valid, active_b, do_inc, max_ind,
+                    half_ind,
+                )
+            };
+        }
+    }
+    type_iii_ind_words_and_ta_dec_scalar(
+        ta, ind, n_literals, lit_active, cat, lit, valid, active_b, do_inc, max_ind, half_ind,
+    );
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn type_iii_ind_words_and_ta_dec_scalar(
+    ta: &mut [u8],
+    ind: &mut [u8],
+    n_literals: usize,
+    lit_active: &[u64],
+    cat: &[u64],
+    lit: &[u64],
+    valid: &[u64],
+    active_b: &[u8],
+    do_inc: bool,
+    max_ind: u8,
+    half_ind: u8,
+) {
+    for l in 0..n_literals {
+        let w = l / WORD_BITS;
+        let b = l % WORD_BITS;
+        let active = (lit_active[w] >> b) & 1;
+        let cat_b = (cat[w] >> b) & 1;
+        let lit_bv = (lit[w] >> b) & 1;
+        let valid_b = (valid[w] >> b) & 1;
+        let inc = if do_inc { (active & cat_b & lit_bv) as u8 } else { 0u8 };
+        let dec_ind = (active & (1 - cat_b) & lit_bv & valid_b) as u8;
+        let new_ind = ind[l].saturating_add(inc).min(max_ind).saturating_sub(dec_ind);
+        ind[l] = new_ind;
+        ta[l] = ta[l].saturating_sub(active_b[l] & (new_ind < half_ind) as u8);
+    }
+}
+
+/// AVX2 fused [`type_iii_ind_words`] + [`type_iii_ta_dec_bytes`].
+///
+/// Inner loop writes `ind` and `ta` in a single pass: after computing the new `ind` vector
+/// the same registers are used to test `< half_ind` and decrement `ta`, with no round-trip
+/// through memory.
+///
+/// # Safety
+/// Caller must verify AVX2 is available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn type_iii_ind_words_and_ta_dec_avx2(
+    ta: &mut [u8],
+    ind: &mut [u8],
+    n_literals: usize,
+    lit_active: &[u64],
+    cat: &[u64],
+    lit: &[u64],
+    valid: &[u64],
+    active_b: &[u8],
+    do_inc: bool,
+    max_ind: u8,
+    half_ind: u8,
+) {
+    use std::arch::x86_64::*;
+
+    let max_ind_v = _mm256_set1_epi8(max_ind as i8);
+    let zero = _mm256_setzero_si256();
+    let ones_v = _mm256_set1_epi8(1i8);
+    let bias = _mm256_set1_epi8(i8::MIN);
+    // `new_ind < half_ind` via unsigned-compare bias trick (identical to type_iii_ta_dec_bytes_avx2).
+    let half_biased = _mm256_set1_epi8((half_ind ^ 0x80) as i8);
+
+    let shuf = _mm256_set_epi8(
+        3, 3, 3, 3, 3, 3, 3, 3,
+        2, 2, 2, 2, 2, 2, 2, 2,
+        1, 1, 1, 1, 1, 1, 1, 1,
+        0, 0, 0, 0, 0, 0, 0, 0,
+    );
+    let bit_masks = _mm256_set_epi8(
+        0x80u8 as i8, 0x40u8 as i8, 0x20u8 as i8, 0x10u8 as i8,
+        0x08u8 as i8, 0x04u8 as i8, 0x02u8 as i8, 0x01u8 as i8,
+        0x80u8 as i8, 0x40u8 as i8, 0x20u8 as i8, 0x10u8 as i8,
+        0x08u8 as i8, 0x04u8 as i8, 0x02u8 as i8, 0x01u8 as i8,
+        0x80u8 as i8, 0x40u8 as i8, 0x20u8 as i8, 0x10u8 as i8,
+        0x08u8 as i8, 0x04u8 as i8, 0x02u8 as i8, 0x01u8 as i8,
+        0x80u8 as i8, 0x40u8 as i8, 0x20u8 as i8, 0x10u8 as i8,
+        0x08u8 as i8, 0x04u8 as i8, 0x02u8 as i8, 0x01u8 as i8,
+    );
+
+    macro_rules! bits32_to_vec {
+        ($bits:expr) => {{
+            let v = _mm256_set1_epi32($bits as i32);
+            let spread = _mm256_shuffle_epi8(v, shuf);
+            let masked = _mm256_and_si256(spread, bit_masks);
+            let is_zero = _mm256_cmpeq_epi8(masked, zero);
+            _mm256_andnot_si256(is_zero, ones_v)
+        }};
+    }
+
+    macro_rules! load32 {
+        ($slice:expr, $off:expr) => {
+            _mm256_loadu_si256($slice.as_ptr().add($off) as *const __m256i)
+        };
+    }
+
+    let mut l = 0usize;
+    while l + 32 <= n_literals {
+        let widx = l / WORD_BITS;
+        let boff = l % WORD_BITS;
+
+        let w_active = lit_active[widx];
+        let w_cat = cat[widx];
+        let w_lit = lit[widx];
+        let w_valid = valid[widx];
+
+        let inc_bits: u32 = if do_inc {
+            ((w_active & w_cat & w_lit) >> boff) as u32
+        } else {
+            0
+        };
+        let dec_bits: u32 = ((w_active & !w_cat & w_lit & w_valid) >> boff) as u32;
+
+        let inc_v = bits32_to_vec!(inc_bits);
+        let dec_v = bits32_to_vec!(dec_bits);
+
+        // Update ind.
+        let ind_ptr = ind.as_mut_ptr().add(l) as *mut __m256i;
+        let ind_v = _mm256_loadu_si256(ind_ptr as *const __m256i);
+        let new_ind = _mm256_subs_epu8(
+            _mm256_min_epu8(_mm256_adds_epu8(ind_v, inc_v), max_ind_v),
+            dec_v,
+        );
+        _mm256_storeu_si256(ind_ptr, new_ind);
+
+        // Fused ta decrement: active_b[l] && new_ind < half_ind → decrement ta[l].
+        let active_v = load32!(active_b, l);
+        let biased_ind = _mm256_xor_si256(new_ind, bias);
+        let ind_lt_half = _mm256_cmpgt_epi8(half_biased, biased_ind);
+        let ta_dec = _mm256_and_si256(active_v, ind_lt_half);
+        let ta_ptr = ta.as_mut_ptr().add(l) as *mut __m256i;
+        _mm256_storeu_si256(ta_ptr, _mm256_subs_epu8(_mm256_loadu_si256(ta_ptr as *const __m256i), ta_dec));
+
+        l += 32;
+    }
+    // Scalar tail.
+    while l < n_literals {
+        let w = l / WORD_BITS;
+        let b = l % WORD_BITS;
+        let active = (lit_active[w] >> b) & 1;
+        let cat_b = (cat[w] >> b) & 1;
+        let lit_bv = (lit[w] >> b) & 1;
+        let valid_b = (valid[w] >> b) & 1;
+        let inc = if do_inc { (active & cat_b & lit_bv) as u8 } else { 0u8 };
+        let dec_ind = (active & (1 - cat_b) & lit_bv & valid_b) as u8;
+        let new_ind = ind[l].saturating_add(inc).min(max_ind).saturating_sub(dec_ind);
+        ind[l] = new_ind;
+        ta[l] = ta[l].saturating_sub(active_b[l] & (new_ind < half_ind) as u8);
+        l += 1;
+    }
+}
+
 /// Decrement `ta[l]` by 1 (saturating) for each literal that is active and has `ind[l] < half_ind`.
 ///
 /// - `active_b[l]`: 1 if the literal is active (`lit_active`), else 0.
@@ -1050,26 +1242,39 @@ pub(crate) fn type_iii_update(
     if fires {
         let do_inc = target && rng.next_f64() <= 1.0 - 1.0 / d;
 
-        // Update ind directly from bitset words — no Vec allocation, no expand_bits_to_bytes.
-        type_iii_ind_words(ind, n_literals, lit_active, cat, lit, valid, do_inc, max_ind);
+        if rng.next_f64() <= update_p {
+            // Fused path: update ind and decrement ta in a single pass — halves memory reads
+            // over calling type_iii_ind_words then type_iii_ta_dec_bytes separately.
+            type_iii_ind_words_and_ta_dec(
+                ta, ind, n_literals, lit_active, cat, lit, valid, active_b, do_inc, max_ind,
+                half_ind,
+            );
+            for k in 0..words {
+                cat[k] = if target { !cat[k] & valid[k] } else { valid[k] };
+            }
+            return true;
+        }
 
+        // update_p check failed: still update ind (and cat), but skip ta decrement.
+        type_iii_ind_words(ind, n_literals, lit_active, cat, lit, valid, do_inc, max_ind);
         for k in 0..words {
             cat[k] = if target { !cat[k] & valid[k] } else { valid[k] };
         }
-    } else if let Some(off) = first_false_literal(inc, lit, valid, lit_active, words) {
-        let chunk = off / WORD_BITS;
-        let pos = off % WORD_BITS;
-        if (cat[chunk] >> pos) & 1 == 0 {
-            cat[chunk] |= 1u64 << pos;
-        } else if target {
-            cat[chunk] &= !(1u64 << pos);
+    } else {
+        if let Some(off) = first_false_literal(inc, lit, valid, lit_active, words) {
+            let chunk = off / WORD_BITS;
+            let pos = off % WORD_BITS;
+            if (cat[chunk] >> pos) & 1 == 0 {
+                cat[chunk] |= 1u64 << pos;
+            } else if target {
+                cat[chunk] &= !(1u64 << pos);
+            }
         }
-    }
 
-    if rng.next_f64() <= update_p {
-        // Use the caller's pre-computed active_b — no per-clause allocation.
-        type_iii_ta_dec_bytes(ta, ind, n_literals, active_b, half_ind);
-        return true;
+        if rng.next_f64() <= update_p {
+            type_iii_ta_dec_bytes(ta, ind, n_literals, active_b, half_ind);
+            return true;
+        }
     }
 
     false
