@@ -5,6 +5,11 @@
 //! - [`Encoder::fit_numeric`] — `f64` features → quantile booleanization → pack
 //! - [`Encoder::fit_categorical`] — `"col::val"` token strings → vocabulary → pack
 //!
+//! Binary and categorical encoders can grow their feature space after fitting
+//! ([`Encoder::grow_binary`], [`Encoder::extend_categorical`]) — pair with
+//! `TsetlinMachine::grow_features` to expand a trained model onto new data
+//! without discarding learned automata. Numeric encoders are fixed-size once fit.
+//!
 //! The output types [`EncodedSample`] and [`EncodedBatch`] can only be constructed
 //! by an encoder; raw slices are not accepted by [`TsetlinMachine`] methods.
 //!
@@ -204,6 +209,95 @@ impl Encoder {
         }
     }
 
+    // ── growing ──────────────────────────────────────────────────────────────
+
+    /// Extend a categorical encoder with new samples: genuinely unseen tokens are
+    /// appended as new features AFTER all existing features, so every existing
+    /// index — including per-column `"col::<UNK>"` sentinels and `"<OOV>"` — stays
+    /// stable. New column prefixes also get a `"col::<UNK>"` sentinel. Returns the
+    /// number of features added (`0` = the vocabulary already covered the samples).
+    ///
+    /// After a non-zero extension, grow the paired machine to match and re-encode:
+    /// `if enc.extend_categorical(&new) > 0 { tm.grow_features(enc.n_features()); }`
+    ///
+    /// The global sorted-index invariant of [`Encoder::fit_categorical`] is
+    /// intentionally dropped after extension; within each extension batch, new
+    /// tokens are appended in sorted order for determinism.
+    ///
+    /// Note: a token that previously fell into a `<UNK>`/`<OOV>` slot and now has
+    /// its own feature encodes differently afterwards (UNK bit off, own bit on),
+    /// so predictions on *those* samples may legitimately change. Samples whose
+    /// tokens were all previously known encode bit-identically.
+    ///
+    /// # Panics
+    /// Panics if the encoder is not categorical.
+    pub fn extend_categorical(&mut self, samples: &[&[&str]]) -> usize {
+        match &mut self.kind {
+            EncoderKind::Categorical {
+                vocab,
+                index,
+                known_columns,
+            } => {
+                let before = index.len();
+
+                let mut new_tokens: std::collections::BTreeSet<String> = Default::default();
+                let mut new_cols: std::collections::BTreeSet<String> = Default::default();
+                for sample in samples {
+                    for &token in *sample {
+                        if !vocab.contains_key(token) {
+                            new_tokens.insert(token.to_string());
+                        }
+                        if let Some(col) = token.split("::").next() {
+                            if !known_columns.contains_key(col) {
+                                new_cols.insert(col.to_string());
+                            }
+                        }
+                    }
+                }
+
+                for token in new_tokens {
+                    vocab.insert(token.clone(), index.len());
+                    index.push(token);
+                }
+                for col in new_cols {
+                    let unk = format!("{col}::<UNK>");
+                    // The UNK string may collide with a literal token appended
+                    // above — reuse its index rather than pushing a duplicate.
+                    let idx = *vocab.entry(unk.clone()).or_insert(index.len());
+                    if idx == index.len() {
+                        index.push(unk);
+                    }
+                    known_columns.insert(col, idx);
+                }
+
+                self.n_features = index.len();
+                self.words = words_for(2 * self.n_features);
+                self.n_features - before
+            }
+            _ => panic!("extend_categorical requires a categorical encoder"),
+        }
+    }
+
+    /// Grow a binary encoder to `new_n_features`. Callers must append the new
+    /// features at the END of each row so existing feature indices stay stable;
+    /// pair with `TsetlinMachine::grow_features(new_n_features)`.
+    ///
+    /// # Panics
+    /// Panics if the encoder is not binary or if `new_n_features` would shrink it.
+    pub fn grow_binary(&mut self, new_n_features: usize) {
+        assert!(
+            matches!(self.kind, EncoderKind::Binary),
+            "grow_binary requires a binary encoder"
+        );
+        assert!(
+            new_n_features >= self.n_features,
+            "grow_binary cannot shrink: {} -> {new_n_features}",
+            self.n_features
+        );
+        self.n_features = new_n_features;
+        self.words = words_for(2 * new_n_features);
+    }
+
     // ── metadata ─────────────────────────────────────────────────────────────
 
     /// Number of binary features produced by this encoder (= `n_features` for the TM).
@@ -267,9 +361,13 @@ impl Encoder {
             EncoderKind::Categorical {
                 vocab,
                 known_columns,
-                index,
+                index: _,
             } => {
-                let oov_idx = index.len() - 1; // "<OOV>" is always last
+                // Looked up rather than assumed last: extend_categorical appends
+                // new tokens after the "<OOV>" sentinel.
+                let oov_idx = *vocab
+                    .get("<OOV>")
+                    .expect("categorical vocab missing <OOV>");
                 let mut bin = vec![0u8; self.n_features];
                 for &token in tokens {
                     let idx = if let Some(&i) = vocab.get(token) {
@@ -339,6 +437,155 @@ impl Encoder {
             data[i * w..(i + 1) * w].copy_from_slice(&s.0);
         }
         EncodedBatch { data, n, words: w }
+    }
+}
+
+#[cfg(test)]
+mod grow_tests {
+    use super::*;
+
+    /// True if positive-literal bit `i` is set in the encoded sample.
+    fn bit(s: &EncodedSample, i: usize) -> bool {
+        s.0[i / 64] >> (i % 64) & 1 != 0
+    }
+
+    fn fit_ab() -> Encoder {
+        let s1: Vec<&str> = vec!["proc::cmd.exe", "user::alice"];
+        let s2: Vec<&str> = vec!["proc::powershell.exe", "user::bob"];
+        let train: Vec<&[&str]> = vec![s1.as_slice(), s2.as_slice()];
+        Encoder::fit_categorical(&train)
+    }
+
+    #[test]
+    fn extend_categorical_keeps_indices_stable() {
+        let mut e = fit_ab();
+        let before_n = e.n_features();
+        let before_tokens: Vec<String> =
+            (0..before_n).map(|i| e.vocab_token(i).to_string()).collect();
+
+        // Two new tokens in known columns plus one new column (adds its UNK too).
+        let n1: Vec<&str> = vec!["proc::rundll32.exe", "user::carol", "host::web01"];
+        let added = e.extend_categorical(&[n1.as_slice()]);
+
+        // 3 new regular tokens + 1 new column UNK.
+        assert_eq!(added, 4);
+        assert_eq!(e.n_features(), before_n + added);
+        for (i, tok) in before_tokens.iter().enumerate() {
+            assert_eq!(e.vocab_token(i), tok, "existing index {i} moved");
+        }
+    }
+
+    #[test]
+    fn extend_categorical_moves_token_out_of_unk() {
+        let mut e = fit_ab();
+        // Known column, unseen value: encodes to the proc UNK bit before extension.
+        let unk_idx = (0..e.n_features())
+            .find(|&i| e.vocab_token(i) == "proc::<UNK>")
+            .unwrap();
+        let s = e.encode_one_categorical(&["proc::rundll32.exe"]);
+        assert!(bit(&s, unk_idx));
+
+        let n1: Vec<&str> = vec!["proc::rundll32.exe"];
+        e.extend_categorical(&[n1.as_slice()]);
+
+        // Now it has its own appended feature; the UNK bit itself did not move.
+        assert_eq!(e.vocab_token(unk_idx), "proc::<UNK>");
+        let new_idx = (0..e.n_features())
+            .find(|&i| e.vocab_token(i) == "proc::rundll32.exe")
+            .unwrap();
+        let s = e.encode_one_categorical(&["proc::rundll32.exe"]);
+        assert!(bit(&s, new_idx));
+        assert!(!bit(&s, unk_idx));
+    }
+
+    #[test]
+    fn extend_categorical_oov_still_correct() {
+        // Regression test: encode_one_categorical must look up "<OOV>" instead of
+        // assuming it is the last index (it is not, after an extension).
+        let mut e = fit_ab();
+        let oov_idx = (0..e.n_features())
+            .find(|&i| e.vocab_token(i) == "<OOV>")
+            .unwrap();
+
+        let n1: Vec<&str> = vec!["proc::rundll32.exe"];
+        e.extend_categorical(&[n1.as_slice()]);
+        assert_ne!(oov_idx, e.n_features() - 1, "<OOV> should no longer be last");
+
+        // A token with an unknown column still maps to the original OOV index.
+        let s = e.encode_one_categorical(&["zzz"]);
+        assert!(bit(&s, oov_idx));
+        assert!(!bit(&s, e.n_features() - 1));
+    }
+
+    #[test]
+    fn extend_categorical_noop_returns_zero() {
+        let mut e = fit_ab();
+        let before_n = e.n_features();
+        let s1: Vec<&str> = vec!["proc::cmd.exe", "user::bob"];
+        let added = e.extend_categorical(&[s1.as_slice()]);
+        assert_eq!(added, 0);
+        assert_eq!(e.n_features(), before_n);
+    }
+
+    #[test]
+    fn grow_binary_updates_geometry() {
+        let mut e = Encoder::for_binary(5);
+        let row = [1u8, 0, 1, 1, 0];
+        let before = e.encode_one(&row);
+
+        e.grow_binary(8);
+        assert_eq!(e.n_features(), 8);
+        assert_eq!(e.words, crate::clause_bank::dense::words_for(16));
+
+        // Zero-padded row reproduces the old positive bits in the low positions.
+        let padded = [1u8, 0, 1, 1, 0, 0, 0, 0];
+        let after = e.encode_one(&padded);
+        for i in 0..5 {
+            assert_eq!(bit(&before, i), bit(&after, i), "positive bit {i}");
+        }
+        for i in 5..8 {
+            assert!(!bit(&after, i), "new feature bit {i} must be 0");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot shrink")]
+    fn grow_binary_panics_on_shrink() {
+        let mut e = Encoder::for_binary(5);
+        e.grow_binary(4);
+    }
+
+    #[test]
+    #[should_panic(expected = "requires a categorical encoder")]
+    fn extend_categorical_panics_on_binary() {
+        let mut e = Encoder::for_binary(5);
+        let s: Vec<&str> = vec!["a::b"];
+        e.extend_categorical(&[s.as_slice()]);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn extend_categorical_serde_roundtrip() {
+        use crate::serial::SaveLoad;
+
+        let mut e = fit_ab();
+        let n1: Vec<&str> = vec!["proc::rundll32.exe", "host::web01"];
+        e.extend_categorical(&[n1.as_slice()]);
+
+        let mut buf = Vec::new();
+        e.write_to(&mut buf).unwrap();
+        let loaded = Encoder::read_from(&mut buf.as_slice()).unwrap();
+
+        assert_eq!(e.n_features(), loaded.n_features());
+        let q: Vec<&str> = vec!["proc::rundll32.exe", "user::alice", "zzz"];
+        let query: Vec<&[&str]> = vec![q.as_slice()];
+        assert_eq!(
+            e.encode_batch_categorical(&query).data,
+            loaded.encode_batch_categorical(&query).data
+        );
+        for i in 0..e.n_features() {
+            assert_eq!(e.vocab_token(i), loaded.vocab_token(i));
+        }
     }
 }
 

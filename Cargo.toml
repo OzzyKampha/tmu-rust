@@ -133,6 +133,10 @@ path = "examples/mordor_autoencoder.rs"
 name = "type_iii_demo"        # Type III feedback: clause sparsity demo vs baseline
 path = "examples/type_iii_demo.rs"
 
+[[example]]
+name = "growing"              # Growing TM: extend encoder with new tokens, grow the machine, keep learned automata
+path = "examples/growing.rs"
+
 [[bench]]
 name = "throughput"
 path = "benches/throughput.rs"
