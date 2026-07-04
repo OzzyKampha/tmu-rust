@@ -137,6 +137,10 @@ path = "examples/type_iii_demo.rs"
 name = "growing"              # Growing TM: extend encoder with new tokens, grow the machine, keep learned automata
 path = "examples/growing.rs"
 
+[[example]]
+name = "grow_scaling"         # Growing at scale: dense vs sparse literal-space growth + parallel effect
+path = "examples/grow_scaling.rs"
+
 [[bench]]
 name = "throughput"
 path = "benches/throughput.rs"

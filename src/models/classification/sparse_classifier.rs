@@ -225,6 +225,41 @@ impl TMSparseClassifier {
         self.class_weights[class]
     }
 
+    // ---- growing -----------------------------------------------------------
+
+    /// Grow the input space to `new_n_features`, preserving all learned automata.
+    ///
+    /// New features enter as just-excluded candidates (never included), so
+    /// predictions on inputs whose new features are all 0 are identical to before
+    /// the grow, while the new literals remain immediately learnable. Clause
+    /// weights, RNG streams, and hyperparameters are untouched.
+    ///
+    /// Unlike the dense model, the sparse bank grows in place: existing negated
+    /// literal indices are shifted and the new literals are appended to each
+    /// clause's excluded pool — no full-array reallocation.
+    ///
+    /// **Re-encode after growing**: previously produced [`EncodedSample`] /
+    /// [`EncodedBatch`] values use the old word stride and are geometry-incompatible
+    /// with the grown machine.
+    ///
+    /// # Panics
+    /// Panics if `new_n_features < self.n_features()` (shrinking is not supported).
+    /// A call with the current feature count is a no-op.
+    pub fn grow_features(&mut self, new_n_features: usize) {
+        assert!(
+            new_n_features >= self.n_features,
+            "grow_features cannot shrink: {} -> {new_n_features}",
+            self.n_features
+        );
+        if new_n_features == self.n_features {
+            return;
+        }
+        self.bank.grow(2 * new_n_features);
+        self.n_features = new_n_features;
+        self.n_literals = 2 * new_n_features;
+        self.words = words_for(self.n_literals);
+    }
+
     // ---- inference -------------------------------------------------------
 
     /// Internal: predict from a raw literal slice.
@@ -746,6 +781,164 @@ mod tests {
             sparse_acc >= dense_acc - 0.05,
             "sparse {sparse_acc} lags dense {dense_acc} by more than 0.05"
         );
+    }
+
+    // ---- growing the feature space --------------------------------------------
+
+    /// Zero-pad every sample from its current length up to `n`.
+    fn pad_to(xs: &[Vec<u8>], n: usize) -> Vec<Vec<u8>> {
+        xs.iter()
+            .map(|x| {
+                let mut p = x.clone();
+                p.resize(n, 0);
+                p
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grow_preserves_predictions() {
+        let (xtr, ytr) = make_xor(4000, 0.1, 5);
+        let (xte, _) = make_xor(1000, 0.0, 6);
+        let e12 = Encoder::for_binary(N_FEATURES);
+        let mut tm = TMSparseClassifier::with_config(2, N_FEATURES, 10, 15, 3.9, 8, true, 7)
+            .max_included_literals(8);
+        for _ in 0..30 {
+            tm.fit_epoch(&encode(&xtr, &e12), &ytr);
+        }
+
+        let bte12 = encode(&xte, &e12);
+        let preds_before = tm.predict_batch(&bte12);
+        let scores_before: Vec<[i32; 2]> = xte
+            .iter()
+            .map(|x| {
+                let mut out = [0i32; 2];
+                tm.scores(&e12.encode_one(x), &mut out);
+                out
+            })
+            .collect();
+
+        tm.grow_features(20);
+        assert_eq!(tm.n_features(), 20);
+
+        // Same rows, zero-padded to 20 features: predictions and per-class scores
+        // must be identical (new literals are all just-excluded, never included).
+        let e20 = Encoder::for_binary(20);
+        let xte20 = pad_to(&xte, 20);
+        let bte20 = encode(&xte20, &e20);
+        assert_eq!(tm.predict_batch(&bte20), preds_before);
+        for (x, before) in xte20.iter().zip(&scores_before) {
+            let mut out = [0i32; 2];
+            tm.scores(&e20.encode_one(x), &mut out);
+            assert_eq!(&out, before, "scores changed after grow for {x:?}");
+        }
+    }
+
+    #[test]
+    fn grow_noop_when_equal() {
+        let (tm0, _, _) = train_sparse(8, 10);
+        let mut tm = tm0.clone();
+        let rules_before: Vec<Vec<(usize, bool)>> = (0..2)
+            .flat_map(|c| (0..tm.clauses_per_class()).map(move |j| (c, j)))
+            .map(|(c, j)| tm.clause_rule(c, j))
+            .collect();
+        tm.grow_features(N_FEATURES);
+        assert_eq!(tm.n_features(), N_FEATURES);
+        let rules_after: Vec<Vec<(usize, bool)>> = (0..2)
+            .flat_map(|c| (0..tm.clauses_per_class()).map(move |j| (c, j)))
+            .map(|(c, j)| tm.clause_rule(c, j))
+            .collect();
+        assert_eq!(rules_before, rules_after);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot shrink")]
+    fn grow_panics_on_shrink() {
+        let mut tm = TMSparseClassifier::new(2, N_FEATURES, 10, 15, 3.9);
+        tm.grow_features(N_FEATURES - 1);
+    }
+
+    #[test]
+    fn grow_preserves_clause_rules() {
+        let (tm0, _, _) = train_sparse(9, 20);
+        let mut tm = tm0.clone();
+        let rules_before: Vec<Vec<(usize, bool)>> = (0..2)
+            .flat_map(|c| (0..tm.clauses_per_class()).map(move |j| (c, j)))
+            .map(|(c, j)| tm.clause_rule(c, j))
+            .collect();
+
+        tm.grow_features(40);
+
+        // Feature indices and negation flags are stable across the grow.
+        let rules_after: Vec<Vec<(usize, bool)>> = (0..2)
+            .flat_map(|c| (0..tm.clauses_per_class()).map(move |j| (c, j)))
+            .map(|(c, j)| tm.clause_rule(c, j))
+            .collect();
+        assert_eq!(rules_before, rules_after);
+    }
+
+    #[test]
+    fn grow_then_learns_new_feature() {
+        // Pre-train on XOR over the first 12 features.
+        let (xtr, ytr) = make_xor(3000, 0.1, 10);
+        let e12 = Encoder::for_binary(N_FEATURES);
+        let mut tm = TMSparseClassifier::with_config(2, N_FEATURES, 20, 15, 3.9, 8, true, 7)
+            .max_included_literals(8);
+        for _ in 0..20 {
+            tm.fit_epoch(&encode(&xtr, &e12), &ytr);
+        }
+
+        tm.grow_features(16);
+
+        // New task determined solely by an appended feature: label = bit 14.
+        let mut rng = Rng::new(99);
+        let make = |rng: &mut Rng, n: usize| -> (Vec<Vec<u8>>, Vec<usize>) {
+            let mut xs = Vec::with_capacity(n);
+            let mut ys = Vec::with_capacity(n);
+            for _ in 0..n {
+                let f: Vec<u8> = (0..16).map(|_| (rng.next_u64() & 1) as u8).collect();
+                ys.push(f[14] as usize);
+                xs.push(f);
+            }
+            (xs, ys)
+        };
+        let (xtr2, ytr2) = make(&mut rng, 4000);
+        let (xte2, yte2) = make(&mut rng, 1000);
+
+        let e16 = Encoder::for_binary(16);
+        for _ in 0..30 {
+            tm.fit_epoch(&encode(&xtr2, &e16), &ytr2);
+        }
+        let acc = tm.accuracy(&encode(&xte2, &e16), &yte2);
+        assert!(acc >= 0.95, "grown sparse TM failed to learn new feature: {acc}");
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn grown_model_serde_roundtrip() {
+        use crate::serial::SaveLoad;
+        let (xtr, ytr) = make_xor(3000, 0.1, 12);
+        let (xte, _) = make_xor(500, 0.0, 13);
+        let e12 = Encoder::for_binary(N_FEATURES);
+        let mut tm = TMSparseClassifier::with_config(2, N_FEATURES, 10, 15, 3.9, 8, true, 7)
+            .max_included_literals(8);
+        for _ in 0..15 {
+            tm.fit_epoch(&encode(&xtr, &e12), &ytr);
+        }
+
+        tm.grow_features(20);
+        let e20 = Encoder::for_binary(20);
+        let xtr20 = pad_to(&xtr, 20);
+        for _ in 0..5 {
+            tm.fit_epoch(&encode(&xtr20, &e20), &ytr);
+        }
+
+        let mut buf = Vec::new();
+        tm.write_to(&mut buf).unwrap();
+        let loaded = TMSparseClassifier::read_from(&mut buf.as_slice()).unwrap();
+
+        let bte20 = encode(&pad_to(&xte, 20), &e20);
+        assert_eq!(tm.predict_batch(&bte20), loaded.predict_batch(&bte20));
     }
 
     #[cfg(feature = "serde")]
