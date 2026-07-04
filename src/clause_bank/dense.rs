@@ -233,6 +233,103 @@ unsafe fn rebuild_include_avx2(
     }
 }
 
+/// Grow a dense clause bank from `old_n_features` to `new_n_features`, preserving
+/// every learned per-clause state. Returns `(new_n_literals, new_words)`.
+///
+/// The literal layout is `[positives 0..n_features | negateds n_features..2*n_features]`
+/// (see [`pack`]), so growing shifts the negated block: per clause, old positive
+/// states stay at `[0..old_nf]`, old negated states move from `[old_nf..2*old_nf]`
+/// to `[new_nf..new_nf + old_nf]`, and the gaps are new literal slots.
+///
+/// New TA slots are initialised to the deterministic `half - 1` (just-excluded)
+/// rather than the constructor's random `half-1`/`half` split: excluded new
+/// literals leave every clause's firing behaviour on the old feature space
+/// bit-identical, whereas randomly *including* a new positive literal would block
+/// the clause on all previously-seen samples. `half - 1` is one Type Ia increment
+/// from inclusion and not the absorbing state `0`, so new features stay learnable.
+/// New `ind` slots get `half` and new `cat` bits `0`, matching constructor init.
+///
+/// `include` is rebuilt from the new `ta` via [`rebuild_include`]; `valid` is
+/// rebuilt for the new literal count.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn grow_dense_state(
+    n_clauses: usize,
+    old_n_features: usize,
+    new_n_features: usize,
+    half: u8,
+    ta: &mut Vec<u8>,
+    include: &mut Vec<u64>,
+    ind: &mut Vec<u8>,
+    cat: &mut Vec<u64>,
+    valid: &mut Vec<u64>,
+) -> (usize, usize) {
+    debug_assert!(new_n_features > old_n_features);
+    let old_nl = 2 * old_n_features;
+    let new_nl = 2 * new_n_features;
+    let old_words = words_for(old_nl);
+    let new_words = words_for(new_nl);
+
+    let mut new_valid = vec![0u64; new_words];
+    for l in 0..new_nl {
+        new_valid[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
+    }
+
+    // Copy a clause-major u8 array (ta / ind) into the new geometry:
+    // positives stay at the front, negateds shift up by (new_nf - old_nf).
+    let regrow_u8 = |old: &[u8], fill: u8| -> Vec<u8> {
+        let mut new = vec![fill; n_clauses * new_nl];
+        for j in 0..n_clauses {
+            let ob = j * old_nl;
+            let nb = j * new_nl;
+            new[nb..nb + old_n_features].copy_from_slice(&old[ob..ob + old_n_features]);
+            new[nb + new_n_features..nb + new_n_features + old_n_features]
+                .copy_from_slice(&old[ob + old_n_features..ob + old_nl]);
+        }
+        new
+    };
+
+    let new_ta = regrow_u8(ta, half - 1);
+    let new_ind = regrow_u8(ind, half);
+
+    // Remap cat bits one at a time — grow is a cold path, and per-bit remapping
+    // avoids word-shift arithmetic across the moving negated-block boundary.
+    // Padding bits above old_nl are already zero (every cat write is valid-masked).
+    let mut new_cat = vec![0u64; n_clauses * new_words];
+    for j in 0..n_clauses {
+        for l in 0..old_nl {
+            if cat[j * old_words + l / WORD_BITS] >> (l % WORD_BITS) & 1 != 0 {
+                let nl = if l < old_n_features {
+                    l
+                } else {
+                    l + (new_n_features - old_n_features)
+                };
+                new_cat[j * new_words + nl / WORD_BITS] |= 1u64 << (nl % WORD_BITS);
+            }
+        }
+    }
+
+    // Rebuild include from the new ta rather than remapping bits, so
+    // include ↔ ta consistency holds by construction.
+    let mut new_include = vec![0u64; n_clauses * new_words];
+    for j in 0..n_clauses {
+        rebuild_include(
+            &new_ta[j * new_nl..(j + 1) * new_nl],
+            &mut new_include[j * new_words..(j + 1) * new_words],
+            &new_valid,
+            new_words,
+            new_nl,
+            half,
+        );
+    }
+
+    *ta = new_ta;
+    *include = new_include;
+    *ind = new_ind;
+    *cat = new_cat;
+    *valid = new_valid;
+    (new_nl, new_words)
+}
+
 /// Generate one 64-bit Bernoulli sample mask from a fixed-point probability.
 ///
 /// `digits` holds the base-2 expansion of the probability `p` (length = `MASK_BITS`).
@@ -1283,6 +1380,98 @@ pub(crate) fn type_iii_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- grow_dense_state -----------------------------------------------------
+
+    #[test]
+    fn grow_dense_state_relayouts_across_word_boundary() {
+        // old_nf = 40 (old_nl = 80, 2 words) -> new_nf = 70 (new_nl = 140, 3 words):
+        // the stride change and the negated-block shift both cross word boundaries.
+        let n_clauses = 2usize;
+        let (old_nf, new_nf) = (40usize, 70usize);
+        let (old_nl, old_words) = (2 * old_nf, words_for(2 * old_nf));
+        let half = 128u8;
+
+        // Distinctive TA/ind values encoding (clause, literal) so any misplacement
+        // is detected: ta = 7*j + l mod values that straddle half on both sides.
+        let mut ta = vec![0u8; n_clauses * old_nl];
+        let mut ind = vec![0u8; n_clauses * old_nl];
+        for j in 0..n_clauses {
+            for l in 0..old_nl {
+                ta[j * old_nl + l] = ((j * 89 + l * 3) % 256) as u8;
+                ind[j * old_nl + l] = ((j * 53 + l * 7 + 11) % 256) as u8;
+            }
+        }
+        let mut valid = vec![0u64; old_words];
+        for l in 0..old_nl {
+            valid[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
+        }
+        let mut include = vec![0u64; n_clauses * old_words];
+        for j in 0..n_clauses {
+            rebuild_include(
+                &ta[j * old_nl..(j + 1) * old_nl],
+                &mut include[j * old_words..(j + 1) * old_words],
+                &valid,
+                old_words,
+                old_nl,
+                half,
+            );
+        }
+        // cat bits on a spread of positions in both the positive and negated blocks.
+        let cat_bits = [0usize, 7, 39, 40, 63, 64, 79];
+        let mut cat = vec![0u64; n_clauses * old_words];
+        for (j, &l) in cat_bits.iter().enumerate().map(|(i, l)| (i % n_clauses, l)) {
+            cat[j * old_words + l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
+        }
+        let (old_ta, old_ind, old_cat) = (ta.clone(), ind.clone(), cat.clone());
+
+        let (new_nl, new_words) = grow_dense_state(
+            n_clauses, old_nf, new_nf, half, &mut ta, &mut include, &mut ind, &mut cat, &mut valid,
+        );
+        assert_eq!(new_nl, 2 * new_nf);
+        assert_eq!(new_words, words_for(2 * new_nf));
+
+        // Remap: positives stay, negateds shift by (new_nf - old_nf).
+        let remap = |l: usize| if l < old_nf { l } else { l + (new_nf - old_nf) };
+        let is_old_slot = |l: usize| l < old_nf || (new_nf..new_nf + old_nf).contains(&l);
+
+        for j in 0..n_clauses {
+            for l in 0..old_nl {
+                assert_eq!(ta[j * new_nl + remap(l)], old_ta[j * old_nl + l], "ta j={j} l={l}");
+                assert_eq!(ind[j * new_nl + remap(l)], old_ind[j * old_nl + l], "ind j={j} l={l}");
+            }
+            for l in 0..new_nl {
+                if !is_old_slot(l) {
+                    assert_eq!(ta[j * new_nl + l], half - 1, "new ta slot j={j} l={l}");
+                    assert_eq!(ind[j * new_nl + l], half, "new ind slot j={j} l={l}");
+                }
+                // include consistent with ta everywhere.
+                let inc_bit = include[j * new_words + l / WORD_BITS] >> (l % WORD_BITS) & 1;
+                assert_eq!(inc_bit == 1, ta[j * new_nl + l] >= half, "include j={j} l={l}");
+                // cat bits appear exactly at remapped positions.
+                let cat_bit = cat[j * new_words + l / WORD_BITS] >> (l % WORD_BITS) & 1;
+                let expected = if is_old_slot(l) {
+                    let ol = if l < old_nf { l } else { l - (new_nf - old_nf) };
+                    old_cat[j * old_words + ol / WORD_BITS] >> (ol % WORD_BITS) & 1
+                } else {
+                    0
+                };
+                assert_eq!(cat_bit, expected, "cat j={j} l={l}");
+            }
+        }
+
+        // valid covers exactly the new literal range.
+        for l in 0..new_words * WORD_BITS {
+            let bit = valid[l / WORD_BITS] >> (l % WORD_BITS) & 1;
+            assert_eq!(bit == 1, l < new_nl, "valid bit {l}");
+        }
+        // include padding bits above new_nl are zero.
+        for j in 0..n_clauses {
+            for l in new_nl..new_words * WORD_BITS {
+                assert_eq!(include[j * new_words + l / WORD_BITS] >> (l % WORD_BITS) & 1, 0);
+            }
+        }
+    }
 
     // ---- clause_fire vs fire_predict on an empty clause ----------------------
 

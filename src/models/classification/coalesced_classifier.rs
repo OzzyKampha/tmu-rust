@@ -21,9 +21,9 @@
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::PARALLEL_MIN;
 use crate::clause_bank::dense::{
-    bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, rebuild_include,
-    type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for, GOLDEN, MASK_BITS,
-    WORD_BITS,
+    bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, grow_dense_state,
+    rebuild_include, type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for,
+    GOLDEN, MASK_BITS, WORD_BITS,
 };
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
@@ -377,6 +377,53 @@ impl CoalescedTsetlinMachine {
     /// Return `true` if shared clause `clause` votes *for* `class` (weight `>= 0`).
     pub fn clause_is_positive(&self, class: usize, clause: usize) -> bool {
         self.weights[class * self.n_clauses + clause] >= 0
+    }
+
+    // ---- growing -----------------------------------------------------------
+
+    /// Grow the input space to `new_n_features`, preserving all learned automata.
+    ///
+    /// New features start fully excluded (TA state `half - 1`, one increment from
+    /// inclusion), so predictions on inputs whose new features are all 0 are
+    /// bit-identical to before the grow, while the new literals remain immediately
+    /// learnable. Clause weights, RNG streams, and hyperparameters are untouched.
+    ///
+    /// Typical use with a grown encoder:
+    /// `if enc.extend_categorical(&new_samples) > 0 { tm.grow_features(enc.n_features()); }`
+    ///
+    /// **Re-encode after growing**: previously produced [`EncodedSample`] /
+    /// [`EncodedBatch`] values use the old word stride and are geometry-incompatible
+    /// with the grown machine (this is only caught by `debug_assert!` in release
+    /// builds).
+    ///
+    /// # Panics
+    /// Panics if `new_n_features < self.n_features()` (shrinking is not supported).
+    /// A call with the current feature count is a no-op.
+    pub fn grow_features(&mut self, new_n_features: usize) {
+        assert!(
+            new_n_features >= self.n_features,
+            "grow_features cannot shrink: {} -> {new_n_features}",
+            self.n_features
+        );
+        if new_n_features == self.n_features {
+            return;
+        }
+        let n_clauses = self.n_clauses;
+        let (n_literals, words) = grow_dense_state(
+            n_clauses,
+            self.n_features,
+            new_n_features,
+            self.half,
+            &mut self.ta,
+            &mut self.include,
+            &mut self.ind,
+            &mut self.cat,
+            &mut self.valid,
+        );
+        self.n_features = new_n_features;
+        self.n_literals = n_literals;
+        self.words = words;
+        self.literals = vec![0u64; words];
     }
 
     // ---- inference -------------------------------------------------------
@@ -1218,5 +1265,199 @@ mod tests {
         for _ in 0..5 {
             tm.fit_epoch(&btr, &ytr);
         }
+    }
+
+    // ---- growing the feature space --------------------------------------------
+
+    /// Zero-pad every sample from its current length up to `n`.
+    fn pad_to(xs: &[Vec<u8>], n: usize) -> Vec<Vec<u8>> {
+        xs.iter()
+            .map(|x| {
+                let mut p = x.clone();
+                p.resize(n, 0);
+                p
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grow_preserves_predictions() {
+        let (xtr, ytr) = make_xor(3000, 0.1, 5);
+        let (xte, _) = make_xor(500, 0.0, 6);
+        let e12 = enc(12);
+        let btr = e12.encode_batch(&as_slices(&xtr));
+
+        let mut tm = CoalescedTsetlinMachine::with_config(2, 12, 16, 15, 3.9, 8, true, 7);
+        for _ in 0..20 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+
+        let bte12 = e12.encode_batch(&as_slices(&xte));
+        let preds_before = tm.predict_batch(&bte12);
+        let scores_before: Vec<[i32; 2]> = xte
+            .iter()
+            .map(|x| {
+                let mut out = [0i32; 2];
+                tm.scores(&e12.encode_one(x), &mut out);
+                out
+            })
+            .collect();
+
+        tm.grow_features(20);
+        assert_eq!(tm.n_features(), 20);
+        assert_eq!(tm.words_per_sample(), words_for(40));
+
+        // Same rows, zero-padded to the new width: predictions and per-class
+        // scores must be bit-identical (new literals are all excluded).
+        let e20 = enc(20);
+        let xte20 = pad_to(&xte, 20);
+        let bte20 = e20.encode_batch(&as_slices(&xte20));
+        assert_eq!(tm.predict_batch(&bte20), preds_before);
+        for (x, before) in xte20.iter().zip(&scores_before) {
+            let mut out = [0i32; 2];
+            tm.scores(&e20.encode_one(x), &mut out);
+            assert_eq!(&out, before, "scores changed after grow for {x:?}");
+        }
+    }
+
+    #[test]
+    fn grow_noop_when_equal() {
+        let (xtr, ytr) = make_xor(500, 0.0, 8);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let mut tm = CoalescedTsetlinMachine::with_config(2, 12, 16, 10, 3.0, 8, true, 42);
+        tm.fit_epoch(&btr, &ytr);
+
+        let (ta, include) = (tm.ta.clone(), tm.include.clone());
+        tm.grow_features(12);
+        assert_eq!(tm.n_features(), 12);
+        assert_eq!(tm.ta, ta);
+        assert_eq!(tm.include, include);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot shrink")]
+    fn grow_panics_on_shrink() {
+        let mut tm = CoalescedTsetlinMachine::with_config(2, 12, 16, 10, 3.0, 8, true, 42);
+        tm.grow_features(11);
+    }
+
+    #[test]
+    fn grow_preserves_clause_rules() {
+        let (xtr, ytr) = make_xor(2000, 0.1, 9);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let mut tm = CoalescedTsetlinMachine::with_config(2, 12, 16, 15, 3.9, 8, true, 7);
+        for _ in 0..10 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+
+        let rules_before: Vec<Vec<(usize, bool)>> =
+            (0..tm.n_clauses()).map(|j| tm.clause_rule(j)).collect();
+
+        tm.grow_features(30);
+
+        // Feature indices and negation flags are stable across the grow, so the
+        // interpretability mapping must be unchanged.
+        let rules_after: Vec<Vec<(usize, bool)>> =
+            (0..tm.n_clauses()).map(|j| tm.clause_rule(j)).collect();
+        assert_eq!(rules_before, rules_after);
+    }
+
+    #[test]
+    fn grow_then_learns_new_feature() {
+        // Pre-train on XOR over the first 12 features.
+        let (xtr, ytr) = make_xor(2000, 0.1, 10);
+        let e12 = enc(12);
+        let mut tm = CoalescedTsetlinMachine::with_config(2, 12, 16, 15, 3.9, 8, true, 7);
+        let btr = e12.encode_batch(&as_slices(&xtr));
+        for _ in 0..10 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+
+        tm.grow_features(16);
+
+        // New task determined solely by an appended feature: label = bit 14.
+        let mut rng = Rng::new(99);
+        let make = |rng: &mut Rng, n: usize| -> (Vec<Vec<u8>>, Vec<usize>) {
+            let mut xs = Vec::with_capacity(n);
+            let mut ys = Vec::with_capacity(n);
+            for _ in 0..n {
+                let f: Vec<u8> = (0..16).map(|_| (rng.next_u64() & 1) as u8).collect();
+                ys.push(f[14] as usize);
+                xs.push(f);
+            }
+            (xs, ys)
+        };
+        let (xtr2, ytr2) = make(&mut rng, 3000);
+        let (xte2, yte2) = make(&mut rng, 1000);
+
+        let e16 = enc(16);
+        let btr2 = e16.encode_batch(&as_slices(&xtr2));
+        let bte2 = e16.encode_batch(&as_slices(&xte2));
+        for _ in 0..15 {
+            tm.fit_epoch(&btr2, &ytr2);
+        }
+        let acc = tm.accuracy(&bte2, &yte2);
+        assert!(acc >= 0.95, "grown TM failed to learn new feature: {acc}");
+    }
+
+    #[test]
+    fn grow_with_type_iii_continues_training() {
+        let (xtr, ytr) = make_xor(1000, 0.1, 11);
+        let e12 = enc(12);
+        let btr = e12.encode_batch(&as_slices(&xtr));
+        let mut tm = CoalescedTsetlinMachine::with_config(2, 12, 16, 15, 3.9, 8, true, 7)
+            .type_iii_feedback(200.0);
+        for _ in 0..5 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+
+        tm.grow_features(18);
+        assert_eq!(tm.ind.len(), tm.ta.len());
+        assert_eq!(tm.cat.len(), tm.include.len());
+
+        let e18 = enc(18);
+        let xtr18 = pad_to(&xtr, 18);
+        let btr18 = e18.encode_batch(&as_slices(&xtr18));
+        for _ in 0..5 {
+            tm.fit_epoch(&btr18, &ytr);
+        }
+
+        // clause_rule must stay consistent with the include bitset after growing.
+        for clause in 0..tm.n_clauses() {
+            let rule = tm.clause_rule(clause);
+            let inc = &tm.include[clause * tm.words..(clause + 1) * tm.words];
+            let bitset_count: u32 = inc.iter().map(|w| w.count_ones()).sum();
+            assert_eq!(rule.len(), bitset_count as usize);
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn grown_model_serde_roundtrip() {
+        let (xtr, ytr) = make_xor(2000, 0.1, 12);
+        let (xte, _) = make_xor(500, 0.0, 13);
+        let e12 = enc(12);
+        let btr = e12.encode_batch(&as_slices(&xtr));
+        let mut tm = CoalescedTsetlinMachine::with_config(2, 12, 16, 15, 3.9, 8, true, 7);
+        for _ in 0..8 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+
+        tm.grow_features(20);
+        let e20 = enc(20);
+        let xtr20 = pad_to(&xtr, 20);
+        let btr20 = e20.encode_batch(&as_slices(&xtr20));
+        for _ in 0..4 {
+            tm.fit_epoch(&btr20, &ytr);
+        }
+
+        let mut buf = Vec::new();
+        tm.write_to(&mut buf).unwrap();
+        let loaded = CoalescedTsetlinMachine::read_from(&mut buf.as_slice()).unwrap();
+
+        let bte20 = e20.encode_batch(&as_slices(&pad_to(&xte, 20)));
+        assert_eq!(tm.predict_batch(&bte20), loaded.predict_batch(&bte20));
     }
 }
