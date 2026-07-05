@@ -51,6 +51,12 @@ fn time_epoch_dense(features: usize, cpc: usize, batch: &tmu_rs::EncodedBatch, y
     median_epoch(|| tm.fit_epoch(batch, ys))
 }
 
+/// Dense **data-parallel** (approximate) training: shards samples across threads.
+fn time_epoch_dense_dp(features: usize, cpc: usize, batch: &tmu_rs::EncodedBatch, ys: &[usize]) -> f64 {
+    let mut tm = TsetlinMachine::with_config(N_CLASSES, features, cpc, 20, 3.9, 8, true, 7);
+    median_epoch(|| tm.fit_epoch_parallel(batch, ys))
+}
+
 fn time_epoch_sparse(features: usize, cpc: usize, batch: &tmu_rs::EncodedBatch, ys: &[usize]) -> f64 {
     let mut tm = TMSparseClassifier::with_config(N_CLASSES, features, cpc, 20, 3.9, 8, true, 7)
         .max_included_literals(32);
@@ -86,12 +92,17 @@ fn main() {
     let e = Encoder::for_binary(feats_a);
     let btr = e.encode_batch(&as_slices(&xtr));
     println!("Sweep A — {feats_a} features (words={}), vary clauses/class:", feats_a / 32);
-    println!("  {:>7} | {:>10} | {:>10}", "clauses", "dense", "sparse");
-    println!("  {}", "-".repeat(33));
+    println!(
+        "  {:>7} | {:>12} | {:>12} | {:>10}",
+        "clauses", "dense(exact)", "dense(DP)", "sparse"
+    );
+    println!("  {}", "-".repeat(52));
     for &cpc in &[16usize, 64, 128, 256, 1024] {
         let d = time_epoch_dense(feats_a, cpc, &btr, &ytr);
+        let dp = time_epoch_dense_dp(feats_a, cpc, &btr, &ytr);
         let s = time_epoch_sparse(feats_a, cpc, &btr, &ytr);
-        println!("  {cpc:>7} | {d:>8.1}ms | {s:>8.1}ms");
+        let sp = d / dp;
+        println!("  {cpc:>7} | {d:>10.1}ms | {dp:>8.1}ms {sp:>3.1}x | {s:>8.1}ms");
     }
 
     // ── Sweep B: FIX low clause count, widen features (the headline) ────────
@@ -115,8 +126,10 @@ fn main() {
         );
     }
 
-    println!("\nCompare SCALAR vs PARALLEL runs. In Sweep B the work-aware gate lets");
-    println!("the wide cells parallelise SPARSE training despite only {cpc_b} clauses;");
-    println!("DENSE training stays scalar by design (parallelising few wide dense");
-    println!("clauses is slower — AVX2-fast work + per-sample Rayon dispatch).");
+    println!("\nCompare SCALAR vs PARALLEL runs:");
+    println!("- dense(exact): bit-identical clause-parallel; memory-bandwidth bound, so it");
+    println!("  only helps very large models (gated at DENSE_TRAIN_PARALLEL_MIN clauses).");
+    println!("- dense(DP): fit_epoch_parallel — approximate data-parallel over samples,");
+    println!("  ~2-4x faster than scalar at any size (see the xN column in Sweep A).");
+    println!("- sparse training + all inference use the work-aware gate (Follow-up 2).");
 }

@@ -38,6 +38,18 @@ pub(crate) const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
 #[cfg(feature = "parallel")]
 pub(crate) const PARALLEL_MIN: usize = 128;
 
+/// Clause-count floor for the **exact** dense clause-parallel *training* path.
+///
+/// Dense training is memory-bandwidth bound: `bench_training` (10k clauses) shows
+/// only ~1.3× on 4 cores, and `parallel_scaling` shows exact clause-parallel
+/// training is *slower* than scalar at moderate clause counts (the model stays
+/// L3-resident, so sharing it across cores just adds coherence traffic). So the
+/// exact path only clause-parallelises for genuinely large models where it wins;
+/// below this, `fit_epoch` runs scalar. For a real multicore speedup at any size,
+/// use `fit_epoch_parallel` (approximate, data-parallel over samples).
+#[cfg(feature = "parallel")]
+pub(crate) const DENSE_TRAIN_PARALLEL_MIN: usize = 4096;
+
 /// Total-work floor (items × per-item words) for the work-aware branch, for cases
 /// where a few heavy items still amortise Rayon dispatch. Calibrated from
 /// `examples/parallel_scaling.rs`: below ~256 work-units even sparse training and

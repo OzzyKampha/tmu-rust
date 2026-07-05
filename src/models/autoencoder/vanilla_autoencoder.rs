@@ -3,7 +3,7 @@
 //! Mirrors TMU's `vanilla_autoencoder.py` / `TMAutoEncoder`.
 
 #[cfg(feature = "parallel")]
-use crate::clause_bank::dense::{use_parallel, PARALLEL_MIN};
+use crate::clause_bank::dense::{use_parallel, DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN};
 use crate::clause_bank::dense::{
     bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, rebuild_include,
     type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for, GOLDEN, MASK_BITS,
@@ -482,7 +482,7 @@ impl TMAutoEncoder {
         let out_cat = &mut cat[o * cpo * words..(o + 1) * cpo * words];
 
         #[cfg(feature = "parallel")]
-        if cpo >= PARALLEL_MIN {
+        if cpo >= DENSE_TRAIN_PARALLEL_MIN {
             use rayon::prelude::*;
             if type_iii_en {
                 out_ta

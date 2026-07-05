@@ -3,7 +3,7 @@
 //! Mirrors TMU's `vanilla_classifier.py` / `TMClassifier`.
 
 #[cfg(feature = "parallel")]
-use crate::clause_bank::dense::{use_parallel, PARALLEL_MIN};
+use crate::clause_bank::dense::{use_parallel, DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN};
 use crate::clause_bank::dense::{
     bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, grow_dense_state,
     rebuild_include, type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for,
@@ -76,6 +76,14 @@ pub struct TsetlinMachine {
     d: f64,
     /// Whether Type III feedback is active during training.
     type_iii: bool,
+
+    /// When set, `update_class` never takes the nested Rayon path. Used to keep
+    /// per-shard replica training single-threaded inside `fit_epoch_parallel`
+    /// (which is already parallel across shards). Not serialised — a fresh/loaded
+    /// model always trains normally. Only read on `--features parallel`.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    train_scalar: bool,
 }
 
 #[cfg(feature = "serde")]
@@ -284,6 +292,7 @@ impl TsetlinMachine {
             cat: vec![0u64; n_clauses * words],
             d: 200.0,
             type_iii: false,
+            train_scalar: false,
         }
     }
 
@@ -567,10 +576,11 @@ impl TsetlinMachine {
     /// `target` is 1 for the true class and 0 for the sampled negative class.
     /// `sum` is the pre-computed clamped clause sum from `class_sum_train`.
     /// `lit_b` / `active_b` are byte-expanded per-sample arrays (precomputed in `fit_one_lit`).
-    /// When `--features parallel` is active and `clauses_per_class >= PARALLEL_MIN`,
-    /// the per-clause loop runs in parallel via rayon. (Dense training keeps the
-    /// count-only gate: per-clause work is AVX2-fast and Rayon is dispatched per
-    /// sample, so a few wide clauses don't amortise — see `use_parallel` docs.)
+    /// When `--features parallel` is active and `clauses_per_class >=
+    /// DENSE_TRAIN_PARALLEL_MIN`, the per-clause loop runs in parallel via rayon.
+    /// The threshold is high because exact clause-parallel training is
+    /// memory-bandwidth bound and only wins for very large models; for a real
+    /// multicore speedup at any size use `fit_epoch_parallel` (data-parallel).
     fn update_class(
         &mut self,
         c: usize,
@@ -594,6 +604,8 @@ impl TsetlinMachine {
         let type_iii_en = self.type_iii;
         let d_val = self.d;
         let target_bool = target != 0;
+        #[cfg(feature = "parallel")]
+        let force_scalar = self.train_scalar;
 
         let Self {
             ta,
@@ -641,7 +653,7 @@ impl TsetlinMachine {
         let class_cat = &mut cat[c * cps * words..(c + 1) * cps * words];
 
         #[cfg(feature = "parallel")]
-        if cps >= PARALLEL_MIN {
+        if !force_scalar && cps >= DENSE_TRAIN_PARALLEL_MIN {
             use rayon::prelude::*;
             if type_iii_en {
                 class_ta
@@ -797,6 +809,124 @@ impl TsetlinMachine {
         let data = batch.data.as_slice();
         for &i in &order {
             self.fit_one_lit(&data[i * w..(i + 1) * w], ys[i]);
+        }
+    }
+
+    /// Train one epoch using **data-parallel** clause learning: the epoch's samples
+    /// are sharded across Rayon threads, each thread trains a private replica of the
+    /// model on its shard, and the replicas are merged back into `self` by averaging
+    /// per-TA counters and per-clause weights (then rebuilding the include bitsets).
+    ///
+    /// Unlike [`fit_epoch`], this is **approximate**: results are *not* bit-identical
+    /// to sequential training and depend on the thread/shard count. In exchange it
+    /// scales with cores even for cache-resident models, where the exact
+    /// clause-parallel path (`fit_epoch` under `--features parallel`) is
+    /// memory-bandwidth bound and barely speeds up. Use it when training throughput
+    /// matters more than exact reproducibility; use [`fit_epoch`] for the exact,
+    /// deterministic path.
+    ///
+    /// Deterministic for a fixed thread count and seed. Requires `--features
+    /// parallel` (otherwise transparently falls back to [`fit_epoch`]).
+    ///
+    /// # Panics
+    /// Panics if Type III feedback is enabled (the averaging merge does not define
+    /// how to combine indicator/`clause_and_target` state across replicas).
+    pub fn fit_epoch_parallel(&mut self, batch: &EncodedBatch, ys: &[usize]) {
+        #[cfg(not(feature = "parallel"))]
+        {
+            self.fit_epoch(batch, ys);
+        }
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            assert!(
+                !self.type_iii,
+                "fit_epoch_parallel does not support Type III feedback; use fit_epoch"
+            );
+            debug_assert_eq!(batch.words, self.words);
+            let n = batch.n;
+            assert_eq!(n, ys.len());
+            if n == 0 {
+                return;
+            }
+
+            // Deterministic shuffle — same RNG stream position as fit_epoch.
+            let mut order: Vec<usize> = (0..n).collect();
+            for i in (1..n).rev() {
+                let k = self.rng.below(i + 1);
+                order.swap(i, k);
+            }
+
+            let w = self.words;
+            let data = batch.data.as_slice();
+            let n_shards = rayon::current_num_threads().clamp(1, n);
+            if n_shards == 1 {
+                for &i in &order {
+                    self.fit_one_lit(&data[i * w..(i + 1) * w], ys[i]);
+                }
+                return;
+            }
+
+            // Distinct per-replica RNG seeds, drawn deterministically from the master.
+            let seeds: Vec<u64> = (0..n_shards).map(|_| self.rng.next_u64()).collect();
+            let n_clauses = self.n_classes * self.clauses_per_class;
+            let n_cls = self.n_classes;
+
+            // Replicas: clone state, force scalar (no nested Rayon), reseed streams.
+            let mut replicas: Vec<TsetlinMachine> = seeds
+                .iter()
+                .map(|&sd| {
+                    let mut r = self.clone();
+                    r.train_scalar = true;
+                    r.rng = Rng::new(sd);
+                    r.literal_rng = Rng::new(sd ^ 0x4C49_5445_5241_4C21u64);
+                    r.rngs = (0..n_clauses)
+                        .map(|i| Rng::new(sd ^ (i as u64).wrapping_add(1).wrapping_mul(GOLDEN)))
+                        .collect();
+                    r.class_rngs = (0..n_cls)
+                        .map(|c| Rng::new(sd ^ (c as u64 + n_clauses as u64 + 1).wrapping_mul(GOLDEN)))
+                        .collect();
+                    r
+                })
+                .collect();
+
+            // Each replica trains sequentially on a contiguous shard of the order.
+            let shard_len = n.div_ceil(n_shards);
+            replicas.par_iter_mut().enumerate().for_each(|(s, replica)| {
+                let start = s * shard_len;
+                if start >= n {
+                    return;
+                }
+                let end = (start + shard_len).min(n);
+                for &i in &order[start..end] {
+                    replica.fit_one_lit(&data[i * w..(i + 1) * w], ys[i]);
+                }
+            });
+
+            // Merge: average TA counters and weights across replicas, then rebuild
+            // the include bitsets so they stay consistent with the merged TA.
+            let kf = replicas.len() as u32;
+            self.ta.par_iter_mut().enumerate().for_each(|(i, t)| {
+                let sum: u32 = replicas.iter().map(|r| r.ta[i] as u32).sum();
+                *t = ((sum + kf / 2) / kf) as u8;
+            });
+            let wmax = self.threshold;
+            self.weights.par_iter_mut().enumerate().for_each(|(i, wv)| {
+                let sum: i64 = replicas.iter().map(|r| r.weights[i] as i64).sum();
+                let avg = ((sum + kf as i64 / 2) / kf as i64) as i32;
+                *wv = avg.clamp(1, wmax);
+            });
+
+            let words = self.words;
+            let n_literals = self.n_literals;
+            let half = self.half;
+            let valid = self.valid.as_slice();
+            self.include
+                .par_chunks_mut(words)
+                .zip(self.ta.par_chunks(n_literals))
+                .for_each(|(inc_c, ta_c)| {
+                    rebuild_include(ta_c, inc_c, valid, words, n_literals, half);
+                });
         }
     }
 
@@ -2127,6 +2257,24 @@ mod tests {
             assert_eq!(p, tm.predict_lit(&bte.data[i * w..(i + 1) * w]));
         }
         assert!(tm.accuracy(&bte, &yte) > 0.9, "wide/few-clause model failed to learn");
+    }
+
+    #[test]
+    fn fit_epoch_parallel_learns_xor() {
+        // Data-parallel (approximate) training must still learn noisy XOR to high
+        // accuracy. Under `--features parallel` this shards across threads and
+        // merges replicas; without it, it falls back to the exact path.
+        let (xtr, ytr) = make_xor(6000, 0.1, 1);
+        let (xte, yte) = make_xor(2000, 0.0, 2);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let bte = e.encode_batch(&as_slices(&xte));
+        let mut tm = TsetlinMachine::with_config(2, 12, 40, 15, 3.9, 8, true, 7);
+        for _ in 0..30 {
+            tm.fit_epoch_parallel(&btr, &ytr);
+        }
+        let acc = tm.accuracy(&bte, &yte);
+        assert!(acc > 0.95, "data-parallel XOR accuracy too low: {acc}");
     }
 
     // ---- growing the feature space --------------------------------------------
