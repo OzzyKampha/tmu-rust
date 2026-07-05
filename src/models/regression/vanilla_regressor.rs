@@ -3,7 +3,7 @@
 //! Mirrors TMU's `vanilla_regressor.py` / `TMRegressor`.
 
 #[cfg(feature = "parallel")]
-use crate::clause_bank::dense::PARALLEL_MIN;
+use crate::clause_bank::dense::DENSE_TRAIN_PARALLEL_MIN;
 use crate::clause_bank::dense::{
     bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, rebuild_include,
     type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for, GOLDEN, MASK_BITS,
@@ -408,7 +408,7 @@ impl TMRegressor {
         let val = valid.as_slice();
 
         #[cfg(feature = "parallel")]
-        if n_clauses >= PARALLEL_MIN {
+        if n_clauses >= DENSE_TRAIN_PARALLEL_MIN {
             use rayon::prelude::*;
             if type_iii_en {
                 ta.par_chunks_mut(n_literals)

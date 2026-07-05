@@ -271,6 +271,60 @@ impl SparseClauseBank {
         }
     }
 
+    // ---- growing ---------------------------------------------------------
+
+    /// Grow the bank to `new_n_literals`, preserving every learned clause.
+    ///
+    /// The literal layout is `[positives 0..n_features | negateds n_features..2*n_features]`
+    /// (see [`pack`](crate::clause_bank::dense::pack)), so growing `n_features`
+    /// shifts the negated block up. Per clause: every stored index `>= old_n_features`
+    /// (a negated literal) is remapped by `+ (new_n_features - old_n_features)` in all
+    /// three pools, and the new positive/negated literals are appended to `excluded`
+    /// at the least-forgotten state (`half - 1`), exactly matching [`SparseClauseBank::new`].
+    ///
+    /// Because new literals enter as just-excluded candidates (never `included`),
+    /// firing on inputs whose new features are all 0 is unchanged — the same
+    /// zero-forgetting guarantee as the dense bank.
+    pub(crate) fn grow(&mut self, new_n_literals: usize) {
+        debug_assert!(new_n_literals >= self.n_literals);
+        debug_assert_eq!(new_n_literals % 2, 0);
+        if new_n_literals == self.n_literals {
+            return;
+        }
+        let old_nf = (self.n_literals / 2) as u32;
+        let new_nf = (new_n_literals / 2) as u32;
+        let shift = new_nf - old_nf;
+        let least_forgotten = self.half - 1;
+        let n_new = new_n_literals - self.n_literals;
+
+        for c in &mut self.clauses {
+            // Remap negated-literal indices (positives, being < old_nf, are untouched).
+            let remap = |l: &mut u32| {
+                if *l >= old_nf {
+                    *l += shift;
+                }
+            };
+            c.included.iter_mut().for_each(remap);
+            c.excluded.iter_mut().for_each(remap);
+            c.unallocated.iter_mut().for_each(remap);
+
+            // Append the new literals as just-excluded candidates: new positives
+            // [old_nf, new_nf) and new negateds [new_nf + old_nf, 2*new_nf).
+            c.excluded.reserve(n_new);
+            c.excluded_state.reserve(n_new);
+            for f in old_nf..new_nf {
+                c.excluded.push(f);
+                c.excluded_state.push(least_forgotten);
+            }
+            for l in (new_nf + old_nf)..(new_n_literals as u32) {
+                c.excluded.push(l);
+                c.excluded_state.push(least_forgotten);
+            }
+        }
+
+        self.n_literals = new_n_literals;
+    }
+
     // ---- parallel access -------------------------------------------------
 
     /// Mutable slice of all clauses, for clause-parallel feedback (Rayon).
@@ -609,6 +663,53 @@ mod tests {
             1,
             "at the include limit, no new literal should be promoted"
         );
+    }
+
+    #[test]
+    fn grow_remaps_negated_indices_and_adds_excluded() {
+        // 4 features (8 literals) -> 7 features (14 literals). half = 128.
+        let mut b = bank(1, 4);
+        let half = b.half;
+        // Include a positive literal (feat 1 → index 1) and a negated literal
+        // (feat 2 → index 4 + 2 = 6). Absorb out one excluded literal so the
+        // unallocated pool is also exercised.
+        force_include(&mut b, 0, 1, 200);
+        force_include(&mut b, 0, 6, 200);
+        {
+            let c = &mut b.clauses[0];
+            let pos = c.excluded.iter().position(|&x| x == 5).unwrap(); // neg of feat 1
+            c.excluded.swap_remove(pos);
+            c.excluded_state.swap_remove(pos);
+            c.unallocated.push(5);
+        }
+
+        b.grow(14); // 7 features
+
+        let c = &b.clauses[0];
+        // Positive index 1 unchanged; negated indices shifted by (7 - 4) = 3.
+        assert!(c.included.contains(&1), "positive index must be unchanged");
+        assert!(c.included.contains(&(6 + 3)), "negated index must shift by 3");
+        assert!(c.unallocated.contains(&(5 + 3)), "unallocated negated index must shift");
+        // New literals present as just-excluded: new positives 4,5,6 and new
+        // negateds 7+4..14 = 11,12,13.
+        for l in [4u32, 5, 6, 11, 12, 13] {
+            let pos = c.excluded.iter().position(|&x| x == l);
+            assert!(pos.is_some(), "new literal {l} must be in excluded");
+            assert_eq!(c.excluded_state[pos.unwrap()], half - 1);
+        }
+        // n_literals bookkeeping updated.
+        assert_eq!(b.n_literals, 14);
+    }
+
+    #[test]
+    fn grow_noop_when_equal() {
+        let mut b = bank(1, 4);
+        force_include(&mut b, 0, 2, 200);
+        let before = b.clauses[0].clone();
+        b.grow(8);
+        assert_eq!(b.n_literals, 8);
+        assert_eq!(b.clauses[0].included, before.included);
+        assert_eq!(b.clauses[0].excluded, before.excluded);
     }
 
     #[test]

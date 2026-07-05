@@ -19,7 +19,7 @@
 //! (the clause/literal bit layout is identical to the vanilla machine).
 
 #[cfg(feature = "parallel")]
-use crate::clause_bank::dense::PARALLEL_MIN;
+use crate::clause_bank::dense::{use_parallel, DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN};
 use crate::clause_bank::dense::{
     bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, grow_dense_state,
     rebuild_include, type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for,
@@ -89,6 +89,22 @@ pub struct CoalescedTsetlinMachine {
     literals: Vec<u64>,
     /// Global RNG for shuffling, clause dropout, and negative-class selection.
     rng: Rng,
+
+    /// Forces scalar training in per-shard replicas inside `fit_epoch_data_parallel`
+    /// (which is already parallel across shards). Not serialised; only read on
+    /// `--features parallel`.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    train_scalar: bool,
+    /// Opt-in: let `fit_epoch` use the approximate data-parallel path when large
+    /// enough. Off by default (exact). Not serialised.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    data_parallel: bool,
+    /// Whether the fast-training hint was already printed (once per model).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    hint_shown: bool,
 }
 
 #[cfg(feature = "serde")]
@@ -302,7 +318,21 @@ impl CoalescedTsetlinMachine {
             type_iii: false,
             literals: vec![0u64; words],
             rng,
+            train_scalar: false,
+            data_parallel: false,
+            hint_shown: false,
         }
+    }
+
+    /// Opt into **faster, approximate** training. When enabled (and built with
+    /// `--features parallel`), [`fit_epoch`](Self::fit_epoch) uses a data-parallel
+    /// path for large enough models (~2–3× faster on multiple cores). Results are
+    /// no longer bit-identical to exact training and depend on the thread count;
+    /// leave it off (default) for exact, reproducible training. No effect without
+    /// `--features parallel` or on small models. Unsupported with Type III.
+    pub fn data_parallel(mut self, on: bool) -> Self {
+        self.data_parallel = on;
+        self
     }
 
     // ---- builders --------------------------------------------------------
@@ -503,7 +533,7 @@ impl CoalescedTsetlinMachine {
         let n = batch.n;
         let w = self.words;
         #[cfg(feature = "parallel")]
-        if n >= PARALLEL_MIN && self.n_clauses >= PARALLEL_MIN {
+        if n >= PARALLEL_MIN && use_parallel(self.n_clauses, w) {
             use rayon::prelude::*;
             return (0..n)
                 .into_par_iter()
@@ -594,6 +624,8 @@ impl CoalescedTsetlinMachine {
         let type_iii_en = self.type_iii;
         let d_val = self.d;
         let target_bool = target != 0;
+        #[cfg(feature = "parallel")]
+        let force_scalar = self.train_scalar;
 
         let sum = self.class_sum(c, clause_outputs, clause_active);
         let t = self.threshold as f64;
@@ -629,7 +661,7 @@ impl CoalescedTsetlinMachine {
         let class_w = &mut weights[c * nc..(c + 1) * nc];
 
         #[cfg(feature = "parallel")]
-        if nc >= PARALLEL_MIN {
+        if !force_scalar && nc >= DENSE_TRAIN_PARALLEL_MIN {
             use rayon::prelude::*;
             if type_iii_en {
                 ta.par_chunks_mut(n_literals)
@@ -788,10 +820,28 @@ impl CoalescedTsetlinMachine {
     }
 
     /// Run one training epoch over an encoded batch, shuffling the order each epoch.
+    ///
+    /// Exact by default; switches to the approximate data-parallel path when
+    /// [`data_parallel(true)`](Self::data_parallel) is set and the workload is large
+    /// enough (requires `--features parallel`). Prints a one-time hint when a large
+    /// model is trained exactly without the flag.
     pub fn fit_epoch(&mut self, batch: &EncodedBatch, ys: &[usize]) {
         debug_assert_eq!(batch.words, self.words);
         let n = batch.n;
         assert_eq!(n, ys.len());
+
+        #[cfg(feature = "parallel")]
+        if self.data_parallel
+            && rayon::current_num_threads() > 1
+            && n >= PARALLEL_MIN
+            && use_parallel(self.n_clauses, self.words)
+        {
+            self.fit_epoch_data_parallel(batch, ys);
+            return;
+        }
+        #[cfg(feature = "parallel")]
+        self.maybe_hint_data_parallel(n);
+
         let mut order: Vec<usize> = (0..n).collect();
         for i in (1..n).rev() {
             let k = self.rng.below(i + 1);
@@ -801,6 +851,118 @@ impl CoalescedTsetlinMachine {
         let data = batch.data.as_slice();
         for &i in &order {
             self.fit_one_lit(&data[i * w..(i + 1) * w], ys[i]);
+        }
+    }
+
+    /// One-time stderr hint that a large model would train faster with
+    /// `data_parallel(true)`.
+    #[cfg(feature = "parallel")]
+    fn maybe_hint_data_parallel(&mut self, n: usize) {
+        // Only when: flag off, not yet shown, and multi-core (else it wouldn't help).
+        if self.hint_shown || self.data_parallel || rayon::current_num_threads() <= 1 {
+            return;
+        }
+        if n >= 512 && self.n_clauses.saturating_mul(self.words) >= 8192 {
+            eprintln!(
+                "tmu-rs: training a large model ({} clauses × {} features) on the exact \
+                 path — call .data_parallel(true) for ~2-3× faster (approximate, \
+                 data-parallel) training.",
+                self.n_clauses, self.n_features
+            );
+            self.hint_shown = true;
+        }
+    }
+
+    /// Data-parallel epoch (approximate); invoked only from [`fit_epoch`] when
+    /// [`data_parallel`](Self::data_parallel) is set and the workload is large
+    /// enough. Merges replicas by averaging per-TA counters and signed weights.
+    #[cfg(feature = "parallel")]
+    fn fit_epoch_data_parallel(&mut self, batch: &EncodedBatch, ys: &[usize]) {
+        {
+            use rayon::prelude::*;
+            assert!(
+                !self.type_iii,
+                "data_parallel does not support Type III feedback; unset it or use exact fit_epoch"
+            );
+            debug_assert_eq!(batch.words, self.words);
+            let n = batch.n;
+            assert_eq!(n, ys.len());
+            if n == 0 {
+                return;
+            }
+
+            let mut order: Vec<usize> = (0..n).collect();
+            for i in (1..n).rev() {
+                let k = self.rng.below(i + 1);
+                order.swap(i, k);
+            }
+
+            let w = self.words;
+            let data = batch.data.as_slice();
+            let n_shards = rayon::current_num_threads().clamp(1, n);
+            if n_shards == 1 {
+                for &i in &order {
+                    self.fit_one_lit(&data[i * w..(i + 1) * w], ys[i]);
+                }
+                return;
+            }
+
+            let seeds: Vec<u64> = (0..n_shards).map(|_| self.rng.next_u64()).collect();
+            let nc = self.n_clauses;
+            let n_cls = self.n_classes;
+
+            let mut replicas: Vec<CoalescedTsetlinMachine> = seeds
+                .iter()
+                .map(|&sd| {
+                    let mut r = self.clone();
+                    r.train_scalar = true;
+                    r.rng = Rng::new(sd);
+                    r.literal_rng = Rng::new(sd ^ 0x4C49_5445_5241_4C21u64);
+                    r.rngs = (0..nc)
+                        .map(|i| Rng::new(sd ^ (i as u64).wrapping_add(1).wrapping_mul(GOLDEN)))
+                        .collect();
+                    r.class_rngs = (0..n_cls)
+                        .map(|c| Rng::new(sd ^ (c as u64 + nc as u64 + 1).wrapping_mul(GOLDEN)))
+                        .collect();
+                    r
+                })
+                .collect();
+
+            let shard_len = n.div_ceil(n_shards);
+            replicas.par_iter_mut().enumerate().for_each(|(s, replica)| {
+                let start = s * shard_len;
+                if start >= n {
+                    return;
+                }
+                let end = (start + shard_len).min(n);
+                for &i in &order[start..end] {
+                    replica.fit_one_lit(&data[i * w..(i + 1) * w], ys[i]);
+                }
+            });
+
+            // Merge: average TA counters and (signed, unbounded) weights.
+            let kf = replicas.len() as u32;
+            self.ta.par_iter_mut().enumerate().for_each(|(i, t)| {
+                let sum: u32 = replicas.iter().map(|r| r.ta[i] as u32).sum();
+                *t = ((sum + kf / 2) / kf) as u8;
+            });
+            self.weights.par_iter_mut().enumerate().for_each(|(i, wv)| {
+                let sum: i64 = replicas.iter().map(|r| r.weights[i] as i64).sum();
+                let k = kf as i64;
+                // Rounded average (symmetric for negative sums).
+                *wv = ((sum + k / 2 * sum.signum()) / k) as i32;
+            });
+
+            let words = self.words;
+            let n_literals = self.n_literals;
+            let half = self.half;
+            let valid = self.valid.as_slice();
+            self.include
+                .par_chunks_mut(words)
+                .zip(self.ta.par_chunks(n_literals))
+                .for_each(|(inc_c, ta_c)| {
+                    rebuild_include(ta_c, inc_c, valid, words, n_literals, half);
+                });
         }
     }
 
@@ -814,7 +976,7 @@ impl CoalescedTsetlinMachine {
         let n = batch.n;
         let w = self.words;
         #[cfg(feature = "parallel")]
-        if n >= PARALLEL_MIN {
+        if n >= PARALLEL_MIN && use_parallel(self.n_clauses, w) {
             use rayon::prelude::*;
             let correct: usize = (0..n)
                 .into_par_iter()
@@ -1265,6 +1427,24 @@ mod tests {
         for _ in 0..5 {
             tm.fit_epoch(&btr, &ytr);
         }
+    }
+
+    #[test]
+    fn data_parallel_learns_xor() {
+        // 16 clauses/T=15 mirrors `coalesced_learns_xor` (a small bank generalises
+        // best on noisy XOR — more low-T clauses overfit the label noise).
+        let (xtr, ytr) = make_xor(5000, 0.25, 1);
+        let (xte, yte) = make_xor(2000, 0.0, 2);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let bte = e.encode_batch(&as_slices(&xte));
+        let mut tm =
+            CoalescedTsetlinMachine::with_config(2, 12, 16, 15, 3.9, 8, true, 7).data_parallel(true);
+        for _ in 0..40 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+        let acc = tm.accuracy(&bte, &yte);
+        assert!(acc > 0.9, "coalesced data_parallel XOR accuracy too low: {acc}");
     }
 
     // ---- growing the feature space --------------------------------------------

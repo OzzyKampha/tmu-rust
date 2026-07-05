@@ -38,6 +38,43 @@ pub(crate) const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
 #[cfg(feature = "parallel")]
 pub(crate) const PARALLEL_MIN: usize = 128;
 
+/// Clause-count floor for the **exact** dense clause-parallel *training* path.
+///
+/// Dense training is memory-bandwidth bound: `bench_training` (10k clauses) shows
+/// only ~1.3× on 4 cores, and `parallel_scaling` shows exact clause-parallel
+/// training is *slower* than scalar at moderate clause counts (the model stays
+/// L3-resident, so sharing it across cores just adds coherence traffic). So the
+/// exact path only clause-parallelises for genuinely large models where it wins;
+/// below this, `fit_epoch` runs scalar. For a real multicore speedup at any size,
+/// use `.fast_training(true)` (approximate, data-parallel over samples).
+#[cfg(feature = "parallel")]
+pub(crate) const DENSE_TRAIN_PARALLEL_MIN: usize = 4096;
+
+/// Total-work floor (items × per-item words) for the work-aware branch, for cases
+/// where a few heavy items still amortise Rayon dispatch. Calibrated from
+/// `examples/parallel_scaling.rs`: below ~256 work-units even sparse training and
+/// sample-parallel inference lose to dispatch overhead; the win grows above it.
+#[cfg(feature = "parallel")]
+pub(crate) const PARALLEL_WORK_MIN: usize = 256;
+
+/// Decide whether to take a Rayon path: parallelise when there are **many items**
+/// (`items >= PARALLEL_MIN`, the original rule) **OR** the **total work is large**
+/// (`items × words_per_item >= PARALLEL_WORK_MIN`) — the latter catches
+/// **few-but-wide** workloads (e.g. 16 clauses over a million literals) the
+/// count-only rule wrongly ran single-threaded.
+///
+/// Used for **sample-parallel inference** (all models) and **sparse training**,
+/// which the `parallel_scaling` benchmark shows benefit from the work term. Dense
+/// *training* deliberately keeps the count-only gate: its per-clause work is
+/// AVX2-fast and Rayon is dispatched per sample, so parallelising a few wide
+/// clauses is pure overhead (measured regression). Bit-identical either way
+/// (disjoint per-item state), so this only selects a code path, never the result.
+#[cfg(feature = "parallel")]
+#[inline]
+pub(crate) fn use_parallel(items: usize, words_per_item: usize) -> bool {
+    items >= PARALLEL_MIN || items.saturating_mul(words_per_item) >= PARALLEL_WORK_MIN
+}
+
 /// Return the minimum number of 64-bit words needed to hold `bits` bits.
 #[inline(always)]
 pub(crate) fn words_for(bits: usize) -> usize {
@@ -1380,6 +1417,23 @@ pub(crate) fn type_iii_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- parallel_by_work -----------------------------------------------------
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn use_parallel_thresholds() {
+        // Many items: original count rule still fires regardless of width.
+        assert!(use_parallel(PARALLEL_MIN, 1));
+        assert!(!use_parallel(PARALLEL_MIN - 1, 1));
+        // Few-but-wide: crosses the total-work floor (PARALLEL_WORK_MIN = 256).
+        assert!(use_parallel(4, 64)); // 256
+        assert!(use_parallel(2, 200)); // 400
+        assert!(!use_parallel(4, 32)); // 128 < 256, and 4 < 128 → scalar
+        assert!(!use_parallel(4, 1)); // trivial → scalar
+        // No overflow at extreme sizes.
+        assert!(use_parallel(usize::MAX, usize::MAX));
+    }
 
     // ---- grow_dense_state -----------------------------------------------------
 

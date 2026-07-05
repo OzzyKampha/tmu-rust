@@ -5,7 +5,7 @@
 //! from [`crate::CoalescedTsetlinMachine`].
 
 #[cfg(feature = "parallel")]
-use crate::clause_bank::dense::PARALLEL_MIN;
+use crate::clause_bank::dense::{use_parallel, DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN};
 use crate::clause_bank::dense::{
     bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, rebuild_include,
     type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for, GOLDEN, MASK_BITS,
@@ -344,7 +344,7 @@ impl TMCoalescedAutoEncoder {
         let w = self.words;
         let packed = batch.data.as_slice();
         #[cfg(feature = "parallel")]
-        if n >= PARALLEL_MIN {
+        if n >= PARALLEL_MIN && use_parallel(self.n_clauses, w) {
             use rayon::prelude::*;
             return (0..n)
                 .into_par_iter()
@@ -456,7 +456,7 @@ impl TMCoalescedAutoEncoder {
         let out_w = &mut weights[o * nc..(o + 1) * nc];
 
         #[cfg(feature = "parallel")]
-        if nc >= PARALLEL_MIN {
+        if nc >= DENSE_TRAIN_PARALLEL_MIN {
             use rayon::prelude::*;
             if type_iii_en {
                 ta.par_chunks_mut(n_literals)
@@ -660,7 +660,7 @@ impl TMCoalescedAutoEncoder {
         let packed = batch.data.as_slice();
 
         #[cfg(feature = "parallel")]
-        if n >= PARALLEL_MIN {
+        if n >= PARALLEL_MIN && use_parallel(self.n_clauses, w) {
             use rayon::prelude::*;
             let correct: usize = (0..n)
                 .into_par_iter()
