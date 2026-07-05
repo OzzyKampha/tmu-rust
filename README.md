@@ -56,7 +56,8 @@ let accuracy = tm.accuracy(&test_x, &test_y);
   - `TMCompositeClassifier` — ensemble of per-class Tsetlin Machines with independent clause banks
   - `TMAutoEncoder` — binary reconstruction via positive-only clause banks
   - `TMSparseClassifier` — sparse clause bank with **absorbing actions**: literals are permanently dropped from each clause as training converges, so memory and per-clause evaluation scale with the number of *active* literals (a big win in high-dimensional, sparsely-relevant feature spaces)
-- Optional multi-threaded training via [Rayon](https://github.com/rayon-rs/rayon) (`--features parallel`)
+- **Growing feature space** — extend a trained model with new features as the encoder learns new symbols, *without discarding learned automata*: `Encoder::extend_categorical` / `grow_binary` paired with `grow_features` on the vanilla, coalesced, and sparse classifiers. Predictions on previously-seen inputs stay bit-identical across the grow; the new features are immediately learnable
+- Optional multi-threaded training via [Rayon](https://github.com/rayon-rs/rayon) (`--features parallel`): work-aware parallel inference, plus an opt-in approximate **data-parallel** training mode (`.data_parallel(true)`, ~2–3× on multiple cores) — while `fit_epoch` stays exact and deterministic by default
 - AVX2 fast paths for clause update loops with runtime dispatch — u8 TA counters processed 32-wide (4× smaller working set vs u32; scalar fallback on non-AVX2 targets)
 - Type-safe `Encoder` for binary, numeric (quantile booleanization), and categorical inputs
 - Fast booleanizer for continuous-valued inputs
@@ -95,6 +96,35 @@ AVX2 fast paths are also activated at runtime automatically when the CPU support
 
 ---
 
+## Growing a trained model
+
+When new data introduces symbols the encoder has never seen, grow the vocabulary and the machine instead of retraining from scratch. Existing feature indices stay stable and every learned clause is preserved, so predictions on previously-seen inputs are unchanged:
+
+```rust
+// New events arrive with tokens not in the original vocabulary.
+let added = encoder.extend_categorical(&new_samples); // append new tokens as new features
+if added > 0 {
+    tm.grow_features(encoder.n_features());            // widen the machine to match
+}
+// Re-encode with the grown encoder, then keep training — old detections intact,
+// new features learned. Works on TsetlinMachine, CoalescedTsetlinMachine, TMSparseClassifier.
+```
+
+See `examples/growing.rs` (a Sysmon detector that learns new adversary tooling incrementally) and `examples/grow_scaling.rs` (dense vs sparse as the literal space grows to 1M features).
+
+## Faster training (optional, approximate)
+
+`fit_epoch` is **exact and deterministic by default**. On a multi-core build (`--features parallel`) you can opt into an approximate **data-parallel** epoch — samples are sharded across cores, each trains a replica, and the replicas are merged — typically ~2–3× faster, by setting one flag; you still call `fit_epoch`:
+
+```rust
+let mut tm = TsetlinMachine::with_config(/* … */).data_parallel(true);
+tm.fit_epoch(&train_x, &train_y); // shards across cores when the model is large enough
+```
+
+Trade-off: results are no longer bit-identical to sequential training (accuracy tracks exact within noise). Leave it off for exact, reproducible runs. Training a large model on the exact path prints a one-time hint suggesting the flag. Validate accuracy with `examples/dp_vs_exact.rs`; measure throughput with `examples/parallel_scaling.rs`.
+
+---
+
 ## Examples
 
 The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) demos with matching hyperparameters (e.g. MNIST: 2000 clauses, T=50, s=10.0; IMDb: 2000 clauses, T=80, s=10.0). See [PORTING_STATUS.md](PORTING_STATUS.md) for the full status.
@@ -127,6 +157,10 @@ The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) demos with 
 
 | Example | Description |
 |---|---|
+| `growing` | Grow a trained detector's vocabulary + literal space on new data, keeping learned automata (Sysmon story) |
+| `grow_scaling` | Dense vs sparse literal-space growth to 1M features; grow latency, memory, inference throughput |
+| `parallel_scaling` | Training ms/epoch vs clauses × literals; exact vs `data_parallel`, scalar vs `--features parallel` |
+| `dp_vs_exact` | Validate `data_parallel(true)` accuracy against exact training on real data (breast cancer) |
 | `sparse_vs_dense` | Dense vs sparse head-to-head: accuracy parity, memory footprint, train/inference time |
 | `save_load` | Train → save → load → predict/resume round-trip |
 | `ndr_flows` | Synthetic network-flow detection (booleanizer + rule extraction) |
