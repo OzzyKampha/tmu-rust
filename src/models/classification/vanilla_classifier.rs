@@ -864,10 +864,13 @@ impl TsetlinMachine {
     }
 
     /// One-time stderr hint that a large model would train faster with
-    /// `data_parallel(true)`. No-op once shown, or if the flag is already set.
+    /// `data_parallel(true)`. Shown only when ALL hold: the flag is off, the model
+    /// is genuinely large, there is more than one core (so it would actually help),
+    /// and it hasn't been shown yet for this model.
     #[cfg(feature = "parallel")]
     fn maybe_hint_data_parallel(&mut self, n: usize) {
-        if self.hint_shown || self.data_parallel {
+        // Suppressed when the flag is already set, already shown, or single-core.
+        if self.hint_shown || self.data_parallel || rayon::current_num_threads() <= 1 {
             return;
         }
         // Only nag when the workload is genuinely large enough that data-parallel

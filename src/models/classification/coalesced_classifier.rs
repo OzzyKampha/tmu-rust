@@ -858,7 +858,8 @@ impl CoalescedTsetlinMachine {
     /// `data_parallel(true)`.
     #[cfg(feature = "parallel")]
     fn maybe_hint_data_parallel(&mut self, n: usize) {
-        if self.hint_shown || self.data_parallel {
+        // Only when: flag off, not yet shown, and multi-core (else it wouldn't help).
+        if self.hint_shown || self.data_parallel || rayon::current_num_threads() <= 1 {
             return;
         }
         if n >= 512 && self.n_clauses.saturating_mul(self.words) >= 8192 {
