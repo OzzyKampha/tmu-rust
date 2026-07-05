@@ -3,7 +3,7 @@
 //! Mirrors TMU's `vanilla_autoencoder.py` / `TMAutoEncoder`.
 
 #[cfg(feature = "parallel")]
-use crate::clause_bank::dense::PARALLEL_MIN;
+use crate::clause_bank::dense::{use_parallel, PARALLEL_MIN};
 use crate::clause_bank::dense::{
     bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, rebuild_include,
     type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for, GOLDEN, MASK_BITS,
@@ -337,7 +337,7 @@ impl TMAutoEncoder {
         let w = self.words;
         let packed = batch.data.as_slice();
         #[cfg(feature = "parallel")]
-        if n >= PARALLEL_MIN && self.clauses_per_output >= PARALLEL_MIN {
+        if n >= PARALLEL_MIN && use_parallel(self.clauses_per_output, w) {
             use rayon::prelude::*;
             return (0..n)
                 .into_par_iter()
@@ -667,7 +667,7 @@ impl TMAutoEncoder {
         let packed = batch.data.as_slice();
 
         #[cfg(feature = "parallel")]
-        if n >= PARALLEL_MIN {
+        if n >= PARALLEL_MIN && use_parallel(self.clauses_per_output, w) {
             use rayon::prelude::*;
             let correct: usize = (0..n)
                 .into_par_iter()

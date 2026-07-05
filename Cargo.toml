@@ -141,6 +141,10 @@ path = "examples/growing.rs"
 name = "grow_scaling"         # Growing at scale: dense vs sparse literal-space growth + parallel effect
 path = "examples/grow_scaling.rs"
 
+[[example]]
+name = "parallel_scaling"     # Training ms/epoch vs clauses × literals; work-aware Rayon gate effect
+path = "examples/parallel_scaling.rs"
+
 [[bench]]
 name = "throughput"
 path = "benches/throughput.rs"

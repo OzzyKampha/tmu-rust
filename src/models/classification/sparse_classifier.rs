@@ -29,6 +29,8 @@
 //! All other public API mirrors [`TsetlinMachine`] one-to-one.
 
 #[cfg(feature = "parallel")]
+use crate::clause_bank::dense::use_parallel;
+#[cfg(feature = "parallel")]
 use crate::clause_bank::dense::PARALLEL_MIN;
 use crate::clause_bank::dense::{words_for, GOLDEN, WORD_BITS};
 use crate::clause_bank::sparse::SparseClauseBank;
@@ -333,7 +335,7 @@ impl TMSparseClassifier {
         let n = batch.len();
         let w = self.words;
         #[cfg(feature = "parallel")]
-        if n >= PARALLEL_MIN && self.clauses_per_class >= PARALLEL_MIN {
+        if n >= PARALLEL_MIN && use_parallel(self.clauses_per_class, w) {
             use rayon::prelude::*;
             return (0..n)
                 .into_par_iter()
@@ -352,7 +354,7 @@ impl TMSparseClassifier {
         let n = batch.len();
         let w = self.words;
         #[cfg(feature = "parallel")]
-        if n >= PARALLEL_MIN {
+        if n >= PARALLEL_MIN && use_parallel(self.clauses_per_class, w) {
             use rayon::prelude::*;
             let correct: usize = (0..n)
                 .into_par_iter()
@@ -389,6 +391,8 @@ impl TMSparseClassifier {
     /// Apply Type I / II feedback to all clauses of class `c`.
     fn update_class(&mut self, c: usize, target: u8, sum: i32, lit: &[u64], lit_active: &[u64]) {
         let cps = self.clauses_per_class;
+        #[cfg(feature = "parallel")]
+        let words = self.words;
         let boost = self.boost_true_positive;
         let wmax = self.threshold;
         let max_inc = self.max_included_literals;
@@ -470,8 +474,13 @@ impl TMSparseClassifier {
         let w_slice = &mut weights[c * cps..(c + 1) * cps];
         let rng_slice = &mut rngs[c * cps..(c + 1) * cps];
 
+        // Sparse training benefits from the work term (its per-clause loop is
+        // scalar, so wide clauses amortise Rayon well — measured in
+        // parallel_scaling). `words` upper-bounds a clause's variable index-list
+        // work; after absorbing convergence the real work is smaller, so this may
+        // over-parallelise late training (mild overhead only), never under.
         #[cfg(feature = "parallel")]
-        if cps >= PARALLEL_MIN {
+        if use_parallel(cps, words) {
             use rayon::prelude::*;
             clause_slice
                 .par_iter_mut()
@@ -781,6 +790,44 @@ mod tests {
             sparse_acc >= dense_acc - 0.05,
             "sparse {sparse_acc} lags dense {dense_acc} by more than 0.05"
         );
+    }
+
+    #[test]
+    fn use_parallel_wide_few_clauses() {
+        // 32 clauses/class (< the 128 count threshold) but 256 features → words=8,
+        // so cps*words=256 engages the work-aware branch for BOTH sparse training
+        // and inference. Results are path-independent; predict_batch must match the
+        // per-sample path and the model must learn. Under `--features parallel`
+        // this covers the branch the old count-only gate skipped for wide,
+        // few-clause sparse models.
+        let nf = 256;
+        let mut rng = Rng::new(5);
+        let mut gen = |n: usize| -> (Vec<Vec<u8>>, Vec<usize>) {
+            let mut xs = Vec::new();
+            let mut ys = Vec::new();
+            for _ in 0..n {
+                let f: Vec<u8> = (0..nf).map(|_| (rng.next_u64() & 1) as u8).collect();
+                ys.push((f[0] ^ f[1]) as usize);
+                xs.push(f);
+            }
+            (xs, ys)
+        };
+        let (xtr, ytr) = gen(2000);
+        let (xte, yte) = gen(500);
+        let e = Encoder::for_binary(nf);
+        let btr = encode(&xtr, &e);
+        let bte = encode(&xte, &e);
+        let mut tm =
+            TMSparseClassifier::with_config(2, nf, 32, 15, 3.9, 8, true, 7).max_included_literals(8);
+        for _ in 0..30 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+        let w = tm.words;
+        let batch = tm.predict_batch(&bte);
+        for (i, &p) in batch.iter().enumerate() {
+            assert_eq!(p, tm.predict_lit(&bte.data[i * w..(i + 1) * w]));
+        }
+        assert!(tm.accuracy(&bte, &yte) > 0.9, "wide/few-clause sparse model failed to learn");
     }
 
     // ---- growing the feature space --------------------------------------------

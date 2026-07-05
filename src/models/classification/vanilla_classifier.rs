@@ -3,7 +3,7 @@
 //! Mirrors TMU's `vanilla_classifier.py` / `TMClassifier`.
 
 #[cfg(feature = "parallel")]
-use crate::clause_bank::dense::PARALLEL_MIN;
+use crate::clause_bank::dense::{use_parallel, PARALLEL_MIN};
 use crate::clause_bank::dense::{
     bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, grow_dense_state,
     rebuild_include, type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for,
@@ -519,7 +519,7 @@ impl TsetlinMachine {
         let n = batch.n;
         let w = self.words;
         #[cfg(feature = "parallel")]
-        if n >= PARALLEL_MIN && self.clauses_per_class >= PARALLEL_MIN {
+        if n >= PARALLEL_MIN && use_parallel(self.clauses_per_class, w) {
             use rayon::prelude::*;
             return (0..n)
                 .into_par_iter()
@@ -568,7 +568,9 @@ impl TsetlinMachine {
     /// `sum` is the pre-computed clamped clause sum from `class_sum_train`.
     /// `lit_b` / `active_b` are byte-expanded per-sample arrays (precomputed in `fit_one_lit`).
     /// When `--features parallel` is active and `clauses_per_class >= PARALLEL_MIN`,
-    /// the per-clause loop runs in parallel via rayon.
+    /// the per-clause loop runs in parallel via rayon. (Dense training keeps the
+    /// count-only gate: per-clause work is AVX2-fast and Rayon is dispatched per
+    /// sample, so a few wide clauses don't amortise — see `use_parallel` docs.)
     fn update_class(
         &mut self,
         c: usize,
@@ -808,7 +810,7 @@ impl TsetlinMachine {
         let n = batch.n;
         let w = self.words;
         #[cfg(feature = "parallel")]
-        if n >= PARALLEL_MIN {
+        if n >= PARALLEL_MIN && use_parallel(self.clauses_per_class, w) {
             use rayon::prelude::*;
             let correct: usize = (0..n)
                 .into_par_iter()
@@ -2086,6 +2088,45 @@ mod tests {
             .type_iii_feedback(100.0);
         assert_eq!(tm.ind.len(), tm.ta.len());
         assert_eq!(tm.cat.len(), tm.include.len());
+    }
+
+    // ---- work-aware parallel gating -------------------------------------------
+
+    #[test]
+    fn use_parallel_wide_few_clauses_inference() {
+        // 32 clauses/class is below the count threshold (128), but 256 features
+        // → words=8, so cps*words=256 crosses the work floor and the work-aware
+        // INFERENCE branch engages under `--features parallel`. Results are
+        // path-independent, so predict_batch must equal the per-sample path and
+        // the model must still learn — under a parallel build this exercises the
+        // branch the old count-only gate would have skipped.
+        let nf = 256;
+        let mut rng = Rng::new(5);
+        let mut gen = |n: usize| -> (Vec<Vec<u8>>, Vec<usize>) {
+            let mut xs = Vec::new();
+            let mut ys = Vec::new();
+            for _ in 0..n {
+                let f: Vec<u8> = (0..nf).map(|_| (rng.next_u64() & 1) as u8).collect();
+                ys.push((f[0] ^ f[1]) as usize);
+                xs.push(f);
+            }
+            (xs, ys)
+        };
+        let (xtr, ytr) = gen(2000);
+        let (xte, yte) = gen(500);
+        let e = enc(nf);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let bte = e.encode_batch(&as_slices(&xte));
+        let mut tm = TsetlinMachine::with_config(2, nf, 32, 15, 3.9, 8, true, 7);
+        for _ in 0..20 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+        let w = tm.words_per_sample();
+        let batch = tm.predict_batch(&bte);
+        for (i, &p) in batch.iter().enumerate() {
+            assert_eq!(p, tm.predict_lit(&bte.data[i * w..(i + 1) * w]));
+        }
+        assert!(tm.accuracy(&bte, &yte) > 0.9, "wide/few-clause model failed to learn");
     }
 
     // ---- growing the feature space --------------------------------------------

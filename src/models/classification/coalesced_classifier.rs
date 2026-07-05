@@ -19,7 +19,7 @@
 //! (the clause/literal bit layout is identical to the vanilla machine).
 
 #[cfg(feature = "parallel")]
-use crate::clause_bank::dense::PARALLEL_MIN;
+use crate::clause_bank::dense::{use_parallel, PARALLEL_MIN};
 use crate::clause_bank::dense::{
     bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, grow_dense_state,
     rebuild_include, type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for,
@@ -503,7 +503,7 @@ impl CoalescedTsetlinMachine {
         let n = batch.n;
         let w = self.words;
         #[cfg(feature = "parallel")]
-        if n >= PARALLEL_MIN && self.n_clauses >= PARALLEL_MIN {
+        if n >= PARALLEL_MIN && use_parallel(self.n_clauses, w) {
             use rayon::prelude::*;
             return (0..n)
                 .into_par_iter()
@@ -814,7 +814,7 @@ impl CoalescedTsetlinMachine {
         let n = batch.n;
         let w = self.words;
         #[cfg(feature = "parallel")]
-        if n >= PARALLEL_MIN {
+        if n >= PARALLEL_MIN && use_parallel(self.n_clauses, w) {
             use rayon::prelude::*;
             let correct: usize = (0..n)
                 .into_par_iter()
