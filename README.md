@@ -26,19 +26,24 @@ tmu-rs = { git = "https://github.com/ozzykampha/tmu-rust" }
 Then use it:
 
 ```rust
-use tmu_rs::{TsetlinMachine, Encoder};
+use tmu_rs::{Encoder, TsetlinMachine};
 
-// Build encoder from training data (binary features in this example)
-let encoder = Encoder::binary(n_features);
+// Encoder for already-binary (0/1) features; `raw_*` are `&[&[u8]]`.
+let encoder = Encoder::for_binary(n_features);
 let train_x = encoder.encode_batch(&raw_train_x);
+let test_x = encoder.encode_batch(&raw_test_x);
 
-// Create and train the classifier
-let mut tm = TsetlinMachine::with_config(
-    n_classes, clauses_per_class, n_features,
-    threshold, specificity, max_states, boost_true_positive, seed,
-);
+// Simple constructor: (n_classes, n_features, clauses_per_class, threshold T, specificity s)
+let mut tm = TsetlinMachine::new(n_classes, n_features, clauses_per_class, threshold, s);
+
+// …or full control:
+// let mut tm = TsetlinMachine::with_config(
+//     n_classes, n_features, clauses_per_class,
+//     threshold, s, state_bits, boost_true_positive, seed,
+// );
+
 for _ in 0..epochs {
-    tm.fit_epoch(&train_x, &train_y);
+    tm.fit_epoch(&train_x, &train_y); // train_y: &[usize]
 }
 let accuracy = tm.accuracy(&test_x, &test_y);
 ```
