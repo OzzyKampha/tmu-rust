@@ -145,6 +145,10 @@ path = "examples/grow_scaling.rs"
 name = "parallel_scaling"     # Training ms/epoch vs clauses × literals; work-aware Rayon gate effect
 path = "examples/parallel_scaling.rs"
 
+[[example]]
+name = "dp_vs_exact"          # Validate data-parallel vs exact training accuracy on real data (breast cancer)
+path = "examples/dp_vs_exact.rs"
+
 [[bench]]
 name = "throughput"
 path = "benches/throughput.rs"
