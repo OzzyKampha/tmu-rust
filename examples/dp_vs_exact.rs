@@ -3,7 +3,7 @@
 //! Trains two identically-configured, identically-seeded Tsetlin Machines on the
 //! Wisconsin Breast Cancer dataset (30 numeric features, 2 classes) — one with
 //! the exact [`TsetlinMachine::fit_epoch`], one with the approximate
-//! [`TsetlinMachine::fit_epoch_parallel`] (data-parallel over samples) — and
+//! `fit_epoch` with `.data_parallel(true)` (data-parallel over samples) — and
 //! reports test accuracy for each so their gap is visible. Averaged over a few
 //! seeds to smooth the data-parallel path's thread-count nondeterminism.
 //!
@@ -56,7 +56,7 @@ fn main() {
     let mode = "SCALAR (data-parallel falls back to exact)".to_string();
 
     println!("Breast Cancer — {} samples, {} features, {n_classes} classes [{mode}]", xs.len(), xs[0].len());
-    println!("exact fit_epoch  vs  approximate fit_epoch_parallel, {epochs} epochs, {seeds} seeds\n");
+    println!("exact fit_epoch  vs  fit_epoch + data_parallel(true), {epochs} epochs, {seeds} seeds\n");
     println!("  {:>4} | {:>12} | {:>12} | {:>7}", "seed", "exact test", "DP test", "gap");
     println!("  {}", "-".repeat(46));
 
@@ -66,11 +66,14 @@ fn main() {
 
         // Two identically-seeded models: only the epoch method differs.
         let nf = enc.n_features();
+        // Both call fit_epoch; only the data_parallel flag differs (exact vs
+        // approximate data-parallel). Same config + seed otherwise.
         let mut exact = TsetlinMachine::with_config(n_classes, nf, 300, 100, 5.0, 8, true, 7);
-        let mut dp = TsetlinMachine::with_config(n_classes, nf, 300, 100, 5.0, 8, true, 7);
+        let mut dp =
+            TsetlinMachine::with_config(n_classes, nf, 300, 100, 5.0, 8, true, 7).data_parallel(true);
         for _ in 0..epochs {
             exact.fit_epoch(&btr, &ytr);
-            dp.fit_epoch_parallel(&btr, &ytr);
+            dp.fit_epoch(&btr, &ytr);
         }
         let ea = exact.accuracy(&bte, &yte);
         let da = dp.accuracy(&bte, &yte);

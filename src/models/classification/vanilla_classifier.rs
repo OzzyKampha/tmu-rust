@@ -78,12 +78,22 @@ pub struct TsetlinMachine {
     type_iii: bool,
 
     /// When set, `update_class` never takes the nested Rayon path. Used to keep
-    /// per-shard replica training single-threaded inside `fit_epoch_parallel`
+    /// per-shard replica training single-threaded inside `fit_epoch_data_parallel`
     /// (which is already parallel across shards). Not serialised — a fresh/loaded
     /// model always trains normally. Only read on `--features parallel`.
     #[cfg_attr(feature = "serde", serde(skip))]
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     train_scalar: bool,
+
+    /// Opt-in: let `fit_epoch` use the faster (approximate) data-parallel path when
+    /// the workload is large enough. Off by default (exact training). Not serialised.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    data_parallel: bool,
+    /// Whether the "use data_parallel" hint has already been printed (once per model).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    hint_shown: bool,
 }
 
 #[cfg(feature = "serde")]
@@ -293,7 +303,25 @@ impl TsetlinMachine {
             d: 200.0,
             type_iii: false,
             train_scalar: false,
+            data_parallel: false,
+            hint_shown: false,
         }
+    }
+
+    /// Opt into **faster, approximate** training. When enabled (and built with
+    /// `--features parallel`), [`fit_epoch`](Self::fit_epoch) transparently uses a
+    /// data-parallel path for large enough models — samples are sharded across
+    /// threads, each thread trains a replica, and the replicas are merged by
+    /// averaging. Typically ~2–3× faster on multiple cores.
+    ///
+    /// Trade-off: results are **no longer bit-identical** to exact training and
+    /// depend on the thread count (accuracy tracks exact within noise, occasionally
+    /// ±a sample — not a strict guarantee). Leave it off (the default) for exact,
+    /// reproducible training. No effect without `--features parallel` or on models
+    /// too small to benefit. Unsupported with Type III feedback.
+    pub fn data_parallel(mut self, on: bool) -> Self {
+        self.data_parallel = on;
+        self
     }
 
     /// Limit how many literals each clause may include (Type Ia guard).
@@ -580,7 +608,7 @@ impl TsetlinMachine {
     /// DENSE_TRAIN_PARALLEL_MIN`, the per-clause loop runs in parallel via rayon.
     /// The threshold is high because exact clause-parallel training is
     /// memory-bandwidth bound and only wins for very large models; for a real
-    /// multicore speedup at any size use `fit_epoch_parallel` (data-parallel).
+    /// multicore speedup at any size use `.data_parallel(true)` (data-parallel).
     fn update_class(
         &mut self,
         c: usize,
@@ -796,10 +824,33 @@ impl TsetlinMachine {
     }
 
     /// Run one training epoch over an encoded batch, shuffling the order each epoch.
+    ///
+    /// **Exact by default** — bit-identical to sequential training and deterministic.
+    /// If [`data_parallel(true)`](Self::data_parallel) was set *and* the build has
+    /// `--features parallel` *and* the model/batch are large enough to benefit, this
+    /// transparently switches to the faster **data-parallel** path (approximate; see
+    /// [`data_parallel`](Self::data_parallel)). You always call `fit_epoch` either way.
+    ///
+    /// When training a large model on the exact path without the flag, a one-time
+    /// hint is printed to stderr suggesting `data_parallel(true)`.
     pub fn fit_epoch(&mut self, batch: &EncodedBatch, ys: &[usize]) {
         debug_assert_eq!(batch.words, self.words);
         let n = batch.n;
         assert_eq!(n, ys.len());
+
+        // Opt-in fast path: data-parallel, but only when it actually helps.
+        #[cfg(feature = "parallel")]
+        if self.data_parallel
+            && rayon::current_num_threads() > 1
+            && n >= PARALLEL_MIN
+            && use_parallel(self.n_classes * self.clauses_per_class, self.words)
+        {
+            self.fit_epoch_data_parallel(batch, ys);
+            return;
+        }
+        #[cfg(feature = "parallel")]
+        self.maybe_hint_data_parallel(n);
+
         let mut order: Vec<usize> = (0..n).collect();
         for i in (1..n).rev() {
             let k = self.rng.below(i + 1);
@@ -812,36 +863,40 @@ impl TsetlinMachine {
         }
     }
 
-    /// Train one epoch using **data-parallel** clause learning: the epoch's samples
-    /// are sharded across Rayon threads, each thread trains a private replica of the
-    /// model on its shard, and the replicas are merged back into `self` by averaging
-    /// per-TA counters and per-clause weights (then rebuilding the include bitsets).
-    ///
-    /// Unlike [`fit_epoch`], this is **approximate**: results are *not* bit-identical
-    /// to sequential training and depend on the thread/shard count. In exchange it
-    /// scales with cores even for cache-resident models, where the exact
-    /// clause-parallel path (`fit_epoch` under `--features parallel`) is
-    /// memory-bandwidth bound and barely speeds up. Use it when training throughput
-    /// matters more than exact reproducibility; use [`fit_epoch`] for the exact,
-    /// deterministic path.
-    ///
-    /// Deterministic for a fixed thread count and seed. Requires `--features
-    /// parallel` (otherwise transparently falls back to [`fit_epoch`]).
-    ///
-    /// # Panics
-    /// Panics if Type III feedback is enabled (the averaging merge does not define
-    /// how to combine indicator/`clause_and_target` state across replicas).
-    pub fn fit_epoch_parallel(&mut self, batch: &EncodedBatch, ys: &[usize]) {
-        #[cfg(not(feature = "parallel"))]
-        {
-            self.fit_epoch(batch, ys);
+    /// One-time stderr hint that a large model would train faster with
+    /// `data_parallel(true)`. No-op once shown, or if the flag is already set.
+    #[cfg(feature = "parallel")]
+    fn maybe_hint_data_parallel(&mut self, n: usize) {
+        if self.hint_shown || self.data_parallel {
+            return;
         }
-        #[cfg(feature = "parallel")]
+        // Only nag when the workload is genuinely large enough that data-parallel
+        // clearly pays (enough samples to amortise the per-epoch clone/merge, and a
+        // model big enough — ~256+ clauses at moderate width — to scale on cores).
+        let n_clauses = self.n_classes * self.clauses_per_class;
+        if n >= 512 && n_clauses.saturating_mul(self.words) >= 8192 {
+            eprintln!(
+                "tmu-rs: training a large model ({n_clauses} clauses × {} features) on the \
+                 exact path — call .data_parallel(true) for ~2-3× faster (approximate, \
+                 data-parallel) training.",
+                self.n_features
+            );
+            self.hint_shown = true;
+        }
+    }
+
+    /// Data-parallel epoch: shard the samples across Rayon threads, train a private
+    /// replica per shard, merge by averaging per-TA counters and per-clause weights
+    /// (then rebuild the include bitsets). Approximate and thread-count dependent;
+    /// invoked only from [`fit_epoch`] when [`data_parallel`](Self::data_parallel) is
+    /// set and the workload is large enough to benefit. Panics under Type III.
+    #[cfg(feature = "parallel")]
+    fn fit_epoch_data_parallel(&mut self, batch: &EncodedBatch, ys: &[usize]) {
         {
             use rayon::prelude::*;
             assert!(
                 !self.type_iii,
-                "fit_epoch_parallel does not support Type III feedback; use fit_epoch"
+                "data_parallel does not support Type III feedback; unset it or use exact fit_epoch"
             );
             debug_assert_eq!(batch.words, self.words);
             let n = batch.n;
@@ -2260,21 +2315,20 @@ mod tests {
     }
 
     #[test]
-    fn fit_epoch_parallel_learns_xor() {
-        // Data-parallel (approximate) training must still learn noisy XOR to high
-        // accuracy. Under `--features parallel` this shards across threads and
-        // merges replicas; without it, it falls back to the exact path.
+    fn data_parallel_learns_xor() {
+        // With data_parallel(true), fit_epoch uses the approximate data-parallel
+        // path when large enough; it must still learn noisy XOR to high accuracy.
         let (xtr, ytr) = make_xor(6000, 0.1, 1);
         let (xte, yte) = make_xor(2000, 0.0, 2);
         let e = enc(12);
         let btr = e.encode_batch(&as_slices(&xtr));
         let bte = e.encode_batch(&as_slices(&xte));
-        let mut tm = TsetlinMachine::with_config(2, 12, 40, 15, 3.9, 8, true, 7);
+        let mut tm = TsetlinMachine::with_config(2, 12, 40, 15, 3.9, 8, true, 7).data_parallel(true);
         for _ in 0..30 {
-            tm.fit_epoch_parallel(&btr, &ytr);
+            tm.fit_epoch(&btr, &ytr);
         }
         let acc = tm.accuracy(&bte, &yte);
-        assert!(acc > 0.95, "data-parallel XOR accuracy too low: {acc}");
+        assert!(acc > 0.95, "data_parallel XOR accuracy too low: {acc}");
     }
 
     // ---- growing the feature space --------------------------------------------

@@ -46,7 +46,7 @@ pub(crate) const PARALLEL_MIN: usize = 128;
 /// L3-resident, so sharing it across cores just adds coherence traffic). So the
 /// exact path only clause-parallelises for genuinely large models where it wins;
 /// below this, `fit_epoch` runs scalar. For a real multicore speedup at any size,
-/// use `fit_epoch_parallel` (approximate, data-parallel over samples).
+/// use `.fast_training(true)` (approximate, data-parallel over samples).
 #[cfg(feature = "parallel")]
 pub(crate) const DENSE_TRAIN_PARALLEL_MIN: usize = 4096;
 

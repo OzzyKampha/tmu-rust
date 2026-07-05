@@ -51,10 +51,11 @@ fn time_epoch_dense(features: usize, cpc: usize, batch: &tmu_rs::EncodedBatch, y
     median_epoch(|| tm.fit_epoch(batch, ys))
 }
 
-/// Dense **data-parallel** (approximate) training: shards samples across threads.
+/// Dense **data-parallel** (approximate) training via the data_parallel flag.
 fn time_epoch_dense_dp(features: usize, cpc: usize, batch: &tmu_rs::EncodedBatch, ys: &[usize]) -> f64 {
-    let mut tm = TsetlinMachine::with_config(N_CLASSES, features, cpc, 20, 3.9, 8, true, 7);
-    median_epoch(|| tm.fit_epoch_parallel(batch, ys))
+    let mut tm =
+        TsetlinMachine::with_config(N_CLASSES, features, cpc, 20, 3.9, 8, true, 7).data_parallel(true);
+    median_epoch(|| tm.fit_epoch(batch, ys))
 }
 
 fn time_epoch_sparse(features: usize, cpc: usize, batch: &tmu_rs::EncodedBatch, ys: &[usize]) -> f64 {
@@ -97,7 +98,7 @@ fn main() {
         "clauses", "dense(exact)", "dense(DP)", "sparse"
     );
     println!("  {}", "-".repeat(52));
-    for &cpc in &[16usize, 64, 128, 256, 1024] {
+    for &cpc in &[16usize, 64, 256, 1024, 4096, 8192, 16384] {
         let d = time_epoch_dense(feats_a, cpc, &btr, &ytr);
         let dp = time_epoch_dense_dp(feats_a, cpc, &btr, &ytr);
         let s = time_epoch_sparse(feats_a, cpc, &btr, &ytr);
@@ -129,7 +130,7 @@ fn main() {
     println!("\nCompare SCALAR vs PARALLEL runs:");
     println!("- dense(exact): bit-identical clause-parallel; memory-bandwidth bound, so it");
     println!("  only helps very large models (gated at DENSE_TRAIN_PARALLEL_MIN clauses).");
-    println!("- dense(DP): fit_epoch_parallel — approximate data-parallel over samples,");
+    println!("- dense(DP): fit_epoch + data_parallel(true) — approximate data-parallel,");
     println!("  ~2-4x faster than scalar at any size (see the xN column in Sweep A).");
     println!("- sparse training + all inference use the work-aware gate (Follow-up 2).");
 }
