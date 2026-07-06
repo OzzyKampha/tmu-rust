@@ -26,6 +26,15 @@ All notable changes to tmu-rs are documented here.
   memory footprint, train/inference time); see the "Dense vs Sparse" section in
   `BENCHMARKS.md`.
 
+### Changed
+- **Rust 2024 edition** — the crate now builds with `edition = "2024"` and declares
+  `rust-version = "1.96"` (the latest stable toolchain; 2024 edition itself needs
+  only ≥ 1.85).
+  Migration notes: bodies of AVX2 `unsafe fn`s are wrapped in explicit `unsafe {}`
+  blocks (2024 no longer treats an `unsafe fn` body as one big unsafe block), the
+  `gen` identifier (now a reserved keyword) was renamed, and two closure patterns
+  were adjusted for the 2024 match-ergonomics rules. No behavior changes.
+
 ---
 
 ## [1.0.0] — 2026-06-25

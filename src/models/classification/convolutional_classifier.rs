@@ -964,7 +964,7 @@ impl ConvolutionalTsetlinMachine {
         let correct = xs
             .iter()
             .zip(ys)
-            .filter(|(&x, &y)| self.predict(x) == y)
+            .filter(|&(&x, &y)| self.predict(x) == y)
             .count();
         correct as f64 / xs.len() as f64
     }

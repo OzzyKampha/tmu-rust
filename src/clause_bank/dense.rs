@@ -234,7 +234,7 @@ unsafe fn rebuild_include_avx2(
     words: usize,
     n_literals: usize,
     half: u8,
-) {
+) { unsafe {
     use std::arch::x86_64::*;
 
     // Bias both sides by 0x80 to convert unsigned >= to signed >.
@@ -268,7 +268,7 @@ unsafe fn rebuild_include_avx2(
 
         inc[k] = word & valid[k];
     }
-}
+}}
 
 /// Grow a dense clause bank from `old_n_features` to `new_n_features`, preserving
 /// every learned per-clause state. Returns `(new_n_literals, new_words)`.
@@ -508,7 +508,7 @@ unsafe fn type_i_update_bytes_avx2(
     keep_b: &[u8],
     active_b: &[u8],
     max_state: u8,
-) {
+) { unsafe {
     use std::arch::x86_64::*;
 
     let max_state_v = _mm256_set1_epi8(max_state as i8);
@@ -592,7 +592,7 @@ unsafe fn type_i_update_bytes_avx2(
             l += 1;
         }
     }
-}
+}}
 
 /// Apply Type II TA feedback to one clause (byte-array inputs).
 ///
@@ -670,7 +670,7 @@ unsafe fn type_ii_update_bytes_avx2(
     active_b: &[u8],
     half: u8,
     max_state: u8,
-) {
+) { unsafe {
     use std::arch::x86_64::*;
 
     let max_state_v = _mm256_set1_epi8(max_state as i8);
@@ -723,7 +723,7 @@ unsafe fn type_ii_update_bytes_avx2(
         ta[l] = t.saturating_add(inc).min(max_state);
         l += 1;
     }
-}
+}}
 
 /// Type Ia / Ib feedback for one clause from packed bit inputs (test helper).
 ///
@@ -955,7 +955,7 @@ unsafe fn type_iii_ind_words_avx2(
     valid: &[u64],
     do_inc: bool,
     max_ind: u8,
-) {
+) { unsafe {
     use std::arch::x86_64::*;
 
     let max_ind_v = _mm256_set1_epi8(max_ind as i8);
@@ -1036,7 +1036,7 @@ unsafe fn type_iii_ind_words_avx2(
         ind[l] = ind[l].saturating_add(inc).min(max_ind).saturating_sub(dec);
         l += 1;
     }
-}
+}}
 
 /// Fused [`type_iii_ind_words`] + [`type_iii_ta_dec_bytes`] in a single pass over `ind`.
 ///
@@ -1131,7 +1131,7 @@ unsafe fn type_iii_ind_words_and_ta_dec_avx2(
     do_inc: bool,
     max_ind: u8,
     half_ind: u8,
-) {
+) { unsafe {
     use std::arch::x86_64::*;
 
     let max_ind_v = _mm256_set1_epi8(max_ind as i8);
@@ -1228,7 +1228,7 @@ unsafe fn type_iii_ind_words_and_ta_dec_avx2(
         ta[l] = ta[l].saturating_sub(active_b[l] & (new_ind < half_ind) as u8);
         l += 1;
     }
-}
+}}
 
 /// Decrement `ta[l]` by 1 (saturating) for each literal that is active and has `ind[l] < half_ind`.
 ///
@@ -1280,7 +1280,7 @@ unsafe fn type_iii_ta_dec_bytes_avx2(
     n_literals: usize,
     active_b: &[u8],
     half_ind: u8,
-) {
+) { unsafe {
     use std::arch::x86_64::*;
 
     let ones = _mm256_set1_epi8(1);
@@ -1317,7 +1317,7 @@ unsafe fn type_iii_ta_dec_bytes_avx2(
         ta[l] = ta[l].saturating_sub(dec);
         l += 1;
     }
-}
+}}
 
 /// Apply Type III TA feedback to one clause — mirrors TMU's `cb_type_iii_feedback`.
 ///

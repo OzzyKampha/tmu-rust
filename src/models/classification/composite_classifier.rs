@@ -156,7 +156,7 @@ impl TMCompositeClassifier {
     /// Fraction of correctly predicted samples in an encoded batch.
     pub fn accuracy(&self, batch: &EncodedBatch, ys: &[usize]) -> f64 {
         let preds = self.predict_batch(batch);
-        let correct = preds.iter().zip(ys).filter(|(&p, &y)| p == y).count();
+        let correct = preds.iter().zip(ys).filter(|&(&p, &y)| p == y).count();
         correct as f64 / ys.len() as f64
     }
 }
