@@ -802,7 +802,7 @@ mod tests {
         // few-clause sparse models.
         let nf = 256;
         let mut rng = Rng::new(5);
-        let mut gen = |n: usize| -> (Vec<Vec<u8>>, Vec<usize>) {
+        let mut gen_batch = |n: usize| -> (Vec<Vec<u8>>, Vec<usize>) {
             let mut xs = Vec::new();
             let mut ys = Vec::new();
             for _ in 0..n {
@@ -812,8 +812,8 @@ mod tests {
             }
             (xs, ys)
         };
-        let (xtr, ytr) = gen(2000);
-        let (xte, yte) = gen(500);
+        let (xtr, ytr) = gen_batch(2000);
+        let (xte, yte) = gen_batch(500);
         let e = Encoder::for_binary(nf);
         let btr = encode(&xtr, &e);
         let bte = encode(&xte, &e);

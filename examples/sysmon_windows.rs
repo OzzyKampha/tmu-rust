@@ -380,7 +380,7 @@ fn real_file_mode(path: &str) {
         let active: Vec<&str> = bits
             .iter()
             .enumerate()
-            .filter(|(_, &b)| b == 1)
+            .filter(|&(_, &b)| b == 1)
             .map(|(bit, _)| encoder.feature_name(bit))
             .collect();
         println!(

@@ -44,7 +44,7 @@ fn lognormal(r: &mut Rng, mu: f64, sigma: f64) -> f64 {
 }
 
 /// Generate `n` synthetic network-flow records; `mal_frac` controls the fraction of malicious flows.
-fn gen(n: usize, mal_frac: f64, seed: u64) -> (Vec<Vec<f64>>, Vec<usize>) {
+fn gen_flows(n: usize, mal_frac: f64, seed: u64) -> (Vec<Vec<f64>>, Vec<usize>) {
     let mut r = Rng::new(seed);
     let mut xs = Vec::with_capacity(n);
     let mut ys = Vec::with_capacity(n);
@@ -83,8 +83,8 @@ fn gen(n: usize, mal_frac: f64, seed: u64) -> (Vec<Vec<f64>>, Vec<usize>) {
 
 /// Run the full NDR pipeline: generate synthetic flows, encode, train TM, report metrics and rules.
 fn main() {
-    let (xtr, ytr) = gen(4000, 0.3, 1);
-    let (xte, yte) = gen(1500, 0.3, 2);
+    let (xtr, ytr) = gen_flows(4000, 0.3, 1);
+    let (xte, yte) = gen_flows(1500, 0.3, 2);
 
     let xtr_ref: Vec<&[f64]> = xtr.iter().map(|r| r.as_slice()).collect();
     let xte_ref: Vec<&[f64]> = xte.iter().map(|r| r.as_slice()).collect();

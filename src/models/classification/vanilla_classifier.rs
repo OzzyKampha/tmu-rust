@@ -2290,7 +2290,7 @@ mod tests {
         // branch the old count-only gate would have skipped.
         let nf = 256;
         let mut rng = Rng::new(5);
-        let mut gen = |n: usize| -> (Vec<Vec<u8>>, Vec<usize>) {
+        let mut gen_batch = |n: usize| -> (Vec<Vec<u8>>, Vec<usize>) {
             let mut xs = Vec::new();
             let mut ys = Vec::new();
             for _ in 0..n {
@@ -2300,8 +2300,8 @@ mod tests {
             }
             (xs, ys)
         };
-        let (xtr, ytr) = gen(2000);
-        let (xte, yte) = gen(500);
+        let (xtr, ytr) = gen_batch(2000);
+        let (xte, yte) = gen_batch(500);
         let e = enc(nf);
         let btr = e.encode_batch(&as_slices(&xtr));
         let bte = e.encode_batch(&as_slices(&xte));
