@@ -28,8 +28,8 @@ All notable changes to tmu-rs are documented here.
 
 ### Changed
 - **Rust 2024 edition** — the crate now builds with `edition = "2024"` and declares
-  `rust-version = "1.87"` (2024 edition needs ≥ 1.85; the crate also uses
-  `is_multiple_of`, stable since 1.87).
+  `rust-version = "1.96"` (the latest stable toolchain; 2024 edition itself needs
+  only ≥ 1.85).
   Migration notes: bodies of AVX2 `unsafe fn`s are wrapped in explicit `unsafe {}`
   blocks (2024 no longer treats an `unsafe fn` body as one big unsafe block), the
   `gen` identifier (now a reserved keyword) was renamed, and two closure patterns
