@@ -87,7 +87,7 @@ impl GpuTsetlinMachine {
 
         // Guard the largest buffers against the adapter's binding-size limit.
         let dims = super::buffers::Dims::from(&host);
-        let max_bind = ctx.limits.max_storage_buffer_binding_size as u64;
+        let max_bind = ctx.limits.max_storage_buffer_binding_size;
         let ta_bytes = (dims.n_clauses * dims.n_literals * 4) as u64;
         let inc_bytes = (dims.n_clauses * dims.w32 * 4) as u64;
         for (what, needed) in [("ta", ta_bytes), ("include", inc_bytes)] {
@@ -122,6 +122,15 @@ impl GpuTsetlinMachine {
 
         // Host-RNG epoch plan (advances host rng / literal_rng exactly as CPU).
         let plan = self.host.gpu_epoch_plan(n, ys);
+
+        // Mirror CPU's transient `literals` scratch (the last processed sample),
+        // so a GPU-trained model serializes byte-identically to a CPU-trained one.
+        if let Some(&last) = plan.order.last() {
+            let words = self.host.words;
+            self.host
+                .literals
+                .copy_from_slice(&batch.data[last * words..(last + 1) * words]);
+        }
 
         // Config may need refreshing if literal dropout was toggled.
         let has_la = self.host.literal_drop_p > 0.0;
