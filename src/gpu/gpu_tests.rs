@@ -4,8 +4,8 @@
 //! environments without a GPU or software Vulkan driver.
 
 use super::context::GpuContext;
-use crate::clause_bank::dense::{bmask_word, digits_of, MASK_BITS};
 use crate::Rng;
+use crate::clause_bank::dense::{MASK_BITS, bmask_word, digits_of};
 
 fn ctx() -> Option<GpuContext> {
     match GpuContext::new() {
@@ -31,7 +31,13 @@ struct RngParams {
 }
 
 /// Run one entry point of rng_test.wgsl and return `n_seeds * n_outputs` u64s.
-fn run_stream(ctx: &GpuContext, entry: &str, raw_states: &[u64], n_outputs: usize, digits: u32) -> Vec<u64> {
+fn run_stream(
+    ctx: &GpuContext,
+    entry: &str,
+    raw_states: &[u64],
+    n_outputs: usize,
+    digits: u32,
+) -> Vec<u64> {
     use wgpu::util::DeviceExt;
     let dev = &ctx.device;
 
@@ -83,9 +89,18 @@ fn run_stream(ctx: &GpuContext, entry: &str, raw_states: &[u64], n_outputs: usiz
         label: None,
         layout: &pipeline.get_bind_group_layout(0),
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: p_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: seed_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: out_buf.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: p_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: seed_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: out_buf.as_entire_binding(),
+            },
         ],
     });
 
@@ -111,8 +126,18 @@ fn run_stream(ctx: &GpuContext, entry: &str, raw_states: &[u64], n_outputs: usiz
 fn splitmix_stream_bit_exact() {
     let Some(ctx) = ctx() else { return };
     let seeds: Vec<u64> = vec![
-        0, 1, 2, 42, 12345, u64::MAX, u64::MAX - 1, 0x9E3779B97F4A7C15,
-        0xDEADBEEF, 0xFFFF_0000_FFFF_0000, 7, 99999999,
+        0,
+        1,
+        2,
+        42,
+        12345,
+        u64::MAX,
+        u64::MAX - 1,
+        0x9E3779B97F4A7C15,
+        0xDEADBEEF,
+        0xFFFF_0000_FFFF_0000,
+        7,
+        99999999,
     ];
     let n_out = 4096;
 

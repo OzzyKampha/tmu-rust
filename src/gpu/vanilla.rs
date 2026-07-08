@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use wgpu::util::DeviceExt;
 
-use crate::encoder::EncodedBatch;
 use crate::TsetlinMachine;
+use crate::encoder::EncodedBatch;
 
-use super::buffers::{read_u32, DeviceState};
+use super::buffers::{DeviceState, read_u32};
 use super::context::{GpuContext, GpuError};
 
 /// Host-RNG decisions for one epoch, precomputed on the CPU so `self.rng` /
@@ -265,7 +265,10 @@ impl GpuTsetlinMachine {
             self.ctx.queue.submit(Some(enc.finish()));
             k = end;
         }
-        self.ctx.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        self.ctx
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .ok();
         self.device_dirty = true;
     }
 

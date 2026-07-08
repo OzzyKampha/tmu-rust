@@ -201,14 +201,14 @@ impl Layouts {
             device,
             "train_prep0",
             &[
-                (0, Uniform),   // config
-                (2, StorageRw), // include
-                (3, StorageRw), // weights
-                (5, StorageRw), // class_rngs
-                (6, StorageR),  // valid
-                (7, StorageR),  // prob_table
-                (8, StorageR),  // batch_lits
-                (9, StorageR),  // lit_active
+                (0, Uniform),    // config
+                (2, StorageRw),  // include
+                (3, StorageRw),  // weights
+                (5, StorageRw),  // class_rngs
+                (6, StorageR),   // valid
+                (7, StorageR),   // prob_table
+                (8, StorageR),   // batch_lits
+                (9, StorageR),   // lit_active
                 (10, StorageRw), // scratch
             ],
         );
@@ -216,14 +216,14 @@ impl Layouts {
             device,
             "clause_update0",
             &[
-                (0, Uniform),   // config
-                (1, StorageRw), // ta
-                (2, StorageRw), // include
-                (3, StorageRw), // weights
-                (4, StorageRw), // rngs
-                (6, StorageR),  // valid
-                (8, StorageR),  // batch_lits
-                (9, StorageR),  // lit_active
+                (0, Uniform),    // config
+                (1, StorageRw),  // ta
+                (2, StorageRw),  // include
+                (3, StorageRw),  // weights
+                (4, StorageRw),  // rngs
+                (6, StorageR),   // valid
+                (8, StorageR),   // batch_lits
+                (9, StorageR),   // lit_active
                 (10, StorageRw), // scratch
             ],
         );
@@ -294,8 +294,14 @@ impl Pipelines {
             "clause_update_pl",
             &[Some(&layouts.clause_update0), Some(&layouts.sample1)],
         );
-        let scores_pl = pl("scores_pl", &[Some(&layouts.scores0), Some(&layouts.infer1)]);
-        let argmax_pl = pl("argmax_pl", &[Some(&layouts.argmax0), Some(&layouts.infer1)]);
+        let scores_pl = pl(
+            "scores_pl",
+            &[Some(&layouts.scores0), Some(&layouts.infer1)],
+        );
+        let argmax_pl = pl(
+            "argmax_pl",
+            &[Some(&layouts.argmax0), Some(&layouts.infer1)],
+        );
 
         let mk = |module: &wgpu::ShaderModule, layout: &wgpu::PipelineLayout, entry: &str| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {

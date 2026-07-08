@@ -364,8 +364,9 @@ fn gpu_train_save_load_cpu_roundtrip() {
     assert_eq!(gpu_pred, cpu_pred, "GPU vs reloaded-CPU predictions differ");
 
     // The loaded model should keep training bit-identically to a pure-CPU run.
-    let mut pure_cpu = TsetlinMachine::with_config(2, encoder.n_features(), 40, 15, 3.9, 8, true, 42)
-        .max_included_literals(32);
+    let mut pure_cpu =
+        TsetlinMachine::with_config(2, encoder.n_features(), 40, 15, 3.9, 8, true, 42)
+            .max_included_literals(32);
     for _ in 0..12 {
         pure_cpu.fit_epoch(&train, &ytr);
     }
