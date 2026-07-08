@@ -20,62 +20,65 @@ use crate::rng::Rng;
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TsetlinMachine {
-    n_classes: usize,
-    n_features: usize,
-    n_literals: usize,
-    words: usize,
-    clauses_per_class: usize,
-    threshold: i32,
-    s: f64,
-    boost_true_positive: bool,
-    max_included_literals: usize,
-    clause_drop_p: f64,
+    // NOTE: data fields are `pub(crate)` so the optional `gpu` backend (src/gpu/)
+    // can mirror them to device buffers and write them back after GPU training.
+    // The public API is unchanged; only in-crate code can see these.
+    pub(crate) n_classes: usize,
+    pub(crate) n_features: usize,
+    pub(crate) n_literals: usize,
+    pub(crate) words: usize,
+    pub(crate) clauses_per_class: usize,
+    pub(crate) threshold: i32,
+    pub(crate) s: f64,
+    pub(crate) boost_true_positive: bool,
+    pub(crate) max_included_literals: usize,
+    pub(crate) clause_drop_p: f64,
     /// Per-literal dropout probability during training (mirrors TMU's `literal_drop_p`).
-    literal_drop_p: f64,
+    pub(crate) literal_drop_p: f64,
     /// Dedicated RNG for literal-active mask generation (independent of clause/class RNGs).
-    literal_rng: Rng,
+    pub(crate) literal_rng: Rng,
     /// Precomputed binary digits for Bernoulli(1 - literal_drop_p) mask generation.
-    dig_lit_active: Vec<u8>,
+    pub(crate) dig_lit_active: Vec<u8>,
 
     /// u8 TA counters (matches TMU's 8-bit states).  Clause `cj = c*CPC + j` occupies
     /// `ta[cj * n_literals .. (cj+1) * n_literals]`.
-    ta: Vec<u8>,
+    pub(crate) ta: Vec<u8>,
     /// Include bitset.  Clause `cj` occupies `include[cj * words .. (cj+1) * words]`.
     /// Rebuilt after every clause update; kept in sync with `ta`.
-    include: Vec<u64>,
+    pub(crate) include: Vec<u64>,
     /// TA threshold for inclusion: `ta[l] >= half` → literal l is included.
-    half: u8,
+    pub(crate) half: u8,
     /// Maximum TA counter value: `(1 << state_bits) - 1`.
-    max_state: u8,
+    pub(crate) max_state: u8,
 
     /// Per-clause integer weights (>= 1), indexed `c*CPC + j`.
-    weights: Vec<i32>,
+    pub(crate) weights: Vec<i32>,
     /// Per-clause RNG (enables lock-free parallel training).
-    rngs: Vec<Rng>,
+    pub(crate) rngs: Vec<Rng>,
     /// Per-class RNG for drop/inv/keep mask generation.
-    class_rngs: Vec<Rng>,
+    pub(crate) class_rngs: Vec<Rng>,
     /// Per-word mask of real literal bits.
-    valid: Vec<u64>,
-    dig_inv: Vec<u8>,
-    dig_keep: Vec<u8>,
+    pub(crate) valid: Vec<u64>,
+    pub(crate) dig_inv: Vec<u8>,
+    pub(crate) dig_keep: Vec<u8>,
 
-    literals: Vec<u64>,
-    rng: Rng, // for shuffling and negative-class selection only
+    pub(crate) literals: Vec<u64>,
+    pub(crate) rng: Rng, // for shuffling and negative-class selection only
 
     /// Per-class feedback scaling factors for imbalanced datasets.
     /// `class_weights[c]` multiplies the feedback probability for class `c`.
     /// Defaults to `1.0` for all classes (no reweighting).
-    class_weights: Vec<f64>,
+    pub(crate) class_weights: Vec<f64>,
 
     /// Indicator TA states for Type III feedback (same layout as `ta`).
     /// Zero-initialised; only meaningful when `type_iii` is `true`.
-    ind: Vec<u8>,
+    pub(crate) ind: Vec<u8>,
     /// `clause_and_target` bitsets for Type III feedback (same layout as `include`).
-    cat: Vec<u64>,
+    pub(crate) cat: Vec<u64>,
     /// Type III strength: indicator is incremented with probability `1 − 1/d`.
-    d: f64,
+    pub(crate) d: f64,
     /// Whether Type III feedback is active during training.
-    type_iii: bool,
+    pub(crate) type_iii: bool,
 
     /// When set, `update_class` never takes the nested Rayon path. Used to keep
     /// per-shard replica training single-threaded inside `fit_epoch_data_parallel`
@@ -860,6 +863,50 @@ impl TsetlinMachine {
         let data = batch.data.as_slice();
         for &i in &order {
             self.fit_one_lit(&data[i * w..(i + 1) * w], ys[i]);
+        }
+    }
+
+    /// Reproduce one epoch's host-RNG-driven decisions for the GPU backend,
+    /// advancing `self.rng` and `self.literal_rng` **exactly** as [`fit_epoch`]
+    /// would — so a GPU-trained model's serialized RNG state matches CPU training
+    /// bit-for-bit. Returns the shuffled sample order, the per-step negative
+    /// class, and (if literal dropout is on) the per-step literal-active masks.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn gpu_epoch_plan(&mut self, n: usize, ys: &[usize]) -> crate::gpu::GpuEpochPlan {
+        // Fisher–Yates shuffle with `self.rng` (identical to fit_epoch).
+        let mut order: Vec<usize> = (0..n).collect();
+        for i in (1..n).rev() {
+            let k = self.rng.below(i + 1);
+            order.swap(i, k);
+        }
+        let words = self.words;
+        let dropout = self.literal_drop_p > 0.0;
+        let mut negs = Vec::with_capacity(n);
+        let mut lit_active = if dropout {
+            Vec::with_capacity(n * words)
+        } else {
+            Vec::new()
+        };
+        for &i in &order {
+            let y = ys[i];
+            // Negative-class rejection sampling (identical to fit_one_lit).
+            let mut neg = self.rng.below(self.n_classes);
+            while neg == y {
+                neg = self.rng.below(self.n_classes);
+            }
+            negs.push(neg);
+            if dropout {
+                let rng = &mut self.literal_rng;
+                let dig = &self.dig_lit_active;
+                for _ in 0..words {
+                    lit_active.push(bmask_word(rng, dig));
+                }
+            }
+        }
+        crate::gpu::GpuEpochPlan {
+            order,
+            negs,
+            lit_active,
         }
     }
 

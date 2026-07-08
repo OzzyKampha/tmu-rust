@@ -15,6 +15,10 @@ autoexamples = false
 rayon = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 bincode = { version = "1.3", optional = true }
+# GPU backend (feature "gpu"): portable wgpu/WGSL compute for training + inference.
+wgpu = { version = "30", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
@@ -25,6 +29,8 @@ default = ["serde"]
 parallel = ["dep:rayon"]
 # Enable `save`/`load` for models and the encoder (serde + bincode).
 serde = ["dep:serde", "dep:bincode"]
+# GPU training + inference for the vanilla TsetlinMachine (portable wgpu/WGSL).
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [[bin]]
 name = "tmu-rs"
@@ -149,6 +155,16 @@ path = "examples/parallel_scaling.rs"
 [[example]]
 name = "dp_vs_exact"          # Validate data-parallel vs exact training accuracy on real data (breast cancer)
 path = "examples/dp_vs_exact.rs"
+
+[[example]]
+name = "gpu_xor"              # GPU: train noisy XOR on GPU, evaluate on GPU and CPU, save/load
+path = "examples/gpu_xor.rs"
+required-features = ["gpu"]
+
+[[example]]
+name = "gpu_vs_cpu_bench"     # GPU vs CPU training/inference throughput comparison
+path = "examples/gpu_vs_cpu_bench.rs"
+required-features = ["gpu"]
 
 [[bench]]
 name = "throughput"

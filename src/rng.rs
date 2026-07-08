@@ -32,4 +32,20 @@ impl Rng {
     pub fn below(&mut self, n: usize) -> usize {
         (self.next_u64() % n as u64) as usize
     }
+
+    /// Raw internal state (for the GPU backend to mirror RNG streams to the device).
+    #[cfg(feature = "gpu")]
+    #[inline(always)]
+    pub(crate) fn raw(&self) -> u64 {
+        self.0
+    }
+
+    /// Reconstruct an RNG from raw internal state (inverse of [`Rng::raw`]).
+    /// Unlike [`Rng::new`], this does **not** mix in the golden constant — it
+    /// restores an exact state downloaded from the GPU.
+    #[cfg(feature = "gpu")]
+    #[inline(always)]
+    pub(crate) fn from_raw(state: u64) -> Self {
+        Rng(state)
+    }
 }
