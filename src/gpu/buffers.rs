@@ -53,6 +53,10 @@ pub(crate) struct GpuConfig {
     pub dig_inv: u32,
     pub dig_keep: u32,
     pub has_lit_active: u32,
+    pub n_replicas: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
 }
 
 /// Pack up to 32 Bernoulli digit bytes (`0`/`1`) into a u32 (bit `i` = `digits[i]`).
@@ -67,7 +71,12 @@ fn pack_digits(digits: &[u8]) -> u32 {
 }
 
 impl GpuConfig {
-    pub fn build(host: &TsetlinMachine, dims: &Dims, has_lit_active: bool) -> Self {
+    pub fn build(
+        host: &TsetlinMachine,
+        dims: &Dims,
+        has_lit_active: bool,
+        n_replicas: u32,
+    ) -> Self {
         let max_inc = if host.max_included_literals == usize::MAX {
             0xFFFF_FFFFu32
         } else {
@@ -86,6 +95,10 @@ impl GpuConfig {
             dig_inv: pack_digits(&host.dig_inv),
             dig_keep: pack_digits(&host.dig_keep),
             has_lit_active: has_lit_active as u32,
+            n_replicas,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         }
     }
 }
@@ -159,7 +172,7 @@ impl DeviceState {
         let dims = Dims::from(host);
         let dev = &ctx.device;
 
-        let config_data = GpuConfig::build(host, &dims, has_lit_active);
+        let config_data = GpuConfig::build(host, &dims, has_lit_active, 1);
         let config = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tmu config"),
             contents: bytemuck::bytes_of(&config_data),
@@ -223,9 +236,16 @@ impl DeviceState {
         }
     }
 
-    /// Rewrite the config uniform (e.g. when toggling literal dropout per epoch).
-    pub fn write_config(&self, ctx: &GpuContext, host: &TsetlinMachine, has_lit_active: bool) {
-        let cfg = GpuConfig::build(host, &self.dims, has_lit_active);
+    /// Rewrite the config uniform (e.g. when toggling literal dropout per epoch,
+    /// or setting `n_replicas` for a data-parallel epoch).
+    pub fn write_config(
+        &self,
+        ctx: &GpuContext,
+        host: &TsetlinMachine,
+        has_lit_active: bool,
+        n_replicas: u32,
+    ) {
+        let cfg = GpuConfig::build(host, &self.dims, has_lit_active, n_replicas);
         ctx.queue
             .write_buffer(&self.config, 0, bytemuck::bytes_of(&cfg));
     }

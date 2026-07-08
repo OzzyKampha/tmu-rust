@@ -19,11 +19,11 @@
 //! (the clause/literal bit layout is identical to the vanilla machine).
 
 #[cfg(feature = "parallel")]
-use crate::clause_bank::dense::{use_parallel, DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN};
+use crate::clause_bank::dense::{DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN, use_parallel};
 use crate::clause_bank::dense::{
-    bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, grow_dense_state,
-    rebuild_include, type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for,
-    GOLDEN, MASK_BITS, WORD_BITS,
+    GOLDEN, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of, expand_bits_to_bytes,
+    fire_predict, grow_dense_state, rebuild_include, type_i_update_bytes, type_ii_update_bytes,
+    type_iii_update, words_for,
 };
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
@@ -673,14 +673,44 @@ impl CoalescedTsetlinMachine {
                     .enumerate()
                     .for_each(|(j, (((((ta_j, inc_j), w), rng), ind_j), cat_j))| {
                         apply_one_clause_coalesced(
-                            ta_j, inc_j, w, rng, target, p, clause_outputs[j], clause_active[j],
-                            val, words, lit_b, &inv_b, &keep_b, active_b, n_literals, boost,
-                            max_inc, half, max_state,
+                            ta_j,
+                            inc_j,
+                            w,
+                            rng,
+                            target,
+                            p,
+                            clause_outputs[j],
+                            clause_active[j],
+                            val,
+                            words,
+                            lit_b,
+                            &inv_b,
+                            &keep_b,
+                            active_b,
+                            n_literals,
+                            boost,
+                            max_inc,
+                            half,
+                            max_state,
                         );
                         if clause_active[j] {
                             if type_iii_update(
-                                ta_j, ind_j, cat_j, inc_j, lit, val, lit_active, active_b, words, n_literals,
-                                d_val, p, target_bool, rng, half, max_state,
+                                ta_j,
+                                ind_j,
+                                cat_j,
+                                inc_j,
+                                lit,
+                                val,
+                                lit_active,
+                                active_b,
+                                words,
+                                n_literals,
+                                d_val,
+                                p,
+                                target_bool,
+                                rng,
+                                half,
+                                max_state,
                             ) {
                                 rebuild_include(ta_j, inc_j, val, words, n_literals, half);
                             }
@@ -694,9 +724,25 @@ impl CoalescedTsetlinMachine {
                     .enumerate()
                     .for_each(|(j, (((ta_j, inc_j), w), rng))| {
                         apply_one_clause_coalesced(
-                            ta_j, inc_j, w, rng, target, p, clause_outputs[j], clause_active[j],
-                            val, words, lit_b, &inv_b, &keep_b, active_b, n_literals, boost,
-                            max_inc, half, max_state,
+                            ta_j,
+                            inc_j,
+                            w,
+                            rng,
+                            target,
+                            p,
+                            clause_outputs[j],
+                            clause_active[j],
+                            val,
+                            words,
+                            lit_b,
+                            &inv_b,
+                            &keep_b,
+                            active_b,
+                            n_literals,
+                            boost,
+                            max_inc,
+                            half,
+                            max_state,
                         );
                     });
             }
@@ -810,8 +856,26 @@ impl CoalescedTsetlinMachine {
 
         let neg = self.choose_negative(y, &clause_outputs, &clause_active);
 
-        self.update_class(y, 1, &clause_outputs, &clause_active, &lit_b, &active_b, lit, &lit_active);
-        self.update_class(neg, 0, &clause_outputs, &clause_active, &lit_b, &active_b, lit, &lit_active);
+        self.update_class(
+            y,
+            1,
+            &clause_outputs,
+            &clause_active,
+            &lit_b,
+            &active_b,
+            lit,
+            &lit_active,
+        );
+        self.update_class(
+            neg,
+            0,
+            &clause_outputs,
+            &clause_active,
+            &lit_b,
+            &active_b,
+            lit,
+            &lit_active,
+        );
     }
 
     /// Train on a single encoded sample with true label `y`.
@@ -929,16 +993,19 @@ impl CoalescedTsetlinMachine {
                 .collect();
 
             let shard_len = n.div_ceil(n_shards);
-            replicas.par_iter_mut().enumerate().for_each(|(s, replica)| {
-                let start = s * shard_len;
-                if start >= n {
-                    return;
-                }
-                let end = (start + shard_len).min(n);
-                for &i in &order[start..end] {
-                    replica.fit_one_lit(&data[i * w..(i + 1) * w], ys[i]);
-                }
-            });
+            replicas
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(s, replica)| {
+                    let start = s * shard_len;
+                    if start >= n {
+                        return;
+                    }
+                    let end = (start + shard_len).min(n);
+                    for &i in &order[start..end] {
+                        replica.fit_one_lit(&data[i * w..(i + 1) * w], ys[i]);
+                    }
+                });
 
             // Merge: average TA counters and (signed, unbounded) weights.
             let kf = replicas.len() as u32;
@@ -1438,13 +1505,16 @@ mod tests {
         let e = enc(12);
         let btr = e.encode_batch(&as_slices(&xtr));
         let bte = e.encode_batch(&as_slices(&xte));
-        let mut tm =
-            CoalescedTsetlinMachine::with_config(2, 12, 16, 15, 3.9, 8, true, 7).data_parallel(true);
+        let mut tm = CoalescedTsetlinMachine::with_config(2, 12, 16, 15, 3.9, 8, true, 7)
+            .data_parallel(true);
         for _ in 0..40 {
             tm.fit_epoch(&btr, &ytr);
         }
         let acc = tm.accuracy(&bte, &yte);
-        assert!(acc > 0.9, "coalesced data_parallel XOR accuracy too low: {acc}");
+        assert!(
+            acc > 0.9,
+            "coalesced data_parallel XOR accuracy too low: {acc}"
+        );
     }
 
     // ---- growing the feature space --------------------------------------------

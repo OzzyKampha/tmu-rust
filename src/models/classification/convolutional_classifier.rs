@@ -15,9 +15,9 @@
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::DENSE_TRAIN_PARALLEL_MIN;
 use crate::clause_bank::dense::{
-    bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, pack, rebuild_include,
-    type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for, GOLDEN, MASK_BITS,
-    WORD_BITS,
+    GOLDEN, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of, expand_bits_to_bytes,
+    fire_predict, pack, rebuild_include, type_i_update_bytes, type_ii_update_bytes,
+    type_iii_update, words_for,
 };
 use crate::rng::Rng;
 
@@ -770,7 +770,11 @@ impl ConvolutionalTsetlinMachine {
                             })
                             .collect();
                         let fires = !firing.is_empty();
-                        let p_idx = if fires { firing[rng_c.below(firing.len())] } else { 0 };
+                        let p_idx = if fires {
+                            firing[rng_c.below(firing.len())]
+                        } else {
+                            0
+                        };
                         let lit_b = expand_bits_to_bytes(
                             &patches_buf[p_idx * words..(p_idx + 1) * words],
                             n_literals,
@@ -783,8 +787,22 @@ impl ConvolutionalTsetlinMachine {
                         if drop_mask.is_empty() || !drop_mask[j] {
                             let patch_lit = &patches_buf[p_idx * words..(p_idx + 1) * words];
                             if type_iii_update(
-                                ta_c, ind_c, cat_c, inc_c, patch_lit, val, lit_active, &active_b, words,
-                                n_literals, d_val, p, target_bool, rng_c, half, max_state,
+                                ta_c,
+                                ind_c,
+                                cat_c,
+                                inc_c,
+                                patch_lit,
+                                val,
+                                lit_active,
+                                &active_b,
+                                words,
+                                n_literals,
+                                d_val,
+                                p,
+                                target_bool,
+                                rng_c,
+                                half,
+                                max_state,
                             ) {
                                 rebuild_include(ta_c, inc_c, val, words, n_literals, half);
                             }
@@ -810,7 +828,11 @@ impl ConvolutionalTsetlinMachine {
                             })
                             .collect();
                         let fires = !firing.is_empty();
-                        let p_idx = if fires { firing[rng_c.below(firing.len())] } else { 0 };
+                        let p_idx = if fires {
+                            firing[rng_c.below(firing.len())]
+                        } else {
+                            0
+                        };
                         let lit_b = expand_bits_to_bytes(
                             &patches_buf[p_idx * words..(p_idx + 1) * words],
                             n_literals,
@@ -843,7 +865,11 @@ impl ConvolutionalTsetlinMachine {
                     })
                     .collect();
                 fires = !firing.is_empty();
-                p_idx = if fires { firing[class_rng[j].below(firing.len())] } else { 0 };
+                p_idx = if fires {
+                    firing[class_rng[j].below(firing.len())]
+                } else {
+                    0
+                };
             }
             let lit_b =
                 expand_bits_to_bytes(&patches_buf[p_idx * words..(p_idx + 1) * words], n_literals);
@@ -1136,8 +1162,8 @@ mod tests {
 
     #[test]
     fn type_iii_constructs_without_panic() {
-        let _ctm = ConvolutionalTsetlinMachine::new(2, 8, 2, 1, 10, 20, 3.0)
-            .type_iii_feedback(200.0);
+        let _ctm =
+            ConvolutionalTsetlinMachine::new(2, 8, 2, 1, 10, 20, 3.0).type_iii_feedback(200.0);
     }
 
     #[test]
@@ -1152,8 +1178,8 @@ mod tests {
     fn type_iii_trains_without_panic() {
         let (xs, ys) = make_xor_sequence(300, 8, 7);
         let slices = as_slices(&xs);
-        let mut ctm = ConvolutionalTsetlinMachine::new(2, 8, 2, 1, 10, 20, 3.0)
-            .type_iii_feedback(200.0);
+        let mut ctm =
+            ConvolutionalTsetlinMachine::new(2, 8, 2, 1, 10, 20, 3.0).type_iii_feedback(200.0);
         for _ in 0..5 {
             ctm.fit_epoch(&slices, &ys);
         }

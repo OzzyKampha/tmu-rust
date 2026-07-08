@@ -138,6 +138,34 @@ Supported today: `boost_true_positive`, `max_included_literals`, `class_weights`
 `type_iii_feedback` and `clause_drop_p > 0`. To grow features, `into_cpu()`,
 grow, then `to_gpu()` again.
 
+**Too big for VRAM? It still trains.** `to_gpu` never fails because a model is
+too large — if the model doesn't fit in GPU memory it stays on the CPU and
+`fit_epoch` / `predict_batch` run there transparently (check
+`GpuTsetlinMachine::is_gpu_resident()`). Data-parallel likewise scales the
+replica count down to what fits, falling back to the exact GPU path (or, if even
+the single model doesn't fit, the CPU). The only hard error is
+`GpuError::Unsupported` for the options listed above.
+
+**Two training modes.** The default GPU path is *exact* (bitwise-identical to
+CPU) but processes samples sequentially — latency-bound, so it only beats a
+multi-threaded CPU on large models. For a bigger speedup, build the model with
+[`data_parallel(true)`](crate::TsetlinMachine::data_parallel): the GPU then
+trains `R` model replicas in lockstep on sample shards and averages them
+(mirroring the CPU `data_parallel` path), which cuts kernel launches ~`R×` and
+fills the device. Like the CPU flag, this is **approximate** (accuracy tracks
+exact within noise) and replica-count dependent, but deterministic for a given
+seed and `R`. The replica count is chosen automatically from available VRAM;
+override it with `GpuTsetlinMachine::set_replicas(Some(r))` (dynamic — takes
+effect on the next epoch). Inference is identical in both modes.
+
+```rust
+let tm = TsetlinMachine::with_config(10, n_features, 2000, 50, 5.0, 8, true, 42)
+    .data_parallel(true);                 // opt into the fast (approximate) GPU path
+let mut gpu = tm.to_gpu(&ctx)?;
+gpu.set_replicas(Some(16));               // optional: pin the replica count
+for _ in 0..epochs { gpu.fit_epoch(&train, &ys); }
+```
+
 ### Try it / benchmark it
 
 ```sh

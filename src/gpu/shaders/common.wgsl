@@ -27,6 +27,10 @@ struct Config {
     dig_inv: u32,      // Bernoulli digits (bit i = digit i) for the 1/s decrement mask
     dig_keep: u32,     // digits for the (1 - 1/s) increment-keep mask
     has_lit_active: u32, // 0 -> literal dropout off (treat lit_active as all-ones)
+    n_replicas: u32,     // data-parallel replica count (>=1; only the DP kernels use it)
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 fn u64_add(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {

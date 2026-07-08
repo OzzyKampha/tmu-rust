@@ -315,6 +315,105 @@ fn predict_parity_untrained_empty_clauses() {
     assert_eq!(cpu, g);
 }
 
+#[cfg(feature = "serde")]
+#[test]
+fn dp_training_is_deterministic() {
+    // Same seed + same replica count => byte-identical trained model.
+    let Some(ctx) = ctx() else { return };
+    let (xtr, ytr) = make_multiclass(1000, 16, 3, 4);
+    let encoder = Encoder::for_binary(16);
+    let train = encode(&encoder, &xtr);
+
+    let run = || {
+        let tm = TsetlinMachine::with_config(3, encoder.n_features(), 40, 20, 5.0, 8, true, 7)
+            .max_included_literals(32)
+            .data_parallel(true);
+        let mut gpu = tm.to_gpu(&ctx).expect("to_gpu");
+        gpu.set_replicas(Some(8));
+        for _ in 0..4 {
+            gpu.fit_epoch(&train, &ytr);
+        }
+        state_bytes(&gpu.into_cpu())
+    };
+    assert_eq!(run(), run(), "data-parallel training is not deterministic");
+}
+
+#[test]
+fn dp_training_converges_on_noisy_xor() {
+    let Some(ctx) = ctx() else { return };
+    let (xtr, ytr) = make_xor(3000, 12, 0.1, 1);
+    let (xte, yte) = make_xor(2000, 12, 0.0, 2);
+    let encoder = Encoder::for_binary(12);
+    let train = encode(&encoder, &xtr);
+    let test = encode(&encoder, &xte);
+
+    let tm = TsetlinMachine::with_config(2, encoder.n_features(), 80, 15, 3.9, 8, true, 42)
+        .max_included_literals(32)
+        .data_parallel(true);
+    let mut gpu = tm.to_gpu(&ctx).expect("to_gpu");
+    gpu.set_replicas(Some(8));
+    for _ in 0..40 {
+        gpu.fit_epoch(&train, &ytr);
+    }
+    let acc = gpu.accuracy(&test, &yte);
+    assert!(
+        acc > 0.9,
+        "data-parallel GPU noisy-XOR accuracy too low: {acc}"
+    );
+}
+
+#[test]
+fn oversized_model_falls_back_to_cpu_and_still_trains() {
+    // A model whose TA buffer exceeds the adapter's storage-binding limit must
+    // NOT error at to_gpu — it transparently trains/infers on the CPU. On a
+    // small adapter (e.g. llvmpipe's 128 MiB cap) this exercises the fallback;
+    // on a large GPU the model may fit and run on-device — either way it works.
+    let Some(ctx) = ctx() else { return };
+    let bits = 2048; // 4096 literals; 10k clauses -> ta ~= 163 MiB
+    let (xtr, ytr) = make_xor(20, bits, 0.0, 1);
+    let encoder = Encoder::for_binary(bits);
+    let train = encode(&encoder, &xtr);
+
+    let tm = TsetlinMachine::with_config(2, encoder.n_features(), 5000, 50, 5.0, 8, true, 1)
+        .max_included_literals(32);
+    let mut gpu = tm
+        .to_gpu(&ctx)
+        .expect("to_gpu must not error on an oversized model");
+    eprintln!("oversized model gpu_resident = {}", gpu.is_gpu_resident());
+
+    // Training and inference must work regardless of where they run.
+    gpu.fit_epoch(&train, &ytr);
+    let preds = gpu.predict_batch(&train);
+    assert_eq!(preds.len(), 20);
+}
+
+#[test]
+fn large_inference_batch_is_chunked() {
+    // A batch larger than the per-dispatch limit (65535) must predict correctly
+    // by chunking on-device — the concatenated result must match the CPU.
+    let Some(ctx) = ctx() else { return };
+    let bits = 32;
+    let (xtr, ytr) = make_xor(600, bits, 0.1, 1);
+    let (xte, _) = make_xor(70_000, bits, 0.0, 2); // > MAX_DISPATCH -> multi-chunk
+    let encoder = Encoder::for_binary(bits);
+    let train = encode(&encoder, &xtr);
+    let test = encode(&encoder, &xte);
+
+    let tm = TsetlinMachine::with_config(2, encoder.n_features(), 40, 15, 3.9, 8, true, 42)
+        .max_included_literals(32);
+    let mut gpu = tm.to_gpu(&ctx).expect("to_gpu");
+    for _ in 0..10 {
+        gpu.fit_epoch(&train, &ytr);
+    }
+    let gpu_pred = gpu.predict_batch(&test);
+    let cpu_pred = gpu.sync().predict_batch(&test);
+    assert_eq!(gpu_pred.len(), 70_000);
+    assert_eq!(
+        gpu_pred, cpu_pred,
+        "chunked GPU inference diverged from CPU"
+    );
+}
+
 #[test]
 fn gpu_train_converges_on_noisy_xor() {
     let Some(ctx) = ctx() else { return };

@@ -29,10 +29,10 @@
 //! All other public API mirrors [`TsetlinMachine`] one-to-one.
 
 #[cfg(feature = "parallel")]
-use crate::clause_bank::dense::use_parallel;
-#[cfg(feature = "parallel")]
 use crate::clause_bank::dense::PARALLEL_MIN;
-use crate::clause_bank::dense::{words_for, GOLDEN, WORD_BITS};
+#[cfg(feature = "parallel")]
+use crate::clause_bank::dense::use_parallel;
+use crate::clause_bank::dense::{GOLDEN, WORD_BITS, words_for};
 use crate::clause_bank::sparse::SparseClauseBank;
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
@@ -817,8 +817,8 @@ mod tests {
         let e = Encoder::for_binary(nf);
         let btr = encode(&xtr, &e);
         let bte = encode(&xte, &e);
-        let mut tm =
-            TMSparseClassifier::with_config(2, nf, 32, 15, 3.9, 8, true, 7).max_included_literals(8);
+        let mut tm = TMSparseClassifier::with_config(2, nf, 32, 15, 3.9, 8, true, 7)
+            .max_included_literals(8);
         for _ in 0..30 {
             tm.fit_epoch(&btr, &ytr);
         }
@@ -827,7 +827,10 @@ mod tests {
         for (i, &p) in batch.iter().enumerate() {
             assert_eq!(p, tm.predict_lit(&bte.data[i * w..(i + 1) * w]));
         }
-        assert!(tm.accuracy(&bte, &yte) > 0.9, "wide/few-clause sparse model failed to learn");
+        assert!(
+            tm.accuracy(&bte, &yte) > 0.9,
+            "wide/few-clause sparse model failed to learn"
+        );
     }
 
     // ---- growing the feature space --------------------------------------------
@@ -957,7 +960,10 @@ mod tests {
             tm.fit_epoch(&encode(&xtr2, &e16), &ytr2);
         }
         let acc = tm.accuracy(&encode(&xte2, &e16), &yte2);
-        assert!(acc >= 0.95, "grown sparse TM failed to learn new feature: {acc}");
+        assert!(
+            acc >= 0.95,
+            "grown sparse TM failed to learn new feature: {acc}"
+        );
     }
 
     #[cfg(feature = "serde")]

@@ -50,7 +50,7 @@ pub use context::{GpuContext, GpuError};
 mod buffers;
 mod vanilla;
 
-pub(crate) use vanilla::GpuEpochPlan;
+pub(crate) use vanilla::{DpPlan, GpuEpochPlan};
 pub use vanilla::GpuTsetlinMachine;
 
 #[cfg(test)]

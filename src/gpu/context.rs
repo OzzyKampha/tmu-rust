@@ -74,6 +74,13 @@ pub(crate) struct Layouts {
     pub scores0: wgpu::BindGroupLayout,
     pub argmax0: wgpu::BindGroupLayout,
     pub infer1: wgpu::BindGroupLayout,
+    // Data-parallel (approximate) training path.
+    pub dp_prep0: wgpu::BindGroupLayout,
+    pub dp_clause0: wgpu::BindGroupLayout,
+    pub dp_sample1: wgpu::BindGroupLayout,
+    pub dp_avg_ta0: wgpu::BindGroupLayout,
+    pub dp_avg_w0: wgpu::BindGroupLayout,
+    pub dp_rebuild0: wgpu::BindGroupLayout,
 }
 
 /// Compiled compute pipelines, one per kernel entry point.
@@ -82,6 +89,12 @@ pub(crate) struct Pipelines {
     pub clause_update: wgpu::ComputePipeline,
     pub scores: wgpu::ComputePipeline,
     pub argmax: wgpu::ComputePipeline,
+    // Data-parallel (approximate) training path.
+    pub train_prep_dp: wgpu::ComputePipeline,
+    pub clause_update_dp: wgpu::ComputePipeline,
+    pub avg_ta: wgpu::ComputePipeline,
+    pub avg_weights: wgpu::ComputePipeline,
+    pub merge_rebuild: wgpu::ComputePipeline,
 }
 
 /// Kinds of buffer binding used by the kernels.
@@ -315,6 +328,59 @@ impl Layouts {
         );
         let infer1 = bgl(device, "infer1", &[(0, Uniform)]);
 
+        // Data-parallel training. Binding numbers match src/gpu/shaders/train_dp.wgsl.
+        let dp_prep0 = bgl(
+            device,
+            "dp_prep0",
+            &[
+                (0, Uniform),   // cfg
+                (2, StorageRw), // include (replica)
+                (3, StorageRw), // weights (replica)
+                (4, StorageRw), // rngs_all
+                (5, StorageR),  // valid
+                (6, StorageR),  // prob_table
+                (7, StorageR),  // batch_lits
+                (8, StorageR),  // lit_active
+                (9, StorageRw), // scratch
+            ],
+        );
+        let dp_clause0 = bgl(
+            device,
+            "dp_clause0",
+            &[
+                (0, Uniform),   // cfg
+                (1, StorageRw), // ta (replica)
+                (2, StorageRw), // include (replica)
+                (3, StorageRw), // weights (replica)
+                (4, StorageRw), // rngs_all
+                (5, StorageR),  // valid
+                (7, StorageR),  // batch_lits
+                (8, StorageR),  // lit_active
+                (9, StorageRw), // scratch
+            ],
+        );
+        let dp_sample1 = bgl(device, "dp_sample1", &[(0, UniformDyn)]);
+        let dp_avg_ta0 = bgl(
+            device,
+            "dp_avg_ta0",
+            &[(0, Uniform), (1, StorageRw), (10, StorageRw)],
+        );
+        let dp_avg_w0 = bgl(
+            device,
+            "dp_avg_w0",
+            &[(0, Uniform), (3, StorageRw), (12, StorageRw)],
+        );
+        let dp_rebuild0 = bgl(
+            device,
+            "dp_rebuild0",
+            &[
+                (0, Uniform),
+                (5, StorageR),
+                (10, StorageRw),
+                (11, StorageRw),
+            ],
+        );
+
         Layouts {
             train_prep0,
             clause_update0,
@@ -322,6 +388,12 @@ impl Layouts {
             scores0,
             argmax0,
             infer1,
+            dp_prep0,
+            dp_clause0,
+            dp_sample1,
+            dp_avg_ta0,
+            dp_avg_w0,
+            dp_rebuild0,
         }
     }
 }
@@ -341,6 +413,11 @@ impl Pipelines {
         let infer = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tmu-rs infer.wgsl"),
             source: wgpu::ShaderSource::Wgsl(infer_src.into()),
+        });
+        let dp_src = format!("{common}\n{}", include_str!("shaders/train_dp.wgsl"));
+        let dp = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("tmu-rs train_dp.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(dp_src.into()),
         });
 
         let pl = |label: &str, groups: &[Option<&wgpu::BindGroupLayout>]| {
@@ -366,6 +443,17 @@ impl Pipelines {
             "argmax_pl",
             &[Some(&layouts.argmax0), Some(&layouts.infer1)],
         );
+        let dp_prep_pl = pl(
+            "dp_prep_pl",
+            &[Some(&layouts.dp_prep0), Some(&layouts.dp_sample1)],
+        );
+        let dp_clause_pl = pl(
+            "dp_clause_pl",
+            &[Some(&layouts.dp_clause0), Some(&layouts.dp_sample1)],
+        );
+        let dp_avg_ta_pl = pl("dp_avg_ta_pl", &[Some(&layouts.dp_avg_ta0)]);
+        let dp_avg_w_pl = pl("dp_avg_w_pl", &[Some(&layouts.dp_avg_w0)]);
+        let dp_rebuild_pl = pl("dp_rebuild_pl", &[Some(&layouts.dp_rebuild0)]);
 
         let mk = |module: &wgpu::ShaderModule, layout: &wgpu::PipelineLayout, entry: &str| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -383,6 +471,11 @@ impl Pipelines {
             clause_update: mk(&train, &clause_update_pl, "clause_update"),
             scores: mk(&infer, &scores_pl, "scores"),
             argmax: mk(&infer, &argmax_pl, "argmax"),
+            train_prep_dp: mk(&dp, &dp_prep_pl, "train_prep_dp"),
+            clause_update_dp: mk(&dp, &dp_clause_pl, "clause_update_dp"),
+            avg_ta: mk(&dp, &dp_avg_ta_pl, "avg_ta"),
+            avg_weights: mk(&dp, &dp_avg_w_pl, "avg_weights"),
+            merge_rebuild: mk(&dp, &dp_rebuild_pl, "merge_rebuild"),
         }
     }
 }
