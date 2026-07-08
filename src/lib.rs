@@ -30,6 +30,8 @@ pub(crate) mod clause_bank;
 mod clause_inspect;
 pub mod data;
 pub mod encoder;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod models;
 mod rng;
 #[cfg(feature = "serde")]
@@ -38,6 +40,8 @@ mod serial;
 pub use booleanizer::Booleanizer;
 pub use clause_inspect::ClauseInspect;
 pub use encoder::{EncodedBatch, EncodedSample, Encoder};
+#[cfg(feature = "gpu")]
+pub use gpu::{GpuContext, GpuError, GpuTsetlinMachine};
 pub use models::{
     CoalescedTsetlinMachine, ConvolutionalTsetlinMachine, TMAutoEncoder, TMCoalescedAutoEncoder,
     TMCompositeClassifier, TMRegressor, TMSparseClassifier, TsetlinMachine,

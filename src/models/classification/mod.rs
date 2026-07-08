@@ -13,3 +13,6 @@ pub use composite_classifier::TMCompositeClassifier;
 pub use convolutional_classifier::ConvolutionalTsetlinMachine;
 pub use sparse_classifier::TMSparseClassifier;
 pub use vanilla_classifier::TsetlinMachine;
+// Shared data-parallel replica seeding, reused by the GPU backend.
+#[cfg(any(feature = "parallel", feature = "gpu"))]
+pub(crate) use vanilla_classifier::dp_seed;

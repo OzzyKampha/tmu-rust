@@ -3,14 +3,44 @@
 //! Mirrors TMU's `vanilla_classifier.py` / `TMClassifier`.
 
 #[cfg(feature = "parallel")]
-use crate::clause_bank::dense::{use_parallel, DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN};
+use crate::clause_bank::dense::{DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN, use_parallel};
 use crate::clause_bank::dense::{
-    bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, grow_dense_state,
-    rebuild_include, type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for,
-    GOLDEN, MASK_BITS, WORD_BITS,
+    GOLDEN, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of, expand_bits_to_bytes,
+    fire_predict, grow_dense_state, rebuild_include, type_i_update_bytes, type_ii_update_bytes,
+    type_iii_update, words_for,
 };
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
+
+/// Per-replica RNG seeding for the data-parallel training path, shared by the
+/// CPU (`fit_epoch_data_parallel`) and the GPU backend so both use exactly the
+/// same seeding scheme. Given a replica seed `sd`, these derive the replica's
+/// four independent RNG streams (`rng`, `literal_rng`, per-clause `rngs`,
+/// per-class `class_rngs`).
+#[cfg(any(feature = "parallel", feature = "gpu"))]
+pub(crate) mod dp_seed {
+    use super::{GOLDEN, Rng};
+
+    /// XOR constant separating the literal-dropout stream from the sample stream.
+    const LITERAL_XOR: u64 = 0x4C49_5445_5241_4C21;
+
+    #[inline]
+    pub(crate) fn replica_rng(sd: u64) -> Rng {
+        Rng::new(sd)
+    }
+    #[inline]
+    pub(crate) fn literal_rng(sd: u64) -> Rng {
+        Rng::new(sd ^ LITERAL_XOR)
+    }
+    #[inline]
+    pub(crate) fn clause_rng(sd: u64, i: usize) -> Rng {
+        Rng::new(sd ^ (i as u64).wrapping_add(1).wrapping_mul(GOLDEN))
+    }
+    #[inline]
+    pub(crate) fn class_rng(sd: u64, c: usize, n_clauses: usize) -> Rng {
+        Rng::new(sd ^ (c as u64 + n_clauses as u64 + 1).wrapping_mul(GOLDEN))
+    }
+}
 
 /// A weighted multiclass Tsetlin Machine with u8 per-TA counters (matches TMU's 8-bit states).
 ///
@@ -20,62 +50,65 @@ use crate::rng::Rng;
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TsetlinMachine {
-    n_classes: usize,
-    n_features: usize,
-    n_literals: usize,
-    words: usize,
-    clauses_per_class: usize,
-    threshold: i32,
-    s: f64,
-    boost_true_positive: bool,
-    max_included_literals: usize,
-    clause_drop_p: f64,
+    // NOTE: data fields are `pub(crate)` so the optional `gpu` backend (src/gpu/)
+    // can mirror them to device buffers and write them back after GPU training.
+    // The public API is unchanged; only in-crate code can see these.
+    pub(crate) n_classes: usize,
+    pub(crate) n_features: usize,
+    pub(crate) n_literals: usize,
+    pub(crate) words: usize,
+    pub(crate) clauses_per_class: usize,
+    pub(crate) threshold: i32,
+    pub(crate) s: f64,
+    pub(crate) boost_true_positive: bool,
+    pub(crate) max_included_literals: usize,
+    pub(crate) clause_drop_p: f64,
     /// Per-literal dropout probability during training (mirrors TMU's `literal_drop_p`).
-    literal_drop_p: f64,
+    pub(crate) literal_drop_p: f64,
     /// Dedicated RNG for literal-active mask generation (independent of clause/class RNGs).
-    literal_rng: Rng,
+    pub(crate) literal_rng: Rng,
     /// Precomputed binary digits for Bernoulli(1 - literal_drop_p) mask generation.
-    dig_lit_active: Vec<u8>,
+    pub(crate) dig_lit_active: Vec<u8>,
 
     /// u8 TA counters (matches TMU's 8-bit states).  Clause `cj = c*CPC + j` occupies
     /// `ta[cj * n_literals .. (cj+1) * n_literals]`.
-    ta: Vec<u8>,
+    pub(crate) ta: Vec<u8>,
     /// Include bitset.  Clause `cj` occupies `include[cj * words .. (cj+1) * words]`.
     /// Rebuilt after every clause update; kept in sync with `ta`.
-    include: Vec<u64>,
+    pub(crate) include: Vec<u64>,
     /// TA threshold for inclusion: `ta[l] >= half` → literal l is included.
-    half: u8,
+    pub(crate) half: u8,
     /// Maximum TA counter value: `(1 << state_bits) - 1`.
-    max_state: u8,
+    pub(crate) max_state: u8,
 
     /// Per-clause integer weights (>= 1), indexed `c*CPC + j`.
-    weights: Vec<i32>,
+    pub(crate) weights: Vec<i32>,
     /// Per-clause RNG (enables lock-free parallel training).
-    rngs: Vec<Rng>,
+    pub(crate) rngs: Vec<Rng>,
     /// Per-class RNG for drop/inv/keep mask generation.
-    class_rngs: Vec<Rng>,
+    pub(crate) class_rngs: Vec<Rng>,
     /// Per-word mask of real literal bits.
-    valid: Vec<u64>,
-    dig_inv: Vec<u8>,
-    dig_keep: Vec<u8>,
+    pub(crate) valid: Vec<u64>,
+    pub(crate) dig_inv: Vec<u8>,
+    pub(crate) dig_keep: Vec<u8>,
 
-    literals: Vec<u64>,
-    rng: Rng, // for shuffling and negative-class selection only
+    pub(crate) literals: Vec<u64>,
+    pub(crate) rng: Rng, // for shuffling and negative-class selection only
 
     /// Per-class feedback scaling factors for imbalanced datasets.
     /// `class_weights[c]` multiplies the feedback probability for class `c`.
     /// Defaults to `1.0` for all classes (no reweighting).
-    class_weights: Vec<f64>,
+    pub(crate) class_weights: Vec<f64>,
 
     /// Indicator TA states for Type III feedback (same layout as `ta`).
     /// Zero-initialised; only meaningful when `type_iii` is `true`.
-    ind: Vec<u8>,
+    pub(crate) ind: Vec<u8>,
     /// `clause_and_target` bitsets for Type III feedback (same layout as `include`).
-    cat: Vec<u64>,
+    pub(crate) cat: Vec<u64>,
     /// Type III strength: indicator is incremented with probability `1 − 1/d`.
-    d: f64,
+    pub(crate) d: f64,
     /// Whether Type III feedback is active during training.
-    type_iii: bool,
+    pub(crate) type_iii: bool,
 
     /// When set, `update_class` never takes the nested Rayon path. Used to keep
     /// per-shard replica training single-threaded inside `fit_epoch_data_parallel`
@@ -87,9 +120,10 @@ pub struct TsetlinMachine {
 
     /// Opt-in: let `fit_epoch` use the faster (approximate) data-parallel path when
     /// the workload is large enough. Off by default (exact training). Not serialised.
+    /// Also read by the GPU backend to select its data-parallel replica path.
     #[cfg_attr(feature = "serde", serde(skip))]
-    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    data_parallel: bool,
+    #[cfg_attr(not(any(feature = "parallel", feature = "gpu")), allow(dead_code))]
+    pub(crate) data_parallel: bool,
     /// Whether the "use data_parallel" hint has already been printed (once per model).
     #[cfg_attr(feature = "serde", serde(skip))]
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
@@ -545,7 +579,14 @@ impl TsetlinMachine {
         let include = self.include.as_slice();
         let valid = self.valid.as_slice();
         (0..cps)
-            .filter(|&j| fire_predict(&include[(class * cps + j) * words..(class * cps + j + 1) * words], lit, valid, words))
+            .filter(|&j| {
+                fire_predict(
+                    &include[(class * cps + j) * words..(class * cps + j + 1) * words],
+                    lit,
+                    valid,
+                    words,
+                )
+            })
             .collect()
     }
 
@@ -700,8 +741,22 @@ impl TsetlinMachine {
                         );
                         if drop_mask.is_empty() || !drop_mask[j] {
                             if type_iii_update(
-                                ta_c, ind_c, cat_c, inc_c, lit, val, lit_active, active_b, words, n_literals,
-                                d_val, p, target_bool, rng, half, max_state,
+                                ta_c,
+                                ind_c,
+                                cat_c,
+                                inc_c,
+                                lit,
+                                val,
+                                lit_active,
+                                active_b,
+                                words,
+                                n_literals,
+                                d_val,
+                                p,
+                                target_bool,
+                                rng,
+                                half,
+                                max_state,
                             ) {
                                 rebuild_include(ta_c, inc_c, val, words, n_literals, half);
                             }
@@ -863,6 +918,106 @@ impl TsetlinMachine {
         }
     }
 
+    /// Reproduce one epoch's host-RNG-driven decisions for the GPU backend,
+    /// advancing `self.rng` and `self.literal_rng` **exactly** as [`fit_epoch`]
+    /// would — so a GPU-trained model's serialized RNG state matches CPU training
+    /// bit-for-bit. Returns the shuffled sample order, the per-step negative
+    /// class, and (if literal dropout is on) the per-step literal-active masks.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn gpu_epoch_plan(&mut self, n: usize, ys: &[usize]) -> crate::gpu::GpuEpochPlan {
+        // Fisher–Yates shuffle with `self.rng` (identical to fit_epoch).
+        let mut order: Vec<usize> = (0..n).collect();
+        for i in (1..n).rev() {
+            let k = self.rng.below(i + 1);
+            order.swap(i, k);
+        }
+        let words = self.words;
+        let dropout = self.literal_drop_p > 0.0;
+        let mut negs = Vec::with_capacity(n);
+        let mut lit_active = if dropout {
+            Vec::with_capacity(n * words)
+        } else {
+            Vec::new()
+        };
+        for &i in &order {
+            let y = ys[i];
+            // Negative-class rejection sampling (identical to fit_one_lit).
+            let mut neg = self.rng.below(self.n_classes);
+            while neg == y {
+                neg = self.rng.below(self.n_classes);
+            }
+            negs.push(neg);
+            if dropout {
+                let rng = &mut self.literal_rng;
+                let dig = &self.dig_lit_active;
+                for _ in 0..words {
+                    lit_active.push(bmask_word(rng, dig));
+                }
+            }
+        }
+        crate::gpu::GpuEpochPlan {
+            order,
+            negs,
+            lit_active,
+        }
+    }
+
+    /// Plan a **data-parallel** epoch for the GPU: shuffle with `self.rng`, draw
+    /// `r` replica seeds (advancing `self.rng` exactly as CPU `fit_epoch_data_parallel`
+    /// does), and, per replica, precompute the per-shard-step negative class and
+    /// literal-dropout masks from that replica's own RNG streams. Mirrors the CPU
+    /// replica semantics so the GPU fast path is the same algorithm.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn dp_epoch_plan(&mut self, n: usize, ys: &[usize], r: usize) -> crate::gpu::DpPlan {
+        let mut order: Vec<usize> = (0..n).collect();
+        for i in (1..n).rev() {
+            let k = self.rng.below(i + 1);
+            order.swap(i, k);
+        }
+        let seeds: Vec<u64> = (0..r).map(|_| self.rng.next_u64()).collect();
+        let shard_len = n.div_ceil(r);
+        let words = self.words;
+        let dropout = self.literal_drop_p > 0.0;
+        let mut negs = vec![0usize; r * shard_len];
+        let mut lit_active = if dropout {
+            vec![0u64; r * shard_len * words]
+        } else {
+            Vec::new()
+        };
+        for ri in 0..r {
+            let mut rrng = dp_seed::replica_rng(seeds[ri]);
+            let mut lrng = dp_seed::literal_rng(seeds[ri]);
+            let start = ri * shard_len;
+            let end = ((ri + 1) * shard_len).min(n);
+            for s in 0..shard_len {
+                let gk = start + s;
+                if gk >= end {
+                    break; // this replica's shard is exhausted
+                }
+                let y = ys[order[gk]];
+                let mut neg = rrng.below(self.n_classes);
+                while neg == y {
+                    neg = rrng.below(self.n_classes);
+                }
+                negs[ri * shard_len + s] = neg;
+                if dropout {
+                    let dig = &self.dig_lit_active;
+                    let base = (ri * shard_len + s) * words;
+                    for w in 0..words {
+                        lit_active[base + w] = bmask_word(&mut lrng, dig);
+                    }
+                }
+            }
+        }
+        crate::gpu::DpPlan {
+            order,
+            seeds,
+            shard_len,
+            negs,
+            lit_active,
+        }
+    }
+
     /// One-time stderr hint that a large model would train faster with
     /// `data_parallel(true)`. Shown only when ALL hold: the flag is off, the model
     /// is genuinely large, there is more than one core (so it would actually help),
@@ -936,13 +1091,11 @@ impl TsetlinMachine {
                 .map(|&sd| {
                     let mut r = self.clone();
                     r.train_scalar = true;
-                    r.rng = Rng::new(sd);
-                    r.literal_rng = Rng::new(sd ^ 0x4C49_5445_5241_4C21u64);
-                    r.rngs = (0..n_clauses)
-                        .map(|i| Rng::new(sd ^ (i as u64).wrapping_add(1).wrapping_mul(GOLDEN)))
-                        .collect();
+                    r.rng = dp_seed::replica_rng(sd);
+                    r.literal_rng = dp_seed::literal_rng(sd);
+                    r.rngs = (0..n_clauses).map(|i| dp_seed::clause_rng(sd, i)).collect();
                     r.class_rngs = (0..n_cls)
-                        .map(|c| Rng::new(sd ^ (c as u64 + n_clauses as u64 + 1).wrapping_mul(GOLDEN)))
+                        .map(|c| dp_seed::class_rng(sd, c, n_clauses))
                         .collect();
                     r
                 })
@@ -950,16 +1103,19 @@ impl TsetlinMachine {
 
             // Each replica trains sequentially on a contiguous shard of the order.
             let shard_len = n.div_ceil(n_shards);
-            replicas.par_iter_mut().enumerate().for_each(|(s, replica)| {
-                let start = s * shard_len;
-                if start >= n {
-                    return;
-                }
-                let end = (start + shard_len).min(n);
-                for &i in &order[start..end] {
-                    replica.fit_one_lit(&data[i * w..(i + 1) * w], ys[i]);
-                }
-            });
+            replicas
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(s, replica)| {
+                    let start = s * shard_len;
+                    if start >= n {
+                        return;
+                    }
+                    let end = (start + shard_len).min(n);
+                    for &i in &order[start..end] {
+                        replica.fit_one_lit(&data[i * w..(i + 1) * w], ys[i]);
+                    }
+                });
 
             // Merge: average TA counters and weights across replicas, then rebuild
             // the include bitsets so they stay consistent with the merged TA.
@@ -1584,7 +1740,7 @@ mod tests {
         let words = 1usize;
         let half = 8u8; // sb=4 → half=8
         let max_state = 15u8; // (1<<4)-1
-                              // Literal 0 at max state (included); absent from x → violation → Ib path.
+        // Literal 0 at max state (included); absent from x → violation → Ib path.
         let mut ta = vec![max_state];
         let mut inc = vec![1u64]; // bit 0 included
         let lit = vec![0u64]; // absent
@@ -2230,8 +2386,8 @@ mod tests {
 
     #[test]
     fn type_iii_constructs_without_panic() {
-        let _tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42)
-            .type_iii_feedback(200.0);
+        let _tm =
+            TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42).type_iii_feedback(200.0);
     }
 
     #[test]
@@ -2247,8 +2403,8 @@ mod tests {
         let (xtr, ytr) = make_xor(200, 0.0, 7);
         let e = enc(12);
         let btr = e.encode_batch(&as_slices(&xtr));
-        let mut tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42)
-            .type_iii_feedback(200.0);
+        let mut tm =
+            TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42).type_iii_feedback(200.0);
         for _ in 0..5 {
             tm.fit_epoch(&btr, &ytr);
         }
@@ -2261,8 +2417,8 @@ mod tests {
         let e = enc(12);
         let btr = e.encode_batch(&as_slices(&xtr));
         let bte = e.encode_batch(&as_slices(&xte));
-        let mut tm = TsetlinMachine::with_config(2, 12, 20, 10, 3.0, 8, true, 42)
-            .type_iii_feedback(200.0);
+        let mut tm =
+            TsetlinMachine::with_config(2, 12, 20, 10, 3.0, 8, true, 42).type_iii_feedback(200.0);
         for _ in 0..20 {
             tm.fit_epoch(&btr, &ytr);
         }
@@ -2272,8 +2428,8 @@ mod tests {
 
     #[test]
     fn type_iii_ind_and_cat_same_size_as_ta_and_include() {
-        let tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42)
-            .type_iii_feedback(100.0);
+        let tm =
+            TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42).type_iii_feedback(100.0);
         assert_eq!(tm.ind.len(), tm.ta.len());
         assert_eq!(tm.cat.len(), tm.include.len());
     }
@@ -2314,7 +2470,10 @@ mod tests {
         for (i, &p) in batch.iter().enumerate() {
             assert_eq!(p, tm.predict_lit(&bte.data[i * w..(i + 1) * w]));
         }
-        assert!(tm.accuracy(&bte, &yte) > 0.9, "wide/few-clause model failed to learn");
+        assert!(
+            tm.accuracy(&bte, &yte) > 0.9,
+            "wide/few-clause model failed to learn"
+        );
     }
 
     #[test]
@@ -2326,7 +2485,8 @@ mod tests {
         let e = enc(12);
         let btr = e.encode_batch(&as_slices(&xtr));
         let bte = e.encode_batch(&as_slices(&xte));
-        let mut tm = TsetlinMachine::with_config(2, 12, 40, 15, 3.9, 8, true, 7).data_parallel(true);
+        let mut tm =
+            TsetlinMachine::with_config(2, 12, 40, 15, 3.9, 8, true, 7).data_parallel(true);
         for _ in 0..30 {
             tm.fit_epoch(&btr, &ytr);
         }

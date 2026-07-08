@@ -57,6 +57,7 @@ let accuracy = tm.accuracy(&test_x, &test_y);
   - `TMAutoEncoder` — binary reconstruction via positive-only clause banks
   - `TMSparseClassifier` — sparse clause bank with **absorbing actions**: literals are permanently dropped from each clause as training converges, so memory and per-clause evaluation scale with the number of *active* literals (a big win in high-dimensional, sparsely-relevant feature spaces)
 - Optional multi-threaded training via [Rayon](https://github.com/rayon-rs/rayon) (`--features parallel`)
+- Optional **GPU training and inference** for `TMClassifier` via portable [wgpu](https://github.com/gfx-rs/wgpu)/WGSL compute (`--features gpu`) — runs on any Vulkan/Metal/DX12 adapter, **bitwise-identical to CPU training** so models trained on the GPU can be run (or resumed) on the CPU and vice versa. See [GPU acceleration](#gpu-acceleration-training--inference)
 - AVX2 fast paths for clause update loops with runtime dispatch — u8 TA counters processed 32-wide (4× smaller working set vs u32; scalar fallback on non-AVX2 targets)
 - Type-safe `Encoder` for binary, numeric (quantile booleanization), and categorical inputs
 - Fast booleanizer for continuous-valued inputs
@@ -92,6 +93,109 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
 AVX2 fast paths are also activated at runtime automatically when the CPU supports it, even without `target-cpu=native`.
+
+---
+
+## GPU acceleration (training + inference)
+
+The `gpu` feature adds a portable GPU backend for the vanilla `TMClassifier`
+(`TsetlinMachine`), built on [wgpu](https://github.com/gfx-rs/wgpu) / WGSL
+compute shaders. It runs on any Vulkan, Metal, or DX12 adapter — NVIDIA, AMD,
+Intel, or Apple — with **no CUDA toolkit required**, and falls back cleanly to a
+software Vulkan driver (mesa llvmpipe) for CI.
+
+```toml
+tmu-rs = { git = "https://github.com/ozzykampha/tmu-rust", features = ["gpu"] }
+```
+
+```rust
+use std::sync::Arc;
+use tmu_rs::{TsetlinMachine, GpuContext};
+
+let ctx = Arc::new(GpuContext::new()?);          // Err if no adapter is available
+let tm = TsetlinMachine::with_config(2, n_features, 64, 15, 3.9, 8, true, 42);
+
+let mut gpu = tm.to_gpu(&ctx)?;                   // move a copy onto the GPU
+for _ in 0..epochs {
+    gpu.fit_epoch(&train, &ytr);                 // train on the GPU
+}
+let preds = gpu.predict_batch(&test);            // infer on the GPU
+let cpu_model = gpu.into_cpu();                   // ...or download and use the CPU
+let _ = cpu_model.predict_batch(&test);          // (save/load work unchanged)
+```
+
+**Train anywhere, infer anywhere.** GPU training reproduces the per-clause
+SplitMix64 RNG streams and feedback logic exactly, so for a given seed and
+configuration the trained model (`ta`, `include`, `weights`, and all RNG state)
+is **bit-for-bit identical** to CPU training. A model can be trained on the GPU
+and run for inference on the CPU (or the reverse), and `save`/`load` are
+unchanged — the model state lives in the same host struct; the GPU holds a
+device-side copy synced at boundaries (`sync` / `into_cpu`).
+
+Supported today: `boost_true_positive`, `max_included_literals`, `class_weights`,
+`state_bits` (2–8), and `literal_drop_p`. `to_gpu` returns
+`GpuError::Unsupported` (rather than silently falling back) for
+`type_iii_feedback` and `clause_drop_p > 0`. To grow features, `into_cpu()`,
+grow, then `to_gpu()` again.
+
+**Too big for VRAM? It still trains.** `to_gpu` never fails because a model is
+too large — if the model doesn't fit in GPU memory it stays on the CPU and
+`fit_epoch` / `predict_batch` run there transparently (check
+`GpuTsetlinMachine::is_gpu_resident()`). Data-parallel likewise scales the
+replica count down to what fits, falling back to the exact GPU path (or, if even
+the single model doesn't fit, the CPU). The only hard error is
+`GpuError::Unsupported` for the options listed above.
+
+**Two training modes.** The default GPU path is *exact* (bitwise-identical to
+CPU) but processes samples sequentially — latency-bound, so it only beats a
+multi-threaded CPU on large models. For a bigger speedup, build the model with
+[`data_parallel(true)`](crate::TsetlinMachine::data_parallel): the GPU then
+trains `R` model replicas in lockstep on sample shards and averages them
+(mirroring the CPU `data_parallel` path), which cuts kernel launches ~`R×` and
+fills the device. Like the CPU flag, this is **approximate** (accuracy tracks
+exact within noise) and replica-count dependent, but deterministic for a given
+seed and `R`. The replica count is chosen automatically from available VRAM;
+override it with `GpuTsetlinMachine::set_replicas(Some(r))` (dynamic — takes
+effect on the next epoch). Inference is identical in both modes.
+
+```rust
+let tm = TsetlinMachine::with_config(10, n_features, 2000, 50, 5.0, 8, true, 42)
+    .data_parallel(true);                 // opt into the fast (approximate) GPU path
+let mut gpu = tm.to_gpu(&ctx)?;
+gpu.set_replicas(Some(16));               // optional: pin the replica count
+for _ in 0..epochs { gpu.fit_epoch(&train, &ys); }
+```
+
+### Try it / benchmark it
+
+```sh
+# First: confirm your GPU (not a software fallback) is selected, and see limits:
+cargo run --release --features gpu --example gpu_probe
+
+# Train noisy XOR on the GPU, then evaluate on both GPU and CPU:
+cargo run --release --features gpu,serde --example gpu_xor
+
+# CPU-vs-GPU training/inference throughput comparison (checks parity first):
+cargo run --release --features gpu          --example gpu_vs_cpu_bench
+cargo run --release --features gpu,parallel --example gpu_vs_cpu_bench
+```
+
+The benchmark prints a per-stage table (`train` / `infer`, ms and samples/s)
+with the GPU speedup, and reports the one-time upload cost separately. The GPU
+wins on **large** models (many clauses × many features × large batches), where
+there is enough parallel work to hide launch and transfer overhead; on tiny
+models the CPU is faster. Real speedups require real hardware — on the mesa
+llvmpipe software driver the "GPU" is CPU emulation (no AVX2), so treat those
+numbers as a functional check, not a hardware comparison.
+
+**Testing:** GPU tests live in `tests/gpu_parity.rs` (plus RNG bit-exactness
+unit tests) and **skip cleanly** when no adapter is present. To exercise them in
+a headless environment, install a software Vulkan driver (e.g.
+`mesa-vulkan-drivers`) and run:
+
+```sh
+cargo test --features gpu,serde --test gpu_parity
+```
 
 ---
 
@@ -134,6 +238,9 @@ The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) demos with 
 | `bench_training` | Training throughput benchmark (sequential vs parallel, IMDB-scale) |
 | `bench_autoencoder` | AutoEncoder throughput + accuracy vs Python TMU |
 | `absorb_timing` | Per-epoch accuracy and absorbing-state fraction at various `state_bits` |
+| `gpu_probe` | GPU: print the selected adapter, driver, and limits — confirm your GPU is used (needs `--features gpu`) |
+| `gpu_xor` | GPU: train noisy XOR on the GPU, evaluate on GPU and CPU, save/load (needs `--features gpu,serde`) |
+| `gpu_vs_cpu_bench` | CPU-vs-GPU training/inference throughput comparison (needs `--features gpu`) |
 
 `bench_training` uses a synthetic dataset — no download required. Compare with and without `--features parallel`.
 
