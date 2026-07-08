@@ -141,6 +141,9 @@ grow, then `to_gpu()` again.
 ### Try it / benchmark it
 
 ```sh
+# First: confirm your GPU (not a software fallback) is selected, and see limits:
+cargo run --release --features gpu --example gpu_probe
+
 # Train noisy XOR on the GPU, then evaluate on both GPU and CPU:
 cargo run --release --features gpu,serde --example gpu_xor
 
@@ -207,6 +210,7 @@ The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) demos with 
 | `bench_training` | Training throughput benchmark (sequential vs parallel, IMDB-scale) |
 | `bench_autoencoder` | AutoEncoder throughput + accuracy vs Python TMU |
 | `absorb_timing` | Per-epoch accuracy and absorbing-state fraction at various `state_bits` |
+| `gpu_probe` | GPU: print the selected adapter, driver, and limits — confirm your GPU is used (needs `--features gpu`) |
 | `gpu_xor` | GPU: train noisy XOR on the GPU, evaluate on GPU and CPU, save/load (needs `--features gpu,serde`) |
 | `gpu_vs_cpu_bench` | CPU-vs-GPU training/inference throughput comparison (needs `--features gpu`) |
 

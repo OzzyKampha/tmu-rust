@@ -191,6 +191,70 @@ impl GpuContext {
     pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
         &self.adapter_info
     }
+
+    /// `true` if the selected adapter is a software (CPU) implementation such as
+    /// mesa llvmpipe, rather than real GPU hardware.
+    pub fn is_software(&self) -> bool {
+        matches!(self.adapter_info.device_type, wgpu::DeviceType::Cpu)
+    }
+
+    /// The adapter's maximum storage-buffer binding size, in bytes. This gates
+    /// model size: the TA-counter buffer (`4 * classes * clauses * literals`
+    /// bytes) must fit within it, else [`to_gpu`](crate::TsetlinMachine::to_gpu)
+    /// returns [`GpuError::LimitExceeded`].
+    pub fn limits_max_storage_binding(&self) -> u64 {
+        self.limits.max_storage_buffer_binding_size
+    }
+
+    /// A human-readable, multi-line summary of the selected adapter and the
+    /// device limits that matter for tmu-rs (buffer sizes, workgroup dispatch).
+    ///
+    /// wgpu does not expose total VRAM portably, so this reports the buffer
+    /// binding limits — which are what actually gate model size (see
+    /// [`GpuError::LimitExceeded`]).
+    pub fn describe(&self) -> String {
+        let i = &self.adapter_info;
+        let l = &self.limits;
+        let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+        let mut s = String::new();
+        s.push_str(&format!("adapter        : {}\n", i.name));
+        s.push_str(&format!("device type    : {:?}\n", i.device_type));
+        s.push_str(&format!("backend        : {:?}\n", i.backend));
+        if !i.driver.is_empty() {
+            s.push_str(&format!(
+                "driver         : {} {}\n",
+                i.driver, i.driver_info
+            ));
+        }
+        s.push_str(&format!(
+            "vendor:device  : {:#06x}:{:#06x}\n",
+            i.vendor, i.device
+        ));
+        if self.is_software() {
+            s.push_str("NOTE           : software (CPU) driver — not real GPU hardware\n");
+        }
+        s.push_str(&format!(
+            "max buffer     : {:.0} MiB\n",
+            mib(l.max_buffer_size)
+        ));
+        s.push_str(&format!(
+            "max storage buf: {:.0} MiB per binding\n",
+            mib(l.max_storage_buffer_binding_size)
+        ));
+        s.push_str(&format!(
+            "storage bufs   : {} per compute stage\n",
+            l.max_storage_buffers_per_shader_stage
+        ));
+        s.push_str(&format!(
+            "max workgroups : {} per dispatch dimension\n",
+            l.max_compute_workgroups_per_dimension
+        ));
+        s.push_str(&format!(
+            "invocations/wg : {}",
+            l.max_compute_invocations_per_workgroup
+        ));
+        s
+    }
 }
 
 impl Layouts {

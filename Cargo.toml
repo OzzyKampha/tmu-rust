@@ -157,6 +157,11 @@ name = "dp_vs_exact"          # Validate data-parallel vs exact training accurac
 path = "examples/dp_vs_exact.rs"
 
 [[example]]
+name = "gpu_probe"           # GPU: print the selected adapter + limits (confirm your GPU is used)
+path = "examples/gpu_probe.rs"
+required-features = ["gpu"]
+
+[[example]]
 name = "gpu_xor"              # GPU: train noisy XOR on GPU, evaluate on GPU and CPU, save/load
 path = "examples/gpu_xor.rs"
 required-features = ["gpu"]
