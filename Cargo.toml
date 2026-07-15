@@ -10,6 +10,14 @@ readme = "README.md"
 keywords = ["tsetlin", "machine-learning", "classifier", "tmu", "automata"]
 categories = ["science"]
 autoexamples = false
+# Analysis/output artifacts that live in the repo but don't belong in the
+# published crate tarball.
+exclude = [
+    "car_complete_extraction.json",
+    "car_detection_report.txt",
+    "scripts/**",
+    "data/**",
+]
 
 [dependencies]
 rayon = { version = "1", optional = true }
