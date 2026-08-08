@@ -131,63 +131,13 @@ pub(crate) fn expand_bits_to_bytes(bits: &[u64], n: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Smallest `words` at which the AVX2 kernel is worth dispatching to.
-///
-/// Below this the scalar loop is already a handful of instructions and the feature
-/// check plus function-call boundary costs more than the vectorisation saves. Eight
-/// words is 512 literals; the models this crate is used for run far wider (a 1817-
-/// feature encoder gives 57 words), so the threshold only guards toy models.
-const AVX2_MIN_WORDS: usize = 8;
-
-/// Whether this CPU has AVX2, resolved once and cached.
-///
-/// `is_x86_feature_detected!` is itself cached by std, but it still costs a
-/// relaxed load and a branch through a function call; this keeps the hot path to a
-/// single relaxed byte load.
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[inline(always)]
-fn has_avx2() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    /// 0 = not yet probed, 1 = present, 2 = absent.
-    static CACHE: AtomicU8 = AtomicU8::new(0);
-    match CACHE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let present = is_x86_feature_detected!("avx2");
-            CACHE.store(if present { 1 } else { 2 }, Ordering::Relaxed);
-            present
-        }
-    }
-}
-
 /// Returns `true` if a clause fires for inference (no included literal is violated).
 ///
 /// `inc` is the clause include bitset (`words` u64s, 1 bit per literal).
 /// Empty clauses (no included literals) return `false`, matching TMU predict semantics.
 /// Use [`clause_fire`] during training where empty clauses must return `true`.
-///
-/// This is the innermost loop of every dense model's scoring path — a coalesced
-/// classifier walks it once per clause per sample — so it carries an explicit AVX2
-/// kernel. [`fire_predict_scalar`] stays the definition of correct: the dispatch
-/// falls back to it on non-x86 and on pre-AVX2 x86, and `avx2_matches_scalar`
-/// checks the two agree over randomised bitsets.
 #[inline(always)]
 pub(crate) fn fire_predict(inc: &[u64], lit: &[u64], valid: &[u64], words: usize) -> bool {
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-    {
-        if words >= AVX2_MIN_WORDS && has_avx2() {
-            // SAFETY: guarded by the runtime AVX2 check above; the kernel reads
-            // `words` u64s from each slice, which the callers guarantee.
-            return unsafe { fire_predict_avx2(inc, lit, valid, words) };
-        }
-    }
-    fire_predict_scalar(inc, lit, valid, words)
-}
-
-/// Portable reference implementation of [`fire_predict`].
-#[inline(always)]
-pub(crate) fn fire_predict_scalar(inc: &[u64], lit: &[u64], valid: &[u64], words: usize) -> bool {
     let mut violation = 0u64;
     let mut included = 0u64;
     for k in 0..words {
@@ -196,63 +146,6 @@ pub(crate) fn fire_predict_scalar(inc: &[u64], lit: &[u64], valid: &[u64], words
         included |= inc_k;
     }
     violation == 0 && included != 0
-}
-
-/// AVX2 kernel for [`fire_predict`]: four u64 lanes per step.
-///
-/// Identical algebra to the scalar loop — `inc & valid` gives the active includes,
-/// `andnot(lit, active)` gives the violated ones — accumulated in two 256-bit
-/// registers and reduced once at the end with `testz`.
-///
-/// # Safety
-///
-/// The caller must have established that AVX2 is available, and all three slices
-/// must hold at least `words` elements.
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-#[target_feature(enable = "avx2")]
-unsafe fn fire_predict_avx2(inc: &[u64], lit: &[u64], valid: &[u64], words: usize) -> bool {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-
-    debug_assert!(inc.len() >= words && lit.len() >= words && valid.len() >= words);
-
-    unsafe {
-        let mut viol = _mm256_setzero_si256();
-        let mut incl = _mm256_setzero_si256();
-        let (ip, lp, vp) = (
-            inc.as_ptr().cast::<__m256i>(),
-            lit.as_ptr().cast::<__m256i>(),
-            valid.as_ptr().cast::<__m256i>(),
-        );
-
-        let chunks = words / 4;
-        for c in 0..chunks {
-            let active =
-                _mm256_and_si256(_mm256_loadu_si256(ip.add(c)), _mm256_loadu_si256(vp.add(c)));
-            // andnot(a, b) is (!a) & b, so this is `active & !lit`.
-            viol = _mm256_or_si256(
-                viol,
-                _mm256_andnot_si256(_mm256_loadu_si256(lp.add(c)), active),
-            );
-            incl = _mm256_or_si256(incl, active);
-        }
-
-        // A violation anywhere is decisive, so check before bothering with the tail.
-        if _mm256_testz_si256(viol, viol) == 0 {
-            return false;
-        }
-
-        let mut violation = 0u64;
-        let mut included = 0u64;
-        for k in (chunks * 4)..words {
-            let inc_k = *inc.get_unchecked(k) & *valid.get_unchecked(k);
-            violation |= inc_k & !*lit.get_unchecked(k);
-            included |= inc_k;
-        }
-        violation == 0 && (included != 0 || _mm256_testz_si256(incl, incl) == 0)
-    }
 }
 
 /// Returns `true` if a clause fires during training (no active included literal is violated).
@@ -1761,80 +1654,6 @@ mod tests {
         let valid = vec![!0u64; words];
         let lit_active = vec![!0u64; words];
         assert!(clause_fire(&inc, &lit, &valid, words, &lit_active));
-    }
-
-    /// The AVX2 kernel and the scalar reference must agree on every input, not just
-    /// on plausible ones. Randomised bitsets across a range of widths, including
-    /// widths that are not multiples of four so the scalar tail is exercised, and
-    /// densities that make violations rare, common, and certain.
-    #[test]
-    fn avx2_matches_scalar() {
-        let mut state = 0x243f_6a88_85a3_08d3u64;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        for words in [8usize, 9, 11, 16, 31, 57, 64] {
-            for density in [0u32, 1, 8, 32, 63, 64] {
-                let mut inc = vec![0u64; words];
-                let mut lit = vec![0u64; words];
-                let mut valid = vec![0u64; words];
-                for k in 0..words {
-                    // `density` controls how many bits are set, so the sweep covers
-                    // empty clauses (no includes at all) through fully dense ones.
-                    let mut w = 0u64;
-                    for _ in 0..density {
-                        w |= 1u64 << (next() % 64);
-                    }
-                    inc[k] = w;
-                    lit[k] = next();
-                    valid[k] = if density == 0 { 0 } else { next() | 1 };
-                }
-                let want = fire_predict_scalar(&inc, &lit, &valid, words);
-                let got = fire_predict(&inc, &lit, &valid, words);
-                assert_eq!(
-                    want, got,
-                    "avx2 disagreed with scalar at words={words} density={density}"
-                );
-            }
-        }
-    }
-
-    /// Empty clauses are the one case where predict and train semantics diverge, and
-    /// the vector reduction has to preserve it.
-    #[test]
-    fn avx2_returns_false_for_an_empty_clause() {
-        let words = 57;
-        let inc = vec![0u64; words];
-        let lit = vec![!0u64; words];
-        let valid = vec![!0u64; words];
-        assert!(!fire_predict(&inc, &lit, &valid, words));
-        assert!(!fire_predict_scalar(&inc, &lit, &valid, words));
-    }
-
-    /// A clause whose only included literal sits in the scalar tail (past the last
-    /// full 4-word chunk) must still be seen.
-    #[test]
-    fn avx2_tail_literals_are_not_dropped() {
-        let words = 9; // 2 full chunks + 1 tail word
-        let mut inc = vec![0u64; words];
-        let valid = vec![!0u64; words];
-        inc[8] = 1 << 5;
-
-        let mut lit = vec![0u64; words];
-        lit[8] = 1 << 5;
-        assert!(
-            fire_predict(&inc, &lit, &valid, words),
-            "tail include present"
-        );
-
-        lit[8] = 0;
-        assert!(
-            !fire_predict(&inc, &lit, &valid, words),
-            "tail include absent must violate"
-        );
     }
 
     #[test]
