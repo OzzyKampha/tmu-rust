@@ -442,10 +442,13 @@ impl TMCoalescedAutoEncoder {
         let val = valid.as_slice();
         let orng = &mut output_rngs[o];
 
+        // Empty means "all active" (checked via `is_empty()` below) — matches the
+        // `drop_mask` convention in vanilla_autoencoder.rs so the default (no dropout)
+        // path allocates nothing instead of materialising an all-true Vec every call.
         let clause_active: Vec<bool> = if drop_p > 0.0 {
             (0..nc).map(|_| orng.next_f64() >= drop_p).collect()
         } else {
-            vec![true; nc]
+            Vec::new()
         };
 
         let inv_mask: Vec<u64> = (0..words).map(|_| bmask_word(orng, dig_inv)).collect();
@@ -467,12 +470,13 @@ impl TMCoalescedAutoEncoder {
                     .zip(cat.par_chunks_mut(words))
                     .enumerate()
                     .for_each(|(j, (((((ta_j, inc_j), w), rng), ind_j), cat_j))| {
+                        let active_j = clause_active.is_empty() || clause_active[j];
                         apply_one_clause_coalesced(
-                            ta_j, inc_j, w, rng, target, p, clause_outputs[j], clause_active[j],
+                            ta_j, inc_j, w, rng, target, p, clause_outputs[j], active_j,
                             val, words, lit_b, &inv_b, &keep_b, active_b, n_literals, boost,
                             max_inc, half, max_state,
                         );
-                        if clause_active[j] {
+                        if active_j {
                             if type_iii_update(
                                 ta_j, ind_j, cat_j, inc_j, lit, val, lit_active, active_b, words, n_literals,
                                 d_val, p, target_bool, rng, half, max_state,
@@ -488,8 +492,9 @@ impl TMCoalescedAutoEncoder {
                     .zip(rngs.par_iter_mut())
                     .enumerate()
                     .for_each(|(j, (((ta_j, inc_j), w), rng))| {
+                        let active_j = clause_active.is_empty() || clause_active[j];
                         apply_one_clause_coalesced(
-                            ta_j, inc_j, w, rng, target, p, clause_outputs[j], clause_active[j],
+                            ta_j, inc_j, w, rng, target, p, clause_outputs[j], active_j,
                             val, words, lit_b, &inv_b, &keep_b, active_b, n_literals, boost,
                             max_inc, half, max_state,
                         );
@@ -499,6 +504,7 @@ impl TMCoalescedAutoEncoder {
         }
 
         for j in 0..nc {
+            let active_j = clause_active.is_empty() || clause_active[j];
             apply_one_clause_coalesced(
                 &mut ta[j * n_literals..(j + 1) * n_literals],
                 &mut include[j * words..(j + 1) * words],
@@ -507,7 +513,7 @@ impl TMCoalescedAutoEncoder {
                 target,
                 p,
                 clause_outputs[j],
-                clause_active[j],
+                active_j,
                 val,
                 words,
                 lit_b,
@@ -520,7 +526,7 @@ impl TMCoalescedAutoEncoder {
                 half,
                 max_state,
             );
-            if type_iii_en && clause_active[j] {
+            if type_iii_en && active_j {
                 if type_iii_update(
                     &mut ta[j * n_literals..(j + 1) * n_literals],
                     &mut ind[j * n_literals..(j + 1) * n_literals],
@@ -572,6 +578,10 @@ impl TMCoalescedAutoEncoder {
         };
         let mut active_b = expand_bits_to_bytes(&lit_active, n_literals);
 
+        // Reused across every output below — was reallocated per output (n_features
+        // times per sample) before; now allocated once per sample.
+        let mut clause_outputs = vec![false; nc];
+
         for o in 0..n_features {
             let target = ((lit[o / WORD_BITS] >> (o % WORD_BITS)) & 1) as u8;
 
@@ -588,23 +598,21 @@ impl TMCoalescedAutoEncoder {
             active_b[o] = 0;
             active_b[neg_o] = 0;
 
-            // Compute clause fires under this output's feature mask.
-            let clause_outputs: Vec<bool> = {
+            // Compute clause fires under this output's feature mask (into the reused buffer).
+            {
                 let include = self.include.as_slice();
                 let valid = self.valid.as_slice();
                 let litv = self.literals.as_slice();
-                (0..nc)
-                    .map(|j| {
-                        clause_fire(
-                            &include[j * words..(j + 1) * words],
-                            litv,
-                            valid,
-                            words,
-                            &lit_active,
-                        )
-                    })
-                    .collect()
-            };
+                for (j, out) in clause_outputs.iter_mut().enumerate() {
+                    *out = clause_fire(
+                        &include[j * words..(j + 1) * words],
+                        litv,
+                        valid,
+                        words,
+                        &lit_active,
+                    );
+                }
+            }
 
             // Weighted sum (no clause dropout — matches vanilla AE convention).
             let sum = {
