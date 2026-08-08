@@ -13,8 +13,8 @@
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 /// File magic: identifies a tmu-rs serialised artifact.
 pub(crate) const MAGIC: [u8; 4] = *b"TMRS";

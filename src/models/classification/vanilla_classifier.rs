@@ -3,11 +3,11 @@
 //! Mirrors TMU's `vanilla_classifier.py` / `TMClassifier`.
 
 #[cfg(feature = "parallel")]
-use crate::clause_bank::dense::{use_parallel, DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN};
+use crate::clause_bank::dense::{DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN, use_parallel};
 use crate::clause_bank::dense::{
-    bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, grow_dense_state,
-    rebuild_include, type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for,
-    GOLDEN, MASK_BITS, WORD_BITS,
+    GOLDEN, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of, expand_bits_to_bytes,
+    fire_predict, grow_dense_state, rebuild_include, type_i_update_bytes, type_ii_update_bytes,
+    type_iii_update, words_for,
 };
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
@@ -545,7 +545,14 @@ impl TsetlinMachine {
         let include = self.include.as_slice();
         let valid = self.valid.as_slice();
         (0..cps)
-            .filter(|&j| fire_predict(&include[(class * cps + j) * words..(class * cps + j + 1) * words], lit, valid, words))
+            .filter(|&j| {
+                fire_predict(
+                    &include[(class * cps + j) * words..(class * cps + j + 1) * words],
+                    lit,
+                    valid,
+                    words,
+                )
+            })
             .collect()
     }
 
@@ -698,13 +705,27 @@ impl TsetlinMachine {
                             words, lit_b, &inv_b, &keep_b, active_b, n_literals, boost, wmax,
                             max_inc, half, max_state,
                         );
-                        if drop_mask.is_empty() || !drop_mask[j] {
-                            if type_iii_update(
-                                ta_c, ind_c, cat_c, inc_c, lit, val, lit_active, active_b, words, n_literals,
-                                d_val, p, target_bool, rng, half, max_state,
-                            ) {
-                                rebuild_include(ta_c, inc_c, val, words, n_literals, half);
-                            }
+                        if (drop_mask.is_empty() || !drop_mask[j])
+                            && type_iii_update(
+                                ta_c,
+                                ind_c,
+                                cat_c,
+                                inc_c,
+                                lit,
+                                val,
+                                lit_active,
+                                active_b,
+                                words,
+                                n_literals,
+                                d_val,
+                                p,
+                                target_bool,
+                                rng,
+                                half,
+                                max_state,
+                            )
+                        {
+                            rebuild_include(ta_c, inc_c, val, words, n_literals, half);
                         }
                     });
             } else {
@@ -750,8 +771,9 @@ impl TsetlinMachine {
                 half,
                 max_state,
             );
-            if type_iii_en && (drop_mask.is_empty() || !drop_mask[j]) {
-                if type_iii_update(
+            if type_iii_en
+                && (drop_mask.is_empty() || !drop_mask[j])
+                && type_iii_update(
                     &mut class_ta[j * n_literals..(j + 1) * n_literals],
                     &mut class_ind[j * n_literals..(j + 1) * n_literals],
                     &mut class_cat[j * words..(j + 1) * words],
@@ -768,16 +790,16 @@ impl TsetlinMachine {
                     &mut class_rng[j],
                     half,
                     max_state,
-                ) {
-                    rebuild_include(
-                        &class_ta[j * n_literals..(j + 1) * n_literals],
-                        &mut class_inc[j * words..(j + 1) * words],
-                        val,
-                        words,
-                        n_literals,
-                        half,
-                    );
-                }
+                )
+            {
+                rebuild_include(
+                    &class_ta[j * n_literals..(j + 1) * n_literals],
+                    &mut class_inc[j * words..(j + 1) * words],
+                    val,
+                    words,
+                    n_literals,
+                    half,
+                );
             }
         }
     }
@@ -942,7 +964,9 @@ impl TsetlinMachine {
                         .map(|i| Rng::new(sd ^ (i as u64).wrapping_add(1).wrapping_mul(GOLDEN)))
                         .collect();
                     r.class_rngs = (0..n_cls)
-                        .map(|c| Rng::new(sd ^ (c as u64 + n_clauses as u64 + 1).wrapping_mul(GOLDEN)))
+                        .map(|c| {
+                            Rng::new(sd ^ (c as u64 + n_clauses as u64 + 1).wrapping_mul(GOLDEN))
+                        })
                         .collect();
                     r
                 })
@@ -950,16 +974,19 @@ impl TsetlinMachine {
 
             // Each replica trains sequentially on a contiguous shard of the order.
             let shard_len = n.div_ceil(n_shards);
-            replicas.par_iter_mut().enumerate().for_each(|(s, replica)| {
-                let start = s * shard_len;
-                if start >= n {
-                    return;
-                }
-                let end = (start + shard_len).min(n);
-                for &i in &order[start..end] {
-                    replica.fit_one_lit(&data[i * w..(i + 1) * w], ys[i]);
-                }
-            });
+            replicas
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(s, replica)| {
+                    let start = s * shard_len;
+                    if start >= n {
+                        return;
+                    }
+                    let end = (start + shard_len).min(n);
+                    for &i in &order[start..end] {
+                        replica.fit_one_lit(&data[i * w..(i + 1) * w], ys[i]);
+                    }
+                });
 
             // Merge: average TA counters and weights across replicas, then rebuild
             // the include bitsets so they stay consistent with the merged TA.
@@ -1584,7 +1611,7 @@ mod tests {
         let words = 1usize;
         let half = 8u8; // sb=4 → half=8
         let max_state = 15u8; // (1<<4)-1
-                              // Literal 0 at max state (included); absent from x → violation → Ib path.
+        // Literal 0 at max state (included); absent from x → violation → Ib path.
         let mut ta = vec![max_state];
         let mut inc = vec![1u64]; // bit 0 included
         let lit = vec![0u64]; // absent
@@ -2230,8 +2257,8 @@ mod tests {
 
     #[test]
     fn type_iii_constructs_without_panic() {
-        let _tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42)
-            .type_iii_feedback(200.0);
+        let _tm =
+            TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42).type_iii_feedback(200.0);
     }
 
     #[test]
@@ -2247,8 +2274,8 @@ mod tests {
         let (xtr, ytr) = make_xor(200, 0.0, 7);
         let e = enc(12);
         let btr = e.encode_batch(&as_slices(&xtr));
-        let mut tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42)
-            .type_iii_feedback(200.0);
+        let mut tm =
+            TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42).type_iii_feedback(200.0);
         for _ in 0..5 {
             tm.fit_epoch(&btr, &ytr);
         }
@@ -2261,8 +2288,8 @@ mod tests {
         let e = enc(12);
         let btr = e.encode_batch(&as_slices(&xtr));
         let bte = e.encode_batch(&as_slices(&xte));
-        let mut tm = TsetlinMachine::with_config(2, 12, 20, 10, 3.0, 8, true, 42)
-            .type_iii_feedback(200.0);
+        let mut tm =
+            TsetlinMachine::with_config(2, 12, 20, 10, 3.0, 8, true, 42).type_iii_feedback(200.0);
         for _ in 0..20 {
             tm.fit_epoch(&btr, &ytr);
         }
@@ -2272,8 +2299,8 @@ mod tests {
 
     #[test]
     fn type_iii_ind_and_cat_same_size_as_ta_and_include() {
-        let tm = TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42)
-            .type_iii_feedback(100.0);
+        let tm =
+            TsetlinMachine::with_config(2, 12, 8, 10, 3.0, 8, true, 42).type_iii_feedback(100.0);
         assert_eq!(tm.ind.len(), tm.ta.len());
         assert_eq!(tm.cat.len(), tm.include.len());
     }
@@ -2314,7 +2341,10 @@ mod tests {
         for (i, &p) in batch.iter().enumerate() {
             assert_eq!(p, tm.predict_lit(&bte.data[i * w..(i + 1) * w]));
         }
-        assert!(tm.accuracy(&bte, &yte) > 0.9, "wide/few-clause model failed to learn");
+        assert!(
+            tm.accuracy(&bte, &yte) > 0.9,
+            "wide/few-clause model failed to learn"
+        );
     }
 
     #[test]
@@ -2326,7 +2356,8 @@ mod tests {
         let e = enc(12);
         let btr = e.encode_batch(&as_slices(&xtr));
         let bte = e.encode_batch(&as_slices(&xte));
-        let mut tm = TsetlinMachine::with_config(2, 12, 40, 15, 3.9, 8, true, 7).data_parallel(true);
+        let mut tm =
+            TsetlinMachine::with_config(2, 12, 40, 15, 3.9, 8, true, 7).data_parallel(true);
         for _ in 0..30 {
             tm.fit_epoch(&btr, &ytr);
         }

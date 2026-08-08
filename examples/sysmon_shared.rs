@@ -18,55 +18,137 @@ pub fn hive_of(path: &str) -> String {
 /// Token prefixes that indicate attack-relevant fields (process, file, network, registry).
 /// Used to rank clause rules by security significance.
 pub const MEANINGFUL_PREFIXES: &[&str] = &[
-    "process.name", "process.args", "process.parent",
-    "dll.name", "file.name", "file.path",
-    "target.process", "source.process",
-    "dns.question", "destination.",
-    "network.", "registry.",
+    "process.name",
+    "process.args",
+    "process.parent",
+    "dll.name",
+    "file.name",
+    "file.path",
+    "target.process",
+    "source.process",
+    "dns.question",
+    "destination.",
+    "network.",
+    "registry.",
 ];
 
 /// Maps an ECS token string to a short security annotation for rule display.
 /// Returns an empty string if the token has no specific security note.
 pub fn explain_token(tok: &str) -> &'static str {
-    if tok.starts_with("event.id::1 ")  || tok == "event.id::1"  { return "Sysmon: process creation"; }
-    if tok.starts_with("event.id::3 ")  || tok == "event.id::3"  { return "Sysmon: network connection"; }
-    if tok.starts_with("event.id::7 ")  || tok == "event.id::7"  { return "Sysmon: image/DLL loaded"; }
-    if tok.starts_with("event.id::10")                           { return "Sysmon: process access (injection / cred dump)"; }
-    if tok.starts_with("event.id::11")                           { return "Sysmon: file created"; }
-    if tok.starts_with("event.id::12") || tok.starts_with("event.id::13") || tok.starts_with("event.id::14") {
+    if tok.starts_with("event.id::1 ") || tok == "event.id::1" {
+        return "Sysmon: process creation";
+    }
+    if tok.starts_with("event.id::3 ") || tok == "event.id::3" {
+        return "Sysmon: network connection";
+    }
+    if tok.starts_with("event.id::7 ") || tok == "event.id::7" {
+        return "Sysmon: image/DLL loaded";
+    }
+    if tok.starts_with("event.id::10") {
+        return "Sysmon: process access (injection / cred dump)";
+    }
+    if tok.starts_with("event.id::11") {
+        return "Sysmon: file created";
+    }
+    if tok.starts_with("event.id::12")
+        || tok.starts_with("event.id::13")
+        || tok.starts_with("event.id::14")
+    {
         return "Sysmon: registry create/set/delete";
     }
-    if tok.starts_with("event.id::22")                           { return "Sysmon: DNS query"; }
-    if tok.starts_with("event.id::25")                           { return "Sysmon: process tampering"; }
-    if tok.starts_with("process.name::")                         { return "executing process binary"; }
-    if tok.starts_with("process.args::")                         { return "command-line argument token"; }
-    if tok.starts_with("process.parent.name::") || tok.starts_with("process.parent::") { return "parent process"; }
-    if tok.starts_with("target.process.name::")                  { return "victim process (accessed/injected)"; }
-    if tok.starts_with("source.process.name::")                  { return "accessor/injecting process"; }
-    if tok.starts_with("target.process.granted_access::")        { return "access rights requested (PROCESS_VM_READ etc.)"; }
-    if tok.starts_with("file.path::Temp") || tok.contains("::Temp") { return "staging in temp directory (common dropper)"; }
-    if tok.starts_with("file.path::System32")                    { return "system directory (legit or DLL hijack)"; }
-    if tok.starts_with("file.path::AppData")                     { return "user profile staging area"; }
-    if tok.starts_with("file.path::")                            { return "file location"; }
-    if tok.starts_with("file.name::")                            { return "file name"; }
-    if tok.starts_with("dll.name::")                             { return "DLL loaded"; }
-    if tok.starts_with("network.destination") || tok.starts_with("destination.") { return "outbound C2 / lateral target"; }
-    if tok.starts_with("dns.question::")                         { return "DNS lookup (C2 beacon / lateral)"; }
-    if tok.starts_with("registry.")                              { return "registry operation"; }
-    if tok.contains("::lsass")                                   { return "LSASS — credential store (high value target)"; }
-    if tok.contains("::mimikatz") || tok.contains("::mimi")      { return "Mimikatz credential dumper"; }
-    if tok.contains("::powershell") || tok.contains("::psh")     { return "PowerShell execution"; }
-    if tok.contains("::cmd.exe")                                 { return "Command prompt execution"; }
-    if tok.contains("::rundll32")                                { return "LOLBin: runs arbitrary DLLs"; }
-    if tok.contains("::regsvr32")                                { return "LOLBin: runs COM/SCT payloads"; }
-    if tok.contains("::mshta")                                   { return "LOLBin: runs HTML/VBS/JS"; }
-    if tok.contains("::wmic")                                    { return "WMI execution / lateral movement"; }
-    if tok.contains("::schtasks") || tok.contains("::at.exe")    { return "scheduled task (persistence)"; }
-    if tok.contains("::net.exe") || tok.contains("::net1.exe")   { return "domain/user enumeration"; }
-    if tok.contains("Signature::Microsoft Windows")              { return "Microsoft-signed binary (very common — not specific)"; }
-    if tok.contains("code_signature.status::Valid")              { return "valid code signature (most legit processes)"; }
-    if tok.contains("UserID::S-1-5-18")                         { return "SYSTEM account"; }
-    if tok.contains("UserID::S-1-5-19") || tok.contains("UserID::S-1-5-20") { return "LOCAL/NETWORK SERVICE account"; }
+    if tok.starts_with("event.id::22") {
+        return "Sysmon: DNS query";
+    }
+    if tok.starts_with("event.id::25") {
+        return "Sysmon: process tampering";
+    }
+    if tok.starts_with("process.name::") {
+        return "executing process binary";
+    }
+    if tok.starts_with("process.args::") {
+        return "command-line argument token";
+    }
+    if tok.starts_with("process.parent.name::") || tok.starts_with("process.parent::") {
+        return "parent process";
+    }
+    if tok.starts_with("target.process.name::") {
+        return "victim process (accessed/injected)";
+    }
+    if tok.starts_with("source.process.name::") {
+        return "accessor/injecting process";
+    }
+    if tok.starts_with("target.process.granted_access::") {
+        return "access rights requested (PROCESS_VM_READ etc.)";
+    }
+    if tok.starts_with("file.path::Temp") || tok.contains("::Temp") {
+        return "staging in temp directory (common dropper)";
+    }
+    if tok.starts_with("file.path::System32") {
+        return "system directory (legit or DLL hijack)";
+    }
+    if tok.starts_with("file.path::AppData") {
+        return "user profile staging area";
+    }
+    if tok.starts_with("file.path::") {
+        return "file location";
+    }
+    if tok.starts_with("file.name::") {
+        return "file name";
+    }
+    if tok.starts_with("dll.name::") {
+        return "DLL loaded";
+    }
+    if tok.starts_with("network.destination") || tok.starts_with("destination.") {
+        return "outbound C2 / lateral target";
+    }
+    if tok.starts_with("dns.question::") {
+        return "DNS lookup (C2 beacon / lateral)";
+    }
+    if tok.starts_with("registry.") {
+        return "registry operation";
+    }
+    if tok.contains("::lsass") {
+        return "LSASS — credential store (high value target)";
+    }
+    if tok.contains("::mimikatz") || tok.contains("::mimi") {
+        return "Mimikatz credential dumper";
+    }
+    if tok.contains("::powershell") || tok.contains("::psh") {
+        return "PowerShell execution";
+    }
+    if tok.contains("::cmd.exe") {
+        return "Command prompt execution";
+    }
+    if tok.contains("::rundll32") {
+        return "LOLBin: runs arbitrary DLLs";
+    }
+    if tok.contains("::regsvr32") {
+        return "LOLBin: runs COM/SCT payloads";
+    }
+    if tok.contains("::mshta") {
+        return "LOLBin: runs HTML/VBS/JS";
+    }
+    if tok.contains("::wmic") {
+        return "WMI execution / lateral movement";
+    }
+    if tok.contains("::schtasks") || tok.contains("::at.exe") {
+        return "scheduled task (persistence)";
+    }
+    if tok.contains("::net.exe") || tok.contains("::net1.exe") {
+        return "domain/user enumeration";
+    }
+    if tok.contains("Signature::Microsoft Windows") {
+        return "Microsoft-signed binary (very common — not specific)";
+    }
+    if tok.contains("code_signature.status::Valid") {
+        return "valid code signature (most legit processes)";
+    }
+    if tok.contains("UserID::S-1-5-18") {
+        return "SYSTEM account";
+    }
+    if tok.contains("UserID::S-1-5-19") || tok.contains("UserID::S-1-5-20") {
+        return "LOCAL/NETWORK SERVICE account";
+    }
     ""
 }
 
@@ -85,77 +167,195 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
     match eid {
         // ── EID 1 — ProcessCreate ────────────────────────────────────────────────
         1 => {
-            let image   = basename(v["Image"].as_str().unwrap_or("")).to_lowercase();
-            let parent  = basename(v["ParentImage"].as_str().unwrap_or("")).to_lowercase();
+            let image = basename(v["Image"].as_str().unwrap_or("")).to_lowercase();
+            let parent = basename(v["ParentImage"].as_str().unwrap_or("")).to_lowercase();
             let cmdline = v["CommandLine"].as_str().unwrap_or("").to_lowercase();
             let img_path = v["Image"].as_str().unwrap_or("").to_lowercase();
 
             // Known offensive tools — never legitimately present.
-            let attack_tool = matches!(image.as_str(),
-                "mimikatz.exe" | "rubeus.exe" | "sharpdpapi.exe" | "sharpdump.exe"
-                | "procdump.exe" | "procdump64.exe" | "wce.exe" | "fgdump.exe"
-                | "psexec.exe" | "psexec64.exe" | "psexesvc.exe" | "paexec.exe"
-                | "sharpview.exe" | "seatbelt.exe" | "bloodhound.exe" | "sharphound.exe"
-                | "ncat.exe" | "nc.exe" | "covenantgruntstager.exe"
-                | "lazagne.exe" | "pwdump.exe" | "pwdump6.exe" | "pwdump7.exe"
-                | "gsecdump.exe" | "cachedump.exe" | "winhex.exe"
-                | "adfind.exe" | "adrecon.exe" | "ldapdomaindump.exe"
-                | "kerbrute.exe" | "kekeo.exe" | "safetykatz.exe" | "sharpkatz.exe"
-                | "nanodump.exe" | "dumpert.exe" | "handlekatz.exe"
-                | "crackmapexec.exe" | "impacket-secretsdump.exe"
-                | "invoke-mimikatz.exe" | "invoke-ninjacopy.exe"
-                | "sharpchisel.exe" | "chisel.exe" | "ligolo.exe" | "rpivot.exe"
-                | "cobaltstrike.exe" | "beacon.exe" | "brute_ratel.exe" | "nighthawk.exe"
-                | "accesschk.exe" | "accesschk64.exe"
+            let attack_tool = matches!(
+                image.as_str(),
+                "mimikatz.exe"
+                    | "rubeus.exe"
+                    | "sharpdpapi.exe"
+                    | "sharpdump.exe"
+                    | "procdump.exe"
+                    | "procdump64.exe"
+                    | "wce.exe"
+                    | "fgdump.exe"
+                    | "psexec.exe"
+                    | "psexec64.exe"
+                    | "psexesvc.exe"
+                    | "paexec.exe"
+                    | "sharpview.exe"
+                    | "seatbelt.exe"
+                    | "bloodhound.exe"
+                    | "sharphound.exe"
+                    | "ncat.exe"
+                    | "nc.exe"
+                    | "covenantgruntstager.exe"
+                    | "lazagne.exe"
+                    | "pwdump.exe"
+                    | "pwdump6.exe"
+                    | "pwdump7.exe"
+                    | "gsecdump.exe"
+                    | "cachedump.exe"
+                    | "winhex.exe"
+                    | "adfind.exe"
+                    | "adrecon.exe"
+                    | "ldapdomaindump.exe"
+                    | "kerbrute.exe"
+                    | "kekeo.exe"
+                    | "safetykatz.exe"
+                    | "sharpkatz.exe"
+                    | "nanodump.exe"
+                    | "dumpert.exe"
+                    | "handlekatz.exe"
+                    | "crackmapexec.exe"
+                    | "impacket-secretsdump.exe"
+                    | "invoke-mimikatz.exe"
+                    | "invoke-ninjacopy.exe"
+                    | "sharpchisel.exe"
+                    | "chisel.exe"
+                    | "ligolo.exe"
+                    | "rpivot.exe"
+                    | "cobaltstrike.exe"
+                    | "beacon.exe"
+                    | "brute_ratel.exe"
+                    | "nighthawk.exe"
+                    | "accesschk.exe"
+                    | "accesschk64.exe"
             );
 
             // Office macro → scripting host (T1566 phishing / T1059).
-            let office_to_script = matches!(parent.as_str(),
-                "winword.exe" | "excel.exe" | "powerpnt.exe" | "outlook.exe"
-                | "onenote.exe" | "msaccess.exe" | "mspub.exe" | "visio.exe"
-                | "eqnedt32.exe"
-            ) && matches!(image.as_str(),
-                "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe"
-                | "mshta.exe" | "regsvr32.exe" | "rundll32.exe" | "certutil.exe"
-                | "bitsadmin.exe" | "curl.exe" | "wget.exe" | "msiexec.exe"
-                | "installutil.exe" | "msbuild.exe"
+            let office_to_script = matches!(
+                parent.as_str(),
+                "winword.exe"
+                    | "excel.exe"
+                    | "powerpnt.exe"
+                    | "outlook.exe"
+                    | "onenote.exe"
+                    | "msaccess.exe"
+                    | "mspub.exe"
+                    | "visio.exe"
+                    | "eqnedt32.exe"
+            ) && matches!(
+                image.as_str(),
+                "powershell.exe"
+                    | "cmd.exe"
+                    | "wscript.exe"
+                    | "cscript.exe"
+                    | "mshta.exe"
+                    | "regsvr32.exe"
+                    | "rundll32.exe"
+                    | "certutil.exe"
+                    | "bitsadmin.exe"
+                    | "curl.exe"
+                    | "wget.exe"
+                    | "msiexec.exe"
+                    | "installutil.exe"
+                    | "msbuild.exe"
             );
 
             // LOLBin parent → scripting child (living-off-the-land chains).
-            let lolbin_to_script = matches!(parent.as_str(),
-                "msbuild.exe" | "installutil.exe" | "regasm.exe" | "regsvcs.exe"
-                | "ieexec.exe" | "cmstp.exe" | "odbcconf.exe" | "xwizard.exe"
-                | "dnscmd.exe" | "esentutl.exe" | "certutil.exe" | "bitsadmin.exe"
-                | "msiexec.exe" | "regsvr32.exe" | "mshta.exe" | "wmic.exe"
-                | "hh.exe" | "pcalua.exe" | "syncappvpublishingserver.exe"
-                | "appsyncpublishingserver.exe" | "presentationhost.exe"
-                | "diskshadow.exe" | "msconfig.exe" | "wab.exe" | "extrac32.exe"
-            ) && matches!(image.as_str(),
-                "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe"
-                | "mshta.exe" | "regsvr32.exe" | "rundll32.exe"
+            let lolbin_to_script = matches!(
+                parent.as_str(),
+                "msbuild.exe"
+                    | "installutil.exe"
+                    | "regasm.exe"
+                    | "regsvcs.exe"
+                    | "ieexec.exe"
+                    | "cmstp.exe"
+                    | "odbcconf.exe"
+                    | "xwizard.exe"
+                    | "dnscmd.exe"
+                    | "esentutl.exe"
+                    | "certutil.exe"
+                    | "bitsadmin.exe"
+                    | "msiexec.exe"
+                    | "regsvr32.exe"
+                    | "mshta.exe"
+                    | "wmic.exe"
+                    | "hh.exe"
+                    | "pcalua.exe"
+                    | "syncappvpublishingserver.exe"
+                    | "appsyncpublishingserver.exe"
+                    | "presentationhost.exe"
+                    | "diskshadow.exe"
+                    | "msconfig.exe"
+                    | "wab.exe"
+                    | "extrac32.exe"
+            ) && matches!(
+                image.as_str(),
+                "powershell.exe"
+                    | "cmd.exe"
+                    | "wscript.exe"
+                    | "cscript.exe"
+                    | "mshta.exe"
+                    | "regsvr32.exe"
+                    | "rundll32.exe"
             );
 
             // Scripting host → recon/discovery (T1087/T1069/T1016/T1057/T1083).
-            let script_to_recon = matches!(parent.as_str(),
+            let script_to_recon = matches!(
+                parent.as_str(),
                 "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe" | "mshta.exe"
-            ) && matches!(image.as_str(),
-                "whoami.exe" | "net.exe" | "net1.exe" | "nltest.exe" | "ipconfig.exe"
-                | "systeminfo.exe" | "tasklist.exe" | "arp.exe" | "nslookup.exe"
-                | "ping.exe" | "netstat.exe" | "query.exe" | "dsquery.exe" | "dsget.exe"
-                | "gpresult.exe" | "reg.exe" | "sc.exe" | "wmic.exe" | "schtasks.exe"
-                | "at.exe" | "attrib.exe" | "dir.exe" | "tree.exe"
-                | "nbtscan.exe" | "nmap.exe" | "masscan.exe" | "fsutil.exe"
-                | "auditpol.exe" | "bcdedit.exe" | "dnscmd.exe"
-                | "wevtutil.exe" | "vssadmin.exe" | "diskshadow.exe"
+            ) && matches!(
+                image.as_str(),
+                "whoami.exe"
+                    | "net.exe"
+                    | "net1.exe"
+                    | "nltest.exe"
+                    | "ipconfig.exe"
+                    | "systeminfo.exe"
+                    | "tasklist.exe"
+                    | "arp.exe"
+                    | "nslookup.exe"
+                    | "ping.exe"
+                    | "netstat.exe"
+                    | "query.exe"
+                    | "dsquery.exe"
+                    | "dsget.exe"
+                    | "gpresult.exe"
+                    | "reg.exe"
+                    | "sc.exe"
+                    | "wmic.exe"
+                    | "schtasks.exe"
+                    | "at.exe"
+                    | "attrib.exe"
+                    | "dir.exe"
+                    | "tree.exe"
+                    | "nbtscan.exe"
+                    | "nmap.exe"
+                    | "masscan.exe"
+                    | "fsutil.exe"
+                    | "auditpol.exe"
+                    | "bcdedit.exe"
+                    | "dnscmd.exe"
+                    | "wevtutil.exe"
+                    | "vssadmin.exe"
+                    | "diskshadow.exe"
             );
 
             // System process → shell (injection artifact / process hollowing).
-            let system_spawns_shell = matches!(parent.as_str(),
-                "lsass.exe" | "spoolsv.exe" | "winlogon.exe" | "dllhost.exe"
-                | "taskhost.exe" | "taskhostw.exe" | "userinit.exe"
-            ) && matches!(image.as_str(),
-                "cmd.exe" | "powershell.exe" | "wscript.exe" | "cscript.exe"
-                | "mshta.exe" | "rundll32.exe" | "regsvr32.exe"
+            let system_spawns_shell = matches!(
+                parent.as_str(),
+                "lsass.exe"
+                    | "spoolsv.exe"
+                    | "winlogon.exe"
+                    | "dllhost.exe"
+                    | "taskhost.exe"
+                    | "taskhostw.exe"
+                    | "userinit.exe"
+            ) && matches!(
+                image.as_str(),
+                "cmd.exe"
+                    | "powershell.exe"
+                    | "wscript.exe"
+                    | "cscript.exe"
+                    | "mshta.exe"
+                    | "rundll32.exe"
+                    | "regsvr32.exe"
             );
 
             // Encoded / obfuscated PowerShell (T1059.001 / T1027).
@@ -202,10 +402,17 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
 
             // T1548.002 UAC bypass binaries — auto-elevate without prompt.
             // These are abused to spawn a high-integrity shell without a UAC dialog.
-            let uac_bypass = matches!(image.as_str(),
-                "fodhelper.exe" | "eventvwr.exe" | "sdclt.exe" | "wsreset.exe"
-                | "computerdefaults.exe" | "slui.exe" | "cmstp.exe" | "dccw.exe"
-                | "mavinject.exe"  // T1218.013 — injects DLL into running process
+            let uac_bypass = matches!(
+                image.as_str(),
+                "fodhelper.exe"
+                    | "eventvwr.exe"
+                    | "sdclt.exe"
+                    | "wsreset.exe"
+                    | "computerdefaults.exe"
+                    | "slui.exe"
+                    | "cmstp.exe"
+                    | "dccw.exe"
+                    | "mavinject.exe" // T1218.013 — injects DLL into running process
             );
 
             // T1562.001 Impair Defenses — disable AV/EDR via service or cmdline.
@@ -237,28 +444,30 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                         || cmdline.contains("/clear"))));
 
             // T1070.001 Clear Windows Event Logs — remove forensic evidence.
-            let clear_logs =
-                (image == "wevtutil.exe" && (
-                    cmdline.contains(" cl ") || cmdline.contains(" clear-log ")
-                    || cmdline.contains(" sl ") || cmdline.contains("/ms:0")))
+            let clear_logs = (image == "wevtutil.exe"
+                && (cmdline.contains(" cl ")
+                    || cmdline.contains(" clear-log ")
+                    || cmdline.contains(" sl ")
+                    || cmdline.contains("/ms:0")))
                 || (image == "powershell.exe" && cmdline.contains("clear-eventlog"))
                 || (image == "powershell.exe" && cmdline.contains("remove-eventlog"))
                 || (image == "cmd.exe" && cmdline.contains("wevtutil") && cmdline.contains("cl "));
 
             // T1490 Inhibit System Recovery — delete backups/shadow copies pre-ransomware.
-            let inhibit_recovery =
-                (image == "vssadmin.exe" && (
-                    cmdline.contains("delete") || cmdline.contains("shadows")))
-                || (image == "bcdedit.exe" && (
-                    cmdline.contains("recoveryenabled") || cmdline.contains("no")
-                    || cmdline.contains("bootstatuspolicy")
-                    || cmdline.contains("ignoreallfailures")))
-                || (image == "wbadmin.exe" && (
-                    cmdline.contains("delete") || cmdline.contains("catalog")
-                    || cmdline.contains("systemstatebackup")))
-                || (image == "powershell.exe" && (
-                    cmdline.contains("get-wmiobject win32_shadowcopy")
-                    || cmdline.contains(".delete()")));
+            let inhibit_recovery = (image == "vssadmin.exe"
+                && (cmdline.contains("delete") || cmdline.contains("shadows")))
+                || (image == "bcdedit.exe"
+                    && (cmdline.contains("recoveryenabled")
+                        || cmdline.contains("no")
+                        || cmdline.contains("bootstatuspolicy")
+                        || cmdline.contains("ignoreallfailures")))
+                || (image == "wbadmin.exe"
+                    && (cmdline.contains("delete")
+                        || cmdline.contains("catalog")
+                        || cmdline.contains("systemstatebackup")))
+                || (image == "powershell.exe"
+                    && (cmdline.contains("get-wmiobject win32_shadowcopy")
+                        || cmdline.contains(".delete()")));
 
             // T1136.001 Create Local Account — add a backdoor user.
             let create_account = (image == "net.exe" || image == "net1.exe")
@@ -268,56 +477,86 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
             // T1543.003 Create/Modify Windows Service with a suspicious binary path.
             let malicious_service = image == "sc.exe"
                 && cmdline.contains("create")
-                && (cmdline.contains("\\temp\\") || cmdline.contains("\\appdata\\")
-                    || cmdline.contains("\\public\\") || cmdline.contains("\\programdata\\")
-                    || cmdline.contains("\\users\\") || cmdline.contains("cmd.exe")
-                    || cmdline.contains("powershell") || cmdline.contains("rundll32"));
+                && (cmdline.contains("\\temp\\")
+                    || cmdline.contains("\\appdata\\")
+                    || cmdline.contains("\\public\\")
+                    || cmdline.contains("\\programdata\\")
+                    || cmdline.contains("\\users\\")
+                    || cmdline.contains("cmd.exe")
+                    || cmdline.contains("powershell")
+                    || cmdline.contains("rundll32"));
 
             // T1053.005 Scheduled Task with attack payload in /tr argument.
             let schtask_attack = image == "schtasks.exe"
                 && cmdline.contains("/create")
-                && (cmdline.contains("powershell") || cmdline.contains("cmd.exe")
-                    || cmdline.contains("wscript")  || cmdline.contains("cscript")
-                    || cmdline.contains("mshta")    || cmdline.contains("regsvr32")
-                    || cmdline.contains("rundll32") || cmdline.contains("\\temp\\")
-                    || cmdline.contains("\\appdata\\") || cmdline.contains("encodedcommand")
+                && (cmdline.contains("powershell")
+                    || cmdline.contains("cmd.exe")
+                    || cmdline.contains("wscript")
+                    || cmdline.contains("cscript")
+                    || cmdline.contains("mshta")
+                    || cmdline.contains("regsvr32")
+                    || cmdline.contains("rundll32")
+                    || cmdline.contains("\\temp\\")
+                    || cmdline.contains("\\appdata\\")
+                    || cmdline.contains("encodedcommand")
                     || cmdline.contains("http"));
 
             // T1021.006 WinRM lateral movement — wsmprovhost spawns arbitrary commands.
             let winrm_exec = parent == "wsmprovhost.exe"
-                && matches!(image.as_str(),
-                    "cmd.exe" | "powershell.exe" | "net.exe" | "whoami.exe"
-                    | "ipconfig.exe" | "systeminfo.exe" | "tasklist.exe");
+                && matches!(
+                    image.as_str(),
+                    "cmd.exe"
+                        | "powershell.exe"
+                        | "net.exe"
+                        | "whoami.exe"
+                        | "ipconfig.exe"
+                        | "systeminfo.exe"
+                        | "tasklist.exe"
+                );
 
             // T1059.004 Unix shell via WSL / bash (T1202 Indirect Command Execution).
             let wsl_exec = matches!(image.as_str(), "wsl.exe" | "bash.exe")
                 && !cmdline.is_empty()
-                && (cmdline.contains("-c ") || cmdline.contains("curl")
-                    || cmdline.contains("wget") || cmdline.contains("python")
-                    || cmdline.contains("nc ") || cmdline.contains("ncat"));
+                && (cmdline.contains("-c ")
+                    || cmdline.contains("curl")
+                    || cmdline.contains("wget")
+                    || cmdline.contains("python")
+                    || cmdline.contains("nc ")
+                    || cmdline.contains("ncat"));
 
             // T1003.002/T1003.003 reg.exe dumping credential hive files.
             let reg_dump = image == "reg.exe"
                 && cmdline.contains("save")
-                && (cmdline.contains("sam") || cmdline.contains("system")
-                    || cmdline.contains("security") || cmdline.contains("ntds"));
+                && (cmdline.contains("sam")
+                    || cmdline.contains("system")
+                    || cmdline.contains("security")
+                    || cmdline.contains("ntds"));
 
             // T1047 WMI execution — wmic process call create or remote /node:, or wmiprvse spawning children.
             // wmiprvse.exe = WMI Provider Host; anything it spawns is a WMI-executed payload.
             // CAR-2016-03-002: log_source=process/create, mutable=command_line, wmic /node: <host>
-            let wmi_exec =
-                (image == "wmic.exe"
-                    && (cmdline.contains("/node:")                        // remote WMI (T1021/T1047 lateral)
+            let wmi_exec = (image == "wmic.exe"
+                && (cmdline.contains("/node:")                        // remote WMI (T1021/T1047 lateral)
                         || (cmdline.contains("process") && cmdline.contains("call"))))
                 || (parent == "wmiprvse.exe"
-                    && !matches!(image.as_str(), "conhost.exe" | "wbemcons.exe" | "wbemcore.exe"));
+                    && !matches!(
+                        image.as_str(),
+                        "conhost.exe" | "wbemcons.exe" | "wbemcore.exe"
+                    ));
 
             // T1021.003 DCOM lateral movement — mmc.exe or dllhost.exe spawning shells.
             // These COM server processes should never spawn interactive child processes.
             let dcom_exec = matches!(parent.as_str(), "mmc.exe" | "dllhost.exe")
-                && matches!(image.as_str(),
-                    "cmd.exe" | "powershell.exe" | "wscript.exe" | "cscript.exe"
-                    | "mshta.exe" | "rundll32.exe" | "regsvr32.exe");
+                && matches!(
+                    image.as_str(),
+                    "cmd.exe"
+                        | "powershell.exe"
+                        | "wscript.exe"
+                        | "cscript.exe"
+                        | "mshta.exe"
+                        | "rundll32.exe"
+                        | "regsvr32.exe"
+                );
 
             // T1218.011 Signed binary proxy: rundll32 with unusual / non-standard targets.
             let rundll32_abuse = image == "rundll32.exe"
@@ -333,18 +572,36 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
 
             // T1569.002 Service execution — services.exe spawning non-service processes.
             let service_spawn = parent == "services.exe"
-                && !matches!(image.as_str(),
-                    "svchost.exe" | "spoolsv.exe" | "lsass.exe" | "lsm.exe" | "csrss.exe"
-                    | "wininit.exe" | "taskhost.exe" | "taskhostw.exe" | "msdtc.exe"
-                    | "vds.exe" | "wbengine.exe" | "dfsr.exe" | "dfsrs.exe" | "dns.exe"
-                    | "ismserv.exe" | "ntfrs.exe" | "netlogon.exe");
+                && !matches!(
+                    image.as_str(),
+                    "svchost.exe"
+                        | "spoolsv.exe"
+                        | "lsass.exe"
+                        | "lsm.exe"
+                        | "csrss.exe"
+                        | "wininit.exe"
+                        | "taskhost.exe"
+                        | "taskhostw.exe"
+                        | "msdtc.exe"
+                        | "vds.exe"
+                        | "wbengine.exe"
+                        | "dfsr.exe"
+                        | "dfsrs.exe"
+                        | "dns.exe"
+                        | "ismserv.exe"
+                        | "ntfrs.exe"
+                        | "netlogon.exe"
+                );
 
             // T1543.003 Modify existing service binary path (sc config binPath=).
             let modify_service = image == "sc.exe"
                 && cmdline.contains("config")
-                && (cmdline.contains("powershell") || cmdline.contains("cmd.exe")
-                    || cmdline.contains("\\temp\\") || cmdline.contains("\\appdata\\")
-                    || cmdline.contains("rundll32") || cmdline.contains("mshta"));
+                && (cmdline.contains("powershell")
+                    || cmdline.contains("cmd.exe")
+                    || cmdline.contains("\\temp\\")
+                    || cmdline.contains("\\appdata\\")
+                    || cmdline.contains("rundll32")
+                    || cmdline.contains("mshta"));
 
             // T1021.002 Net use for lateral movement / SMB share access.
             let net_lateral = (image == "net.exe" || image == "net1.exe")
@@ -352,12 +609,12 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
 
             // T1134 Token impersonation — runas abuse or PowerShell token manipulation.
             let token_abuse = image == "runas.exe"
-                || (image == "powershell.exe" && (
-                    cmdline.contains("seimpersonateprivilege")
-                    || cmdline.contains("[system.security.principal]")
-                    || cmdline.contains("windowsidentity::impersonate")
-                    || cmdline.contains("impersonateloggedonuser")
-                    || cmdline.contains("duplicatetoken")));
+                || (image == "powershell.exe"
+                    && (cmdline.contains("seimpersonateprivilege")
+                        || cmdline.contains("[system.security.principal]")
+                        || cmdline.contains("windowsidentity::impersonate")
+                        || cmdline.contains("impersonateloggedonuser")
+                        || cmdline.contains("duplicatetoken")));
 
             // T1550 Pass-the-Hash / DCSync / Overpass-the-Hash via Mimikatz syntax.
             let pth_attack = cmdline.contains("sekurlsa::pth")
@@ -371,14 +628,24 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
 
             // T1059.005/006 Visual Basic / Macro execution chains via mshta or wscript.
             let vbs_exec = matches!(parent.as_str(), "mshta.exe" | "wscript.exe" | "cscript.exe")
-                && matches!(image.as_str(),
-                    "cmd.exe" | "powershell.exe" | "net.exe" | "whoami.exe"
-                    | "ipconfig.exe" | "systeminfo.exe" | "reg.exe" | "wmic.exe");
+                && matches!(
+                    image.as_str(),
+                    "cmd.exe"
+                        | "powershell.exe"
+                        | "net.exe"
+                        | "whoami.exe"
+                        | "ipconfig.exe"
+                        | "systeminfo.exe"
+                        | "reg.exe"
+                        | "wmic.exe"
+                );
 
             // T1218.005 Mshta with URL or inline script (not just a local file).
             let mshta_abuse = image == "mshta.exe"
-                && (cmdline.contains("http") || cmdline.contains("javascript:")
-                    || cmdline.contains("vbscript:") || cmdline.contains("about:"));
+                && (cmdline.contains("http")
+                    || cmdline.contains("javascript:")
+                    || cmdline.contains("vbscript:")
+                    || cmdline.contains("about:"));
 
             // CAR-2020-09-003: fltmc.exe unloading a minifilter driver disables AV/EDR (T1562.006).
             // log_source=process/create, mutable=command_line (exe="fltmc.exe", cmd contains "unload")
@@ -392,24 +659,39 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
             // CAR-2020-11-004: Process parent-chain mismatch — indicates hollowing / injection (T1055.012).
             // log_source=process/create, mutable=parent_exe (deviation from expected Windows lineage)
             // Guard: skip events with missing/empty parent (early-boot processes have no recorded parent).
-            let hollow_parent = !parent.is_empty() && (
-                (image == "smss.exe"     && !matches!(parent.as_str(), "smss.exe" | "system"))
-                || (image == "csrss.exe" && !matches!(parent.as_str(), "smss.exe" | "svchost.exe"))
-                || (image == "wininit.exe" && parent != "smss.exe")
-                || (image == "winlogon.exe" && parent != "smss.exe")
-                || (image == "lsass.exe" && !matches!(parent.as_str(), "wininit.exe" | "winlogon.exe"))
-                || (image == "services.exe" && parent != "wininit.exe")
-                || (image == "spoolsv.exe" && parent != "services.exe")
-                || (image == "userinit.exe"
-                    && !matches!(parent.as_str(), "dwm.exe" | "winlogon.exe" | "explorer.exe")));
+            let hollow_parent = !parent.is_empty()
+                && ((image == "smss.exe" && !matches!(parent.as_str(), "smss.exe" | "system"))
+                    || (image == "csrss.exe"
+                        && !matches!(parent.as_str(), "smss.exe" | "svchost.exe"))
+                    || (image == "wininit.exe" && parent != "smss.exe")
+                    || (image == "winlogon.exe" && parent != "smss.exe")
+                    || (image == "lsass.exe"
+                        && !matches!(parent.as_str(), "wininit.exe" | "winlogon.exe"))
+                    || (image == "services.exe" && parent != "wininit.exe")
+                    || (image == "spoolsv.exe" && parent != "services.exe")
+                    || (image == "userinit.exe"
+                        && !matches!(
+                            parent.as_str(),
+                            "dwm.exe" | "winlogon.exe" | "explorer.exe"
+                        )));
 
             // CAR-2021-04-001: Common Windows process running from non-standard path (T1036.005).
             // log_source=process/create, mutable=image_path (masquerading via wrong directory)
             // Guard: only check when we have a full path (contains '\'); bare basenames match nothing.
             let masquerade = img_path.contains('\\')
-                && matches!(image.as_str(),
-                    "svchost.exe" | "smss.exe" | "csrss.exe" | "wininit.exe" | "winlogon.exe"
-                    | "lsass.exe" | "services.exe" | "spoolsv.exe" | "taskhost.exe" | "explorer.exe")
+                && matches!(
+                    image.as_str(),
+                    "svchost.exe"
+                        | "smss.exe"
+                        | "csrss.exe"
+                        | "wininit.exe"
+                        | "winlogon.exe"
+                        | "lsass.exe"
+                        | "services.exe"
+                        | "spoolsv.exe"
+                        | "taskhost.exe"
+                        | "explorer.exe"
+                )
                 && !img_path.contains("\\windows\\system32\\")
                 && !img_path.contains("\\windows\\syswow64\\");
 
@@ -425,7 +707,8 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
             // T1218.007 Msiexec loading remote MSI (LOLBin staging / supply-chain execution).
             // log_source=process/create, mutable=command_line (http or UNC remote path — not /quiet alone)
             let msiexec_remote = image == "msiexec.exe"
-                && (cmdline.contains("http://") || cmdline.contains("https://")
+                && (cmdline.contains("http://")
+                    || cmdline.contains("https://")
                     || (cmdline.contains("/i") && cmdline.contains("\\\\")));
 
             // T1134 /savecred stores credentials for later reuse (runas /savecred).
@@ -434,24 +717,48 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
 
             // CAR-2014-11-003: Accessibility app as debugger — sticky keys backdoor (T1546.008).
             // sethc/utilman/osk/etc. spawning any child = IFEO debugger hijack.
-            let accessibility_backdoor = matches!(parent.as_str(),
-                "sethc.exe" | "utilman.exe" | "osk.exe" | "narrator.exe"
-                | "magnify.exe" | "displayswitch.exe" | "atbroker.exe");
+            let accessibility_backdoor = matches!(
+                parent.as_str(),
+                "sethc.exe"
+                    | "utilman.exe"
+                    | "osk.exe"
+                    | "narrator.exe"
+                    | "magnify.exe"
+                    | "displayswitch.exe"
+                    | "atbroker.exe"
+            );
 
             // CAR-2021-02-001: Web server spawning shells = webshell execution (T1505.003).
-            let webshell_exec = matches!(parent.as_str(),
-                "w3wp.exe" | "httpd.exe" | "nginx.exe" | "apache.exe"
-                | "apache2.exe" | "tomcat.exe" | "php-cgi.exe")
-                && matches!(image.as_str(),
-                    "cmd.exe" | "powershell.exe" | "net.exe" | "whoami.exe"
-                    | "hostname.exe" | "systeminfo.exe" | "ipconfig.exe" | "wscript.exe");
+            let webshell_exec = matches!(
+                parent.as_str(),
+                "w3wp.exe"
+                    | "httpd.exe"
+                    | "nginx.exe"
+                    | "apache.exe"
+                    | "apache2.exe"
+                    | "tomcat.exe"
+                    | "php-cgi.exe"
+            ) && matches!(
+                image.as_str(),
+                "cmd.exe"
+                    | "powershell.exe"
+                    | "net.exe"
+                    | "whoami.exe"
+                    | "hostname.exe"
+                    | "systeminfo.exe"
+                    | "ipconfig.exe"
+                    | "wscript.exe"
+            );
 
             // CAR-2021-05-004 / CAR-2021-05-005: BITS job creation/download (T1197 / T1105).
             // log_source=process/create, mutable=command_line (bitsadmin /create /addfile /transfer)
             let bits_abuse = image == "bitsadmin.exe"
-                && (cmdline.contains("/create") || cmdline.contains("/addfile")
-                    || cmdline.contains("/transfer") || cmdline.contains("/setnotifycmdline")
-                    || cmdline.contains("/resume") || cmdline.contains("/setnotifyflags"));
+                && (cmdline.contains("/create")
+                    || cmdline.contains("/addfile")
+                    || cmdline.contains("/transfer")
+                    || cmdline.contains("/setnotifycmdline")
+                    || cmdline.contains("/resume")
+                    || cmdline.contains("/setnotifyflags"));
 
             // CAR-2013-05-002: Execution from unusual / hidden Windows paths (T1036).
             let suspicious_location = img_path.contains("\\recycler\\")
@@ -469,9 +776,10 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
 
             // CAR-2020-11-002: Network sniffer / packet capture tools (T1040).
             // log_source=process/create, mutable=exe (tshark, windump, tcpdump)
-            let sniffer_exec = matches!(image.as_str(),
-                "tshark.exe" | "windump.exe" | "tcpdump.exe" | "wprui.exe" | "wpr.exe")
-                || (image == "netsh.exe" && cmdline.contains("trace"));
+            let sniffer_exec = matches!(
+                image.as_str(),
+                "tshark.exe" | "windump.exe" | "tcpdump.exe" | "wprui.exe" | "wpr.exe"
+            ) || (image == "netsh.exe" && cmdline.contains("trace"));
 
             // CAR-2020-11-009: hh.exe compiled HTML help — LOLBin for executing scripts (T1218.001).
             let hh_abuse = image == "hh.exe";
@@ -483,7 +791,8 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                 || cmdline.contains("get-cachedgpppassword")
                 || cmdline.contains("get-registryautologon")
                 || cmdline.contains("get-sitelistpassword")
-                || (cmdline.contains("reg") && cmdline.contains("query")
+                || (cmdline.contains("reg")
+                    && cmdline.contains("query")
                     && (cmdline.contains("autologon") || cmdline.contains("defaultpassword")));
 
             // CAR-2021-05-001: certutil adding cert to untrusted store — bypasses trust chain (T1553.004).
@@ -494,8 +803,8 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
 
             // T1053.005 remote lateral: schtasks with /s flag targets a remote computer.
             // log_source=process/create, mutable=command_line (/s <hostname>)
-            let remote_schtask = image == "schtasks.exe"
-                && (cmdline.contains(" /s ") || cmdline.contains("/s\\\\"));
+            let remote_schtask =
+                image == "schtasks.exe" && (cmdline.contains(" /s ") || cmdline.contains("/s\\\\"));
 
             // T1021.002: Execution from UNC share path — lateral movement file copy + execute.
             let unc_execution = img_path.starts_with("\\\\");
@@ -503,14 +812,17 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
             // CAR-2019-04-002: regsvr32.exe spawning child processes — COM execution chain (T1218.010).
             // log_source=process/create, mutable=parent_exe (child of regsvr32)
             let regsvr32_child = parent == "regsvr32.exe"
-                && !matches!(image.as_str(),
-                    "regsvr32.exe" | "werfault.exe" | "wevtutil.exe" | "conhost.exe");
+                && !matches!(
+                    image.as_str(),
+                    "regsvr32.exe" | "werfault.exe" | "wevtutil.exe" | "conhost.exe"
+                );
 
             // CAR-2020-11-007: Net share removal — cleanup after lateral movement (T1070.005).
             let share_cleanup = image == "net.exe"
                 && (cmdline.contains(" use") && cmdline.contains(" /delete"))
                 || (image == "powershell.exe"
-                    && (cmdline.contains("remove-smbshare") || cmdline.contains("remove-fileshare")));
+                    && (cmdline.contains("remove-smbshare")
+                        || cmdline.contains("remove-fileshare")));
 
             // CAR-2020-11-008: MSBuild / msxsl outside Visual Studio — Trusted Dev Tool abuse (T1127).
             let msbuild_abuse = (image == "msbuild.exe"
@@ -519,8 +831,8 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                 || image == "msxsl.exe";
 
             // CAR-2020-11-010: cmstp.exe with external src_ip — UAC bypass / LOLBIN (T1218.003).
-            let cmstp_abuse = image == "cmstp.exe"
-                && (cmdline.contains("http") || cmdline.contains("\\\\"));
+            let cmstp_abuse =
+                image == "cmstp.exe" && (cmdline.contains("http") || cmdline.contains("\\\\"));
 
             attack_tool
                 || office_to_script
@@ -585,21 +897,50 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
         3 => {
             let image = basename(v["Image"].as_str().unwrap_or("")).to_lowercase();
             let initiated = v["Initiated"].as_str().unwrap_or("") == "true";
-            let dest_port: u16 = v["DestinationPort"].as_str().unwrap_or("0")
-                .parse().unwrap_or(0);
+            let dest_port: u16 = v["DestinationPort"]
+                .as_str()
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
             let dest_ip = v["DestinationIp"].as_str().unwrap_or("");
 
             // LOLBins making outbound connections — staging / C2 (T1105 / T1071).
-            let lolbin = matches!(image.as_str(),
-                "mshta.exe" | "regsvr32.exe" | "wscript.exe" | "cscript.exe"
-                | "certutil.exe" | "bitsadmin.exe" | "wmic.exe" | "rundll32.exe"
-                | "odbcconf.exe" | "cmstp.exe" | "msbuild.exe" | "installutil.exe"
-                | "regasm.exe" | "regsvcs.exe" | "ieexec.exe" | "xwizard.exe"
-                | "dnscmd.exe" | "msiexec.exe" | "esentutl.exe" | "expand.exe"
-                | "extrac32.exe" | "hh.exe" | "makecab.exe" | "msdt.exe"
-                | "pcalua.exe" | "rpcping.exe" | "verclsid.exe" | "wab.exe"
-                | "wusa.exe" | "presentationhost.exe" | "diskshadow.exe"
-                | "bash.exe" | "forfiles.exe" | "appvlp.exe"
+            let lolbin = matches!(
+                image.as_str(),
+                "mshta.exe"
+                    | "regsvr32.exe"
+                    | "wscript.exe"
+                    | "cscript.exe"
+                    | "certutil.exe"
+                    | "bitsadmin.exe"
+                    | "wmic.exe"
+                    | "rundll32.exe"
+                    | "odbcconf.exe"
+                    | "cmstp.exe"
+                    | "msbuild.exe"
+                    | "installutil.exe"
+                    | "regasm.exe"
+                    | "regsvcs.exe"
+                    | "ieexec.exe"
+                    | "xwizard.exe"
+                    | "dnscmd.exe"
+                    | "msiexec.exe"
+                    | "esentutl.exe"
+                    | "expand.exe"
+                    | "extrac32.exe"
+                    | "hh.exe"
+                    | "makecab.exe"
+                    | "msdt.exe"
+                    | "pcalua.exe"
+                    | "rpcping.exe"
+                    | "verclsid.exe"
+                    | "wab.exe"
+                    | "wusa.exe"
+                    | "presentationhost.exe"
+                    | "diskshadow.exe"
+                    | "bash.exe"
+                    | "forfiles.exe"
+                    | "appvlp.exe"
             );
 
             // PowerShell / cmd making non-standard-port outbound (C2 beaconing).
@@ -609,24 +950,42 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
 
             // Any scripting host connecting to internal IPs (lateral movement staging).
             let internal_lateral = initiated
-                && matches!(image.as_str(),
-                    "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe"
-                    | "mshta.exe" | "python.exe")
+                && matches!(
+                    image.as_str(),
+                    "powershell.exe"
+                        | "cmd.exe"
+                        | "wscript.exe"
+                        | "cscript.exe"
+                        | "mshta.exe"
+                        | "python.exe"
+                )
                 && (dest_ip.starts_with("10.")
-                    || dest_ip.starts_with("172.16.") || dest_ip.starts_with("172.17.")
-                    || dest_ip.starts_with("172.18.") || dest_ip.starts_with("172.19.")
-                    || dest_ip.starts_with("172.2")   || dest_ip.starts_with("172.3")
+                    || dest_ip.starts_with("172.16.")
+                    || dest_ip.starts_with("172.17.")
+                    || dest_ip.starts_with("172.18.")
+                    || dest_ip.starts_with("172.19.")
+                    || dest_ip.starts_with("172.2")
+                    || dest_ip.starts_with("172.3")
                     || dest_ip.starts_with("192.168."));
 
             // T1021.001 RDP — unexpected process connecting on 3389 (T1021.001).
-            let rdp_nonstandard = initiated && dest_port == 3389
+            let rdp_nonstandard = initiated
+                && dest_port == 3389
                 && !matches!(image.as_str(), "mstsc.exe" | "msrdcw.exe");
 
             // T1021.002 SMB lateral movement — scripting host on port 445 (T1021.002).
-            let smb_lateral = initiated && dest_port == 445
-                && matches!(image.as_str(),
-                    "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe"
-                    | "mshta.exe" | "python.exe" | "wmic.exe");
+            let smb_lateral = initiated
+                && dest_port == 445
+                && matches!(
+                    image.as_str(),
+                    "powershell.exe"
+                        | "cmd.exe"
+                        | "wscript.exe"
+                        | "cscript.exe"
+                        | "mshta.exe"
+                        | "python.exe"
+                        | "wmic.exe"
+                );
 
             // T1021.006 WinRM — unexpected process on WinRM ports 5985/5986.
             let winrm_lateral = initiated
@@ -637,19 +996,36 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
             // These are attack even on standard ports (certutil, bitsadmin, etc.).
             let http_lolbin = initiated
                 && matches!(dest_port, 80 | 443 | 8080 | 8443)
-                && matches!(image.as_str(),
-                    "wscript.exe" | "cscript.exe" | "mshta.exe" | "rundll32.exe"
-                    | "regsvr32.exe" | "msbuild.exe" | "installutil.exe" | "regasm.exe"
-                    | "certutil.exe" | "bitsadmin.exe" | "wmic.exe" | "cmstp.exe");
+                && matches!(
+                    image.as_str(),
+                    "wscript.exe"
+                        | "cscript.exe"
+                        | "mshta.exe"
+                        | "rundll32.exe"
+                        | "regsvr32.exe"
+                        | "msbuild.exe"
+                        | "installutil.exe"
+                        | "regasm.exe"
+                        | "certutil.exe"
+                        | "bitsadmin.exe"
+                        | "wmic.exe"
+                        | "cmstp.exe"
+                );
 
             // T1021.001 Unexpected RDP client process (not just non-mstsc, but scripting hosts).
             // Also covers: psexec making RDP connections.
-            let psexec_smb = initiated && dest_port == 445
+            let psexec_smb = initiated
+                && dest_port == 445
                 && (image.contains("psexec") || image.contains("paexec") || image == "sc.exe");
 
-            (lolbin && initiated) || ps_nonstandard || internal_lateral
-                || rdp_nonstandard || smb_lateral || winrm_lateral
-                || http_lolbin || psexec_smb
+            (lolbin && initiated)
+                || ps_nonstandard
+                || internal_lateral
+                || rdp_nonstandard
+                || smb_lateral
+                || winrm_lateral
+                || http_lolbin
+                || psexec_smb
         }
 
         // ── EID 6 — DriverLoad: BYOVD / unsigned driver (T1068 / T1014) ─────────
@@ -659,17 +1035,24 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
             let signed = v["Signed"].as_str().unwrap_or("false");
 
             // Known BYOVD (Bring Your Own Vulnerable Driver) names.
-            let byovd = img.contains("dbutil_2_3") || img.contains("mhyprot2")
-                || img.contains("gdrv.sys") || img.contains("asmmap")
-                || img.contains("rtcore64") || img.contains("zamguard")
-                || img.contains("ene_io")   || img.contains("physmem")
-                || img.contains("wfp_test") || img.contains("procexp");
+            let byovd = img.contains("dbutil_2_3")
+                || img.contains("mhyprot2")
+                || img.contains("gdrv.sys")
+                || img.contains("asmmap")
+                || img.contains("rtcore64")
+                || img.contains("zamguard")
+                || img.contains("ene_io")
+                || img.contains("physmem")
+                || img.contains("wfp_test")
+                || img.contains("procexp");
 
             // Unsigned driver or loaded from writable path (staging rootkit).
             let unsigned = signed == "false" || sig_status != "Valid";
             let suspicious_path = img.contains("\\temp\\")
-                || img.contains("\\appdata\\") || img.contains("\\users\\public\\")
-                || img.contains("\\programdata\\") || img.contains("\\downloads\\");
+                || img.contains("\\appdata\\")
+                || img.contains("\\users\\public\\")
+                || img.contains("\\programdata\\")
+                || img.contains("\\downloads\\");
 
             byovd || (unsigned && suspicious_path)
         }
@@ -682,10 +1065,14 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
             let process = basename(v["Image"].as_str().unwrap_or("")).to_lowercase();
 
             // Known attack / reflective-injection DLL names.
-            let known_bad = img.contains("mimilib") || img.contains("kiwi.dll")
-                || img.contains("sekurlsa")  || img.contains("wceaux.dll")
-                || img.contains("reflective") || img.contains("payload.dll")
-                || img.contains("beacon.dll") || img.contains("inject.dll")
+            let known_bad = img.contains("mimilib")
+                || img.contains("kiwi.dll")
+                || img.contains("sekurlsa")
+                || img.contains("wceaux.dll")
+                || img.contains("reflective")
+                || img.contains("payload.dll")
+                || img.contains("beacon.dll")
+                || img.contains("inject.dll")
                 || img.contains("cobaltstrike");
 
             // DLL loaded from a staging / writable path (side-load / dropper).
@@ -698,22 +1085,28 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
 
             // Unsigned DLL loaded into a high-value process.
             let unsigned_in_sensitive = (signed == "false" || sig_status != "Valid")
-                && matches!(process.as_str(),
-                    "lsass.exe" | "winlogon.exe" | "csrss.exe" | "wininit.exe"
-                    | "services.exe" | "svchost.exe");
+                && matches!(
+                    process.as_str(),
+                    "lsass.exe"
+                        | "winlogon.exe"
+                        | "csrss.exe"
+                        | "wininit.exe"
+                        | "services.exe"
+                        | "svchost.exe"
+                );
 
             // T1574.001 DLL hijack via DCOM process (mmc.exe, dllhost.exe, excel.exe).
             // DCOM lateral movement loads hijacked DLLs into DCOM server processes.
-            let dcom_dll_hijack = matches!(process.as_str(),
-                "dllhost.exe" | "mmc.exe" | "excel.exe" | "outlook.exe" | "svchost.exe")
-                && (signed == "false" || sig_status != "Valid")
+            let dcom_dll_hijack = matches!(
+                process.as_str(),
+                "dllhost.exe" | "mmc.exe" | "excel.exe" | "outlook.exe" | "svchost.exe"
+            ) && (signed == "false" || sig_status != "Valid")
                 && !img.contains("\\windows\\system32\\")
                 && !img.contains("\\windows\\syswow64\\")
                 && !img.contains("\\program files\\");
 
             // T1218.010 Regsvr32 loading remotely-fetched DLLs.
-            let regsvr_dll = process == "regsvr32.exe"
-                && (staged_dll || signed == "false");
+            let regsvr_dll = process == "regsvr32.exe" && (staged_dll || signed == "false");
 
             known_bad || staged_dll || unsigned_in_sensitive || dcom_dll_hijack || regsvr_dll
         }
@@ -728,18 +1121,28 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
         10 => {
             let target = basename(v["TargetImage"].as_str().unwrap_or("")).to_lowercase();
             let access_str = v["GrantedAccess"].as_str().unwrap_or("0x0");
-            let access = u64::from_str_radix(access_str.trim_start_matches("0x"), 16)
-                .unwrap_or(0);
+            let access = u64::from_str_radix(access_str.trim_start_matches("0x"), 16).unwrap_or(0);
 
             // Any access to lsass is suspicious (T1003.001).
-            if target == "lsass.exe" { return true; }
+            if target == "lsass.exe" {
+                return true;
+            }
 
             // Memory-read/write/dup-handle on other credential-store processes.
-            let sensitive_target = matches!(target.as_str(),
-                "winlogon.exe" | "csrss.exe" | "wininit.exe" | "services.exe"
-                | "explorer.exe" | "svchost.exe" | "spoolsv.exe"
-                | "taskhost.exe" | "taskhostw.exe" | "vaultcvc.exe"
-                | "msmpeng.exe" | "msseces.exe"
+            let sensitive_target = matches!(
+                target.as_str(),
+                "winlogon.exe"
+                    | "csrss.exe"
+                    | "wininit.exe"
+                    | "services.exe"
+                    | "explorer.exe"
+                    | "svchost.exe"
+                    | "spoolsv.exe"
+                    | "taskhost.exe"
+                    | "taskhostw.exe"
+                    | "vaultcvc.exe"
+                    | "msmpeng.exe"
+                    | "msseces.exe"
             );
             // VM_READ(0x10)|VM_WRITE(0x20)|DUP_HANDLE(0x40) or broad PROCESS_ALL_ACCESS.
             // Also: 0x1F0FFF = PROCESS_ALL_ACCESS (DET0363), 0x1410 = token+query ops (T1134).
@@ -762,12 +1165,28 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
             let image = basename(v["Image"].as_str().unwrap_or("")).to_lowercase();
 
             // Broader set of scripting / LOLBin writers.
-            let scripting = matches!(image.as_str(),
-                "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe"
-                | "mshta.exe" | "python.exe" | "wmic.exe" | "regsvr32.exe"
-                | "rundll32.exe" | "msbuild.exe" | "cmstp.exe" | "certutil.exe"
-                | "bitsadmin.exe" | "excel.exe" | "winword.exe" | "outlook.exe"
-                | "onenote.exe" | "msaccess.exe" | "curl.exe" | "expand.exe"
+            let scripting = matches!(
+                image.as_str(),
+                "powershell.exe"
+                    | "cmd.exe"
+                    | "wscript.exe"
+                    | "cscript.exe"
+                    | "mshta.exe"
+                    | "python.exe"
+                    | "wmic.exe"
+                    | "regsvr32.exe"
+                    | "rundll32.exe"
+                    | "msbuild.exe"
+                    | "cmstp.exe"
+                    | "certutil.exe"
+                    | "bitsadmin.exe"
+                    | "excel.exe"
+                    | "winword.exe"
+                    | "outlook.exe"
+                    | "onenote.exe"
+                    | "msaccess.exe"
+                    | "curl.exe"
+                    | "expand.exe"
             );
 
             let staging = fname.contains("\\temp\\")
@@ -779,26 +1198,39 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                 || fname.contains("\\users\\default\\");
 
             // Executable / script extensions (T1027, T1105).
-            let executable = fname.ends_with(".exe") || fname.ends_with(".dll")
-                || fname.ends_with(".ps1")  || fname.ends_with(".bat")
-                || fname.ends_with(".vbs")  || fname.ends_with(".js")
-                || fname.ends_with(".hta")  || fname.ends_with(".jse")
-                || fname.ends_with(".wsf")  || fname.ends_with(".vbe")
-                || fname.ends_with(".scr")  || fname.ends_with(".pif")
-                || fname.ends_with(".cpl")  || fname.ends_with(".inf")
-                || fname.ends_with(".sys")  || fname.ends_with(".ocx")
+            let executable = fname.ends_with(".exe")
+                || fname.ends_with(".dll")
+                || fname.ends_with(".ps1")
+                || fname.ends_with(".bat")
+                || fname.ends_with(".vbs")
+                || fname.ends_with(".js")
+                || fname.ends_with(".hta")
+                || fname.ends_with(".jse")
+                || fname.ends_with(".wsf")
+                || fname.ends_with(".vbe")
+                || fname.ends_with(".scr")
+                || fname.ends_with(".pif")
+                || fname.ends_with(".cpl")
+                || fname.ends_with(".inf")
+                || fname.ends_with(".sys")
+                || fname.ends_with(".ocx")
                 || fname.ends_with(".xll"); // Excel add-in
 
             // Memory-dump artefacts (credential theft).
             let dump = (fname.ends_with(".dmp") || fname.ends_with(".mdmp"))
                 || (fname.ends_with(".bin")
-                    && (fname.contains("lsass") || fname.contains("ntds") || fname.contains("sam")));
+                    && (fname.contains("lsass")
+                        || fname.contains("ntds")
+                        || fname.contains("sam")));
 
             // CAR-2020-09-001: Task file created in Tasks directory by a non-scheduler process (T1053.005).
             // log_source=file/create, mutable=file_path (path in \Tasks\) + image_path (not svchost)
             let task_drop = (fname.contains("\\windows\\system32\\tasks\\")
                 || fname.contains("\\windows\\tasks\\"))
-                && !matches!(image.as_str(), "svchost.exe" | "taskeng.exe" | "taskhostw.exe");
+                && !matches!(
+                    image.as_str(),
+                    "svchost.exe" | "taskeng.exe" | "taskhostw.exe"
+                );
 
             // CAR-2021-05-002: Batch/cmd script dropped into System32 (T1204.002 / T1059.003).
             // log_source=file/create, mutable=file_path (in system32) + extension (.bat/.cmd)
@@ -806,14 +1238,18 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
                 && (fname.ends_with(".bat") || fname.ends_with(".cmd") || fname.ends_with(".ps1"));
 
             // CAR-2019-08-001: lsass.dmp created by Task Manager — credential dump via UI (T1003.001).
-            let taskmgr_dump = image == "taskmgr.exe"
-                && fname.contains("lsass") && fname.ends_with(".dmp");
+            let taskmgr_dump =
+                image == "taskmgr.exe" && fname.contains("lsass") && fname.ends_with(".dmp");
 
             // CAR-2019-08-002: ntds.dit dropped — Active Directory database dump (T1003.003).
             let ntds_drop = fname.contains("ntds.dit") || fname.contains("ntds.jfm");
 
-            scripting && (staging || executable) || dump || task_drop || system32_script
-                || taskmgr_dump || ntds_drop
+            scripting && (staging || executable)
+                || dump
+                || task_drop
+                || system32_script
+                || taskmgr_dump
+                || ntds_drop
         }
 
         // ── EID 12/13 — RegistryEvent: persistence / defence-evasion keys ────────
@@ -919,18 +1355,33 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
             let image = basename(v["Image"].as_str().unwrap_or("")).to_lowercase();
 
             // Known Cobalt Strike / Metasploit / Covenant pipe patterns.
-            let known_c2_pipe = pipe.contains("postex_")  || pipe.contains("msse-")
-                || pipe.contains("status_")   || pipe.contains("msagent_")
-                || pipe.contains("ntsvcs-")   || pipe.contains("46a9e56")
-                || pipe.contains("583da945")  || pipe.contains("wkssvc-")
-                || pipe.contains("isapi_")    || pipe.contains("dce_pipe")
-                || pipe.contains("gruntstager") || pipe.contains("interprocess_")
-                || pipe.contains("atctl")     || pipe.contains("gecko_channel");
+            let known_c2_pipe = pipe.contains("postex_")
+                || pipe.contains("msse-")
+                || pipe.contains("status_")
+                || pipe.contains("msagent_")
+                || pipe.contains("ntsvcs-")
+                || pipe.contains("46a9e56")
+                || pipe.contains("583da945")
+                || pipe.contains("wkssvc-")
+                || pipe.contains("isapi_")
+                || pipe.contains("dce_pipe")
+                || pipe.contains("gruntstager")
+                || pipe.contains("interprocess_")
+                || pipe.contains("atctl")
+                || pipe.contains("gecko_channel");
 
             // Pipe created by a scripting / LOLBin process.
-            let suspicious_creator = matches!(image.as_str(),
-                "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe"
-                | "mshta.exe" | "rundll32.exe" | "regsvr32.exe" | "msbuild.exe");
+            let suspicious_creator = matches!(
+                image.as_str(),
+                "powershell.exe"
+                    | "cmd.exe"
+                    | "wscript.exe"
+                    | "cscript.exe"
+                    | "mshta.exe"
+                    | "rundll32.exe"
+                    | "regsvr32.exe"
+                    | "msbuild.exe"
+            );
 
             known_c2_pipe || suspicious_creator
         }
@@ -944,15 +1395,24 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
             let image = basename(v["Image"].as_str().unwrap_or("")).to_lowercase();
 
             // LOLBins or scripting hosts making DNS queries.
-            let suspicious_process = matches!(image.as_str(),
-                "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe"
-                | "mshta.exe" | "rundll32.exe" | "regsvr32.exe" | "certutil.exe"
-                | "bitsadmin.exe" | "wmic.exe" | "msbuild.exe" | "installutil.exe"
+            let suspicious_process = matches!(
+                image.as_str(),
+                "powershell.exe"
+                    | "cmd.exe"
+                    | "wscript.exe"
+                    | "cscript.exe"
+                    | "mshta.exe"
+                    | "rundll32.exe"
+                    | "regsvr32.exe"
+                    | "certutil.exe"
+                    | "bitsadmin.exe"
+                    | "wmic.exe"
+                    | "msbuild.exe"
+                    | "installutil.exe"
             );
 
             // Very long subdomain label or overall query → DNS tunnelling.
-            let dns_tunnel = query.len() > 60
-                || query.split('.').any(|part| part.len() > 40);
+            let dns_tunnel = query.len() > 60 || query.split('.').any(|part| part.len() > 40);
 
             suspicious_process || dns_tunnel
         }
@@ -971,11 +1431,15 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
             let prefetch = fname.contains("\\prefetch\\") && fname.ends_with(".pf");
 
             // Scripting host deleting executables or dumps (cleanup).
-            let scripted = matches!(image.as_str(),
-                "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe")
-                && (fname.ends_with(".exe") || fname.ends_with(".dll")
-                    || fname.ends_with(".dmp") || fname.ends_with(".evtx")
-                    || fname.ends_with(".ps1") || fname.ends_with(".bat"));
+            let scripted = matches!(
+                image.as_str(),
+                "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe"
+            ) && (fname.ends_with(".exe")
+                || fname.ends_with(".dll")
+                || fname.ends_with(".dmp")
+                || fname.ends_with(".evtx")
+                || fname.ends_with(".ps1")
+                || fname.ends_with(".bat"));
 
             log_delete || prefetch || scripted
         }
@@ -984,13 +1448,31 @@ pub fn is_attack_behavior(v: &serde_json::Value, eid: u32) -> bool {
         // Only flag termination of known security/forensics processes (T1562.001).
         5 => {
             let image = basename(v["Image"].as_str().unwrap_or("")).to_lowercase();
-            matches!(image.as_str(),
-                "msmpeng.exe" | "msseces.exe" | "mbam.exe" | "mbamtray.exe"
-                | "avgnt.exe" | "avp.exe" | "avguard.exe" | "avgwdsvc.exe"
-                | "sysmon.exe" | "sysmon64.exe" | "winlogbeat.exe" | "elastic-agent.exe"
-                | "wireshark.exe" | "processhacker.exe" | "procmon.exe" | "procmon64.exe"
-                | "autoruns.exe" | "autorunsc.exe" | "regedit.exe"
-                | "fltmc.exe" | "bds-vision.exe" | "eguiproxy.exe")
+            matches!(
+                image.as_str(),
+                "msmpeng.exe"
+                    | "msseces.exe"
+                    | "mbam.exe"
+                    | "mbamtray.exe"
+                    | "avgnt.exe"
+                    | "avp.exe"
+                    | "avguard.exe"
+                    | "avgwdsvc.exe"
+                    | "sysmon.exe"
+                    | "sysmon64.exe"
+                    | "winlogbeat.exe"
+                    | "elastic-agent.exe"
+                    | "wireshark.exe"
+                    | "processhacker.exe"
+                    | "procmon.exe"
+                    | "procmon64.exe"
+                    | "autoruns.exe"
+                    | "autorunsc.exe"
+                    | "regedit.exe"
+                    | "fltmc.exe"
+                    | "bds-vision.exe"
+                    | "eguiproxy.exe"
+            )
         }
 
         // ── EID 24 — ClipboardChange: data collection via clipboard (T1115) ──────
@@ -1022,15 +1504,19 @@ pub fn car_tactic(v: &serde_json::Value, eid: u32) -> Option<usize> {
     match eid {
         // ── EID 1 — ProcessCreate: most behavioral signal ────────────────────────
         1 => {
-            let image   = basename(v["Image"].as_str().unwrap_or("")).to_lowercase();
-            let parent  = basename(v["ParentImage"].as_str().unwrap_or("")).to_lowercase();
+            let image = basename(v["Image"].as_str().unwrap_or("")).to_lowercase();
+            let parent = basename(v["ParentImage"].as_str().unwrap_or("")).to_lowercase();
             let cmdline = v["CommandLine"].as_str().unwrap_or("").to_lowercase();
             let img_path = v["Image"].as_str().unwrap_or("").to_lowercase();
 
             // ── Lateral movement ────────────────────────────────────────────────
             // WMI remote execution: wmiprvse.exe spawns any non-system child.
             if parent == "wmiprvse.exe"
-                && !matches!(image.as_str(), "conhost.exe" | "wbemcons.exe" | "wbemcore.exe") {
+                && !matches!(
+                    image.as_str(),
+                    "conhost.exe" | "wbemcons.exe" | "wbemcore.exe"
+                )
+            {
                 return Some(4);
             }
             // WinRM remote execution via wsmprovhost.
@@ -1038,7 +1524,10 @@ pub fn car_tactic(v: &serde_json::Value, eid: u32) -> Option<usize> {
                 return Some(4);
             }
             // PSExec / PAExec lateral tool.
-            if matches!(image.as_str(), "psexec.exe" | "psexec64.exe" | "psexesvc.exe" | "paexec.exe") {
+            if matches!(
+                image.as_str(),
+                "psexec.exe" | "psexec64.exe" | "psexesvc.exe" | "paexec.exe"
+            ) {
                 return Some(4);
             }
             // schtasks with remote /s flag — scheduling on a remote host.
@@ -1051,20 +1540,34 @@ pub fn car_tactic(v: &serde_json::Value, eid: u32) -> Option<usize> {
             }
             // DCOM lateral: mmc/dllhost spawning a scripting process.
             if matches!(parent.as_str(), "mmc.exe" | "dllhost.exe")
-                && matches!(image.as_str(),
-                    "cmd.exe" | "powershell.exe" | "wscript.exe" | "cscript.exe")
+                && matches!(
+                    image.as_str(),
+                    "cmd.exe" | "powershell.exe" | "wscript.exe" | "cscript.exe"
+                )
             {
                 return Some(4);
             }
 
             // ── Credential access ───────────────────────────────────────────────
             // Direct credential-dump tools.
-            if matches!(image.as_str(),
-                "mimikatz.exe" | "rubeus.exe" | "kekeo.exe" | "safetykatz.exe"
-                | "sharpkatz.exe" | "nanodump.exe" | "dumpert.exe" | "wce.exe"
-                | "fgdump.exe" | "pwdump.exe" | "pwdump6.exe" | "pwdump7.exe"
-                | "gsecdump.exe" | "cachedump.exe" | "lazagne.exe")
-            {
+            if matches!(
+                image.as_str(),
+                "mimikatz.exe"
+                    | "rubeus.exe"
+                    | "kekeo.exe"
+                    | "safetykatz.exe"
+                    | "sharpkatz.exe"
+                    | "nanodump.exe"
+                    | "dumpert.exe"
+                    | "wce.exe"
+                    | "fgdump.exe"
+                    | "pwdump.exe"
+                    | "pwdump6.exe"
+                    | "pwdump7.exe"
+                    | "gsecdump.exe"
+                    | "cachedump.exe"
+                    | "lazagne.exe"
+            ) {
                 return Some(1);
             }
             // procdump/comsvcs targeting lsass.
@@ -1074,16 +1577,22 @@ pub fn car_tactic(v: &serde_json::Value, eid: u32) -> Option<usize> {
                 return Some(1);
             }
             // reg.exe saving credential hives.
-            if image == "reg.exe" && cmdline.contains("save")
-                && (cmdline.contains("sam") || cmdline.contains("security")
-                    || cmdline.contains("system") || cmdline.contains("ntds"))
+            if image == "reg.exe"
+                && cmdline.contains("save")
+                && (cmdline.contains("sam")
+                    || cmdline.contains("security")
+                    || cmdline.contains("system")
+                    || cmdline.contains("ntds"))
             {
                 return Some(1);
             }
             // Mimikatz command syntax in any process (Invoke-Mimikatz etc.).
-            if cmdline.contains("sekurlsa::") || cmdline.contains("lsadump::")
-                || cmdline.contains("kerberos::ptt") || cmdline.contains("kerberos::list")
-                || cmdline.contains("token::elevate") || cmdline.contains("privilege::debug")
+            if cmdline.contains("sekurlsa::")
+                || cmdline.contains("lsadump::")
+                || cmdline.contains("kerberos::ptt")
+                || cmdline.contains("kerberos::list")
+                || cmdline.contains("token::elevate")
+                || cmdline.contains("privilege::debug")
             {
                 return Some(1);
             }
@@ -1094,14 +1603,22 @@ pub fn car_tactic(v: &serde_json::Value, eid: u32) -> Option<usize> {
 
             // ── Privilege escalation ────────────────────────────────────────────
             // Accessibility app as debugger — sticky-keys / utilman backdoor.
-            if matches!(parent.as_str(),
-                "sethc.exe" | "utilman.exe" | "osk.exe" | "narrator.exe"
-                | "magnify.exe" | "displayswitch.exe" | "atbroker.exe")
-            {
+            if matches!(
+                parent.as_str(),
+                "sethc.exe"
+                    | "utilman.exe"
+                    | "osk.exe"
+                    | "narrator.exe"
+                    | "magnify.exe"
+                    | "displayswitch.exe"
+                    | "atbroker.exe"
+            ) {
                 return Some(6);
             }
             // GetSystem via named-pipe echo (Meterpreter / CS).
-            if cmdline.contains("echo") && (cmdline.contains("\\pipe\\") || cmdline.contains("\\\\.\\pipe")) {
+            if cmdline.contains("echo")
+                && (cmdline.contains("\\pipe\\") || cmdline.contains("\\\\.\\pipe"))
+            {
                 return Some(6);
             }
             // mavinject DLL injection (T1055.001 / T1548.002).
@@ -1132,17 +1649,17 @@ pub fn car_tactic(v: &serde_json::Value, eid: u32) -> Option<usize> {
             }
             // taskkill against AV processes.
             if image == "taskkill.exe"
-                && (cmdline.contains("msmpeng") || cmdline.contains("sysmon")
-                    || cmdline.contains("msseces") || cmdline.contains("winlogbeat"))
+                && (cmdline.contains("msmpeng")
+                    || cmdline.contains("sysmon")
+                    || cmdline.contains("msseces")
+                    || cmdline.contains("winlogbeat"))
             {
                 return Some(2);
             }
 
             // ── Persistence ─────────────────────────────────────────────────────
             // schtasks /create locally (no remote /s).
-            if image == "schtasks.exe" && cmdline.contains("/create")
-                && !cmdline.contains(" /s ")
-            {
+            if image == "schtasks.exe" && cmdline.contains("/create") && !cmdline.contains(" /s ") {
                 return Some(5);
             }
             // sc.exe create/config with suspicious binPath.
@@ -1166,17 +1683,32 @@ pub fn car_tactic(v: &serde_json::Value, eid: u32) -> Option<usize> {
 
             // ── Discovery ───────────────────────────────────────────────────────
             // Stand-alone enumeration tools (not under a scripting parent).
-            if !matches!(parent.as_str(), "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe") {
-                if matches!(image.as_str(),
-                    "whoami.exe" | "hostname.exe" | "ipconfig.exe" | "systeminfo.exe"
-                    | "arp.exe" | "nslookup.exe" | "tasklist.exe" | "quser.exe"
-                    | "qwinsta.exe" | "gpresult.exe" | "nltest.exe" | "dsquery.exe")
-                {
+            if !matches!(
+                parent.as_str(),
+                "powershell.exe" | "cmd.exe" | "wscript.exe" | "cscript.exe"
+            ) {
+                if matches!(
+                    image.as_str(),
+                    "whoami.exe"
+                        | "hostname.exe"
+                        | "ipconfig.exe"
+                        | "systeminfo.exe"
+                        | "arp.exe"
+                        | "nslookup.exe"
+                        | "tasklist.exe"
+                        | "quser.exe"
+                        | "qwinsta.exe"
+                        | "gpresult.exe"
+                        | "nltest.exe"
+                        | "dsquery.exe"
+                ) {
                     return Some(3);
                 }
                 if image == "net.exe"
-                    && (cmdline.contains(" user") || cmdline.contains(" group")
-                        || cmdline.contains(" localgroup") || cmdline.contains(" view"))
+                    && (cmdline.contains(" user")
+                        || cmdline.contains(" group")
+                        || cmdline.contains(" localgroup")
+                        || cmdline.contains(" view"))
                 {
                     return Some(3);
                 }
@@ -1188,12 +1720,18 @@ pub fn car_tactic(v: &serde_json::Value, eid: u32) -> Option<usize> {
                 return Some(0);
             }
             // Office macro spawning scripting host (initial execution).
-            if matches!(parent.as_str(),
-                "winword.exe" | "excel.exe" | "powerpnt.exe" | "outlook.exe"
-                | "onenote.exe" | "eqnedt32.exe")
-                && matches!(image.as_str(),
-                    "cmd.exe" | "powershell.exe" | "wscript.exe" | "cscript.exe" | "mshta.exe")
-            {
+            if matches!(
+                parent.as_str(),
+                "winword.exe"
+                    | "excel.exe"
+                    | "powerpnt.exe"
+                    | "outlook.exe"
+                    | "onenote.exe"
+                    | "eqnedt32.exe"
+            ) && matches!(
+                image.as_str(),
+                "cmd.exe" | "powershell.exe" | "wscript.exe" | "cscript.exe" | "mshta.exe"
+            ) {
                 return Some(0);
             }
 
@@ -1203,7 +1741,9 @@ pub fn car_tactic(v: &serde_json::Value, eid: u32) -> Option<usize> {
         // ── EID 10 — ProcessAccess: strongly indicates credential access ──────────
         10 => {
             let target = basename(v["TargetImage"].as_str().unwrap_or("")).to_lowercase();
-            if target == "lsass.exe" { return Some(1); }
+            if target == "lsass.exe" {
+                return Some(1);
+            }
             None
         }
 

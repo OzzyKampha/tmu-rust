@@ -234,41 +234,43 @@ unsafe fn rebuild_include_avx2(
     words: usize,
     n_literals: usize,
     half: u8,
-) { unsafe {
-    use std::arch::x86_64::*;
+) {
+    unsafe {
+        use std::arch::x86_64::*;
 
-    // Bias both sides by 0x80 to convert unsigned >= to signed >.
-    // ta >= half  ↔  (ta ^ 0x80) > ((half-1) ^ 0x80)  [signed i8]
-    let bias = _mm256_set1_epi8(i8::MIN);
-    let threshold = _mm256_set1_epi8((half.wrapping_sub(1) ^ 0x80) as i8);
+        // Bias both sides by 0x80 to convert unsigned >= to signed >.
+        // ta >= half  ↔  (ta ^ 0x80) > ((half-1) ^ 0x80)  [signed i8]
+        let bias = _mm256_set1_epi8(i8::MIN);
+        let threshold = _mm256_set1_epi8((half.wrapping_sub(1) ^ 0x80) as i8);
 
-    for k in 0..words {
-        let base = k * WORD_BITS;
-        let limit = (n_literals - base).min(WORD_BITS);
-        let mut word = 0u64;
-        let mut bit = 0usize;
+        for k in 0..words {
+            let base = k * WORD_BITS;
+            let limit = (n_literals - base).min(WORD_BITS);
+            let mut word = 0u64;
+            let mut bit = 0usize;
 
-        // 32 literals per AVX2 iteration.
-        while bit + 32 <= limit {
-            // SAFETY: `bit + 32 <= limit <= n_literals - base`, so `base + bit + 32 <= n_literals`
-            // which is within the `ta` slice. `_mm256_loadu_si256` is an unaligned load.
-            let ptr = ta.as_ptr().add(base + bit) as *const __m256i;
-            let chunk = _mm256_loadu_si256(ptr);
-            let biased = _mm256_xor_si256(chunk, bias);
-            let cmp = _mm256_cmpgt_epi8(biased, threshold);
-            let bits32 = _mm256_movemask_epi8(cmp) as u32 as u64;
-            word |= bits32 << bit;
-            bit += 32;
+            // 32 literals per AVX2 iteration.
+            while bit + 32 <= limit {
+                // SAFETY: `bit + 32 <= limit <= n_literals - base`, so `base + bit + 32 <= n_literals`
+                // which is within the `ta` slice. `_mm256_loadu_si256` is an unaligned load.
+                let ptr = ta.as_ptr().add(base + bit) as *const __m256i;
+                let chunk = _mm256_loadu_si256(ptr);
+                let biased = _mm256_xor_si256(chunk, bias);
+                let cmp = _mm256_cmpgt_epi8(biased, threshold);
+                let bits32 = _mm256_movemask_epi8(cmp) as u32 as u64;
+                word |= bits32 << bit;
+                bit += 32;
+            }
+            // Scalar tail for remaining < 32 literals.
+            while bit < limit {
+                word |= ((ta[base + bit] >= half) as u64) << bit;
+                bit += 1;
+            }
+
+            inc[k] = word & valid[k];
         }
-        // Scalar tail for remaining < 32 literals.
-        while bit < limit {
-            word |= ((ta[base + bit] >= half) as u64) << bit;
-            bit += 1;
-        }
-
-        inc[k] = word & valid[k];
     }
-}}
+}
 
 /// Grow a dense clause bank from `old_n_features` to `new_n_features`, preserving
 /// every learned per-clause state. Returns `(new_n_literals, new_words)`.
@@ -508,91 +510,91 @@ unsafe fn type_i_update_bytes_avx2(
     keep_b: &[u8],
     active_b: &[u8],
     max_state: u8,
-) { unsafe {
-    use std::arch::x86_64::*;
+) {
+    unsafe {
+        use std::arch::x86_64::*;
 
-    let max_state_v = _mm256_set1_epi8(max_state as i8);
-    let ones = _mm256_set1_epi8(1);
-    let all_ones = _mm256_set1_epi8(-1);
-    let boost_v = _mm256_set1_epi8(boost as i8);
+        let max_state_v = _mm256_set1_epi8(max_state as i8);
+        let ones = _mm256_set1_epi8(1);
+        let all_ones = _mm256_set1_epi8(-1);
+        let boost_v = _mm256_set1_epi8(boost as i8);
 
-    // Load 32 bytes (one full AVX2 register) from a u8 slice.
-    // SAFETY: caller ensures at least 32 bytes remain at ptr (checked by loop bound).
-    macro_rules! load32 {
-        ($slice:expr, $off:expr) => {{
-            _mm256_loadu_si256($slice.as_ptr().add($off) as *const __m256i)
-        }};
+        // Load 32 bytes (one full AVX2 register) from a u8 slice.
+        // SAFETY: caller ensures at least 32 bytes remain at ptr (checked by loop bound).
+        macro_rules! load32 {
+            ($slice:expr, $off:expr) => {{ _mm256_loadu_si256($slice.as_ptr().add($off) as *const __m256i) }};
+        }
+
+        let mut l = 0usize;
+
+        if fired_under {
+            while l + 32 <= n_literals {
+                // SAFETY: l + 32 <= n_literals, so all reads are in-bounds.
+                let t = load32!(ta, l);
+                let present = load32!(lit_b, l);
+                let keep_v = load32!(keep_b, l);
+                let inv_v = load32!(inv_b, l);
+                let la = load32!(active_b, l);
+
+                // inc = present & (boost | keep) & la  (all values 0 or 1)
+                let inc = _mm256_and_si256(
+                    _mm256_and_si256(present, _mm256_or_si256(boost_v, keep_v)),
+                    la,
+                );
+                // t_clamped = min(t + inc, max_state)
+                let t_clamped = _mm256_min_epu8(_mm256_adds_epu8(t, inc), max_state_v);
+
+                // absent = 1 - present
+                let absent = _mm256_sub_epi8(ones, present);
+                // not_at_max: 0xFF where t != max_state, 0 where t == max_state
+                let not_at_max = _mm256_andnot_si256(_mm256_cmpeq_epi8(t, max_state_v), all_ones);
+                // dec = absent & inv & la (0 or 1); zeroed out where t == max_state
+                let dec = _mm256_and_si256(
+                    _mm256_and_si256(_mm256_and_si256(absent, inv_v), la),
+                    not_at_max,
+                );
+
+                // native saturating unsigned byte subtract
+                let result = _mm256_subs_epu8(t_clamped, dec);
+                _mm256_storeu_si256(ta.as_mut_ptr().add(l) as *mut __m256i, result);
+                l += 32;
+            }
+            // Scalar tail.
+            let boost_u8 = boost as u8;
+            while l < n_literals {
+                let t = ta[l];
+                let present = lit_b[l];
+                let la = active_b[l];
+                let inc = present & (boost_u8 | keep_b[l]) & la;
+                let not_at_max = (t < max_state) as u8;
+                let dec = (1 - present) & inv_b[l] & not_at_max & la;
+                ta[l] = t.saturating_add(inc).min(max_state).saturating_sub(dec);
+                l += 1;
+            }
+        } else {
+            while l + 32 <= n_literals {
+                // SAFETY: l + 32 <= n_literals, so all reads are in-bounds.
+                let t = load32!(ta, l);
+                let inv_v = load32!(inv_b, l);
+                let la = load32!(active_b, l);
+
+                let not_at_max = _mm256_andnot_si256(_mm256_cmpeq_epi8(t, max_state_v), all_ones);
+                let dec = _mm256_and_si256(_mm256_and_si256(inv_v, la), not_at_max);
+
+                let result = _mm256_subs_epu8(t, dec);
+                _mm256_storeu_si256(ta.as_mut_ptr().add(l) as *mut __m256i, result);
+                l += 32;
+            }
+            while l < n_literals {
+                let t = ta[l];
+                let not_at_max = (t < max_state) as u8;
+                let dec = inv_b[l] & not_at_max & active_b[l];
+                ta[l] = t.saturating_sub(dec);
+                l += 1;
+            }
+        }
     }
-
-    let mut l = 0usize;
-
-    if fired_under {
-        while l + 32 <= n_literals {
-            // SAFETY: l + 32 <= n_literals, so all reads are in-bounds.
-            let t = load32!(ta, l);
-            let present = load32!(lit_b, l);
-            let keep_v = load32!(keep_b, l);
-            let inv_v = load32!(inv_b, l);
-            let la = load32!(active_b, l);
-
-            // inc = present & (boost | keep) & la  (all values 0 or 1)
-            let inc = _mm256_and_si256(
-                _mm256_and_si256(present, _mm256_or_si256(boost_v, keep_v)),
-                la,
-            );
-            // t_clamped = min(t + inc, max_state)
-            let t_clamped = _mm256_min_epu8(_mm256_adds_epu8(t, inc), max_state_v);
-
-            // absent = 1 - present
-            let absent = _mm256_sub_epi8(ones, present);
-            // not_at_max: 0xFF where t != max_state, 0 where t == max_state
-            let not_at_max = _mm256_andnot_si256(_mm256_cmpeq_epi8(t, max_state_v), all_ones);
-            // dec = absent & inv & la (0 or 1); zeroed out where t == max_state
-            let dec = _mm256_and_si256(
-                _mm256_and_si256(_mm256_and_si256(absent, inv_v), la),
-                not_at_max,
-            );
-
-            // native saturating unsigned byte subtract
-            let result = _mm256_subs_epu8(t_clamped, dec);
-            _mm256_storeu_si256(ta.as_mut_ptr().add(l) as *mut __m256i, result);
-            l += 32;
-        }
-        // Scalar tail.
-        let boost_u8 = boost as u8;
-        while l < n_literals {
-            let t = ta[l];
-            let present = lit_b[l];
-            let la = active_b[l];
-            let inc = present & (boost_u8 | keep_b[l]) & la;
-            let not_at_max = (t < max_state) as u8;
-            let dec = (1 - present) & inv_b[l] & not_at_max & la;
-            ta[l] = t.saturating_add(inc).min(max_state).saturating_sub(dec);
-            l += 1;
-        }
-    } else {
-        while l + 32 <= n_literals {
-            // SAFETY: l + 32 <= n_literals, so all reads are in-bounds.
-            let t = load32!(ta, l);
-            let inv_v = load32!(inv_b, l);
-            let la = load32!(active_b, l);
-
-            let not_at_max = _mm256_andnot_si256(_mm256_cmpeq_epi8(t, max_state_v), all_ones);
-            let dec = _mm256_and_si256(_mm256_and_si256(inv_v, la), not_at_max);
-
-            let result = _mm256_subs_epu8(t, dec);
-            _mm256_storeu_si256(ta.as_mut_ptr().add(l) as *mut __m256i, result);
-            l += 32;
-        }
-        while l < n_literals {
-            let t = ta[l];
-            let not_at_max = (t < max_state) as u8;
-            let dec = inv_b[l] & not_at_max & active_b[l];
-            ta[l] = t.saturating_sub(dec);
-            l += 1;
-        }
-    }
-}}
+}
 
 /// Apply Type II TA feedback to one clause (byte-array inputs).
 ///
@@ -670,60 +672,60 @@ unsafe fn type_ii_update_bytes_avx2(
     active_b: &[u8],
     half: u8,
     max_state: u8,
-) { unsafe {
-    use std::arch::x86_64::*;
+) {
+    unsafe {
+        use std::arch::x86_64::*;
 
-    let max_state_v = _mm256_set1_epi8(max_state as i8);
-    let ones = _mm256_set1_epi8(1);
-    let bias = _mm256_set1_epi8(i8::MIN);
-    // t < half  ↔  (t ^ 0x80) < (half ^ 0x80)  ↔  (half ^ 0x80) > (t ^ 0x80)  [signed i8]
-    let half_biased = _mm256_set1_epi8((half ^ 0x80) as i8);
-    // t > 0  ↔  (t ^ 0x80) > (0 ^ 0x80) = 0x80 = i8::MIN  [signed i8]
-    let zero_biased = bias;
+        let max_state_v = _mm256_set1_epi8(max_state as i8);
+        let ones = _mm256_set1_epi8(1);
+        let bias = _mm256_set1_epi8(i8::MIN);
+        // t < half  ↔  (t ^ 0x80) < (half ^ 0x80)  ↔  (half ^ 0x80) > (t ^ 0x80)  [signed i8]
+        let half_biased = _mm256_set1_epi8((half ^ 0x80) as i8);
+        // t > 0  ↔  (t ^ 0x80) > (0 ^ 0x80) = 0x80 = i8::MIN  [signed i8]
+        let zero_biased = bias;
 
-    macro_rules! load32 {
-        ($slice:expr, $off:expr) => {{
-            _mm256_loadu_si256($slice.as_ptr().add($off) as *const __m256i)
-        }};
+        macro_rules! load32 {
+            ($slice:expr, $off:expr) => {{ _mm256_loadu_si256($slice.as_ptr().add($off) as *const __m256i) }};
+        }
+
+        let mut l = 0usize;
+        while l + 32 <= n_literals {
+            // SAFETY: l + 32 <= n_literals, all reads in-bounds.
+            let t = load32!(ta, l);
+            let lit_v = load32!(lit_b, l);
+            let la = load32!(active_b, l);
+
+            let absent = _mm256_sub_epi8(ones, lit_v); // 1 - lit (0 or 1)
+            let t_biased = _mm256_xor_si256(t, bias);
+            // excluded: 0xFF where t < half, 0 elsewhere
+            let excluded = _mm256_cmpgt_epi8(half_biased, t_biased);
+            // not_zero: 0xFF where t > 0, 0 where t == 0
+            let not_zero = _mm256_cmpgt_epi8(t_biased, zero_biased);
+
+            // inc = absent & la (0 or 1) masked by excluded & not_zero (0x00 or 0xFF)
+            let inc = _mm256_and_si256(
+                _mm256_and_si256(absent, la),
+                _mm256_and_si256(excluded, not_zero),
+            );
+
+            // t + inc, clamped to max_state
+            let result = _mm256_min_epu8(_mm256_adds_epu8(t, inc), max_state_v);
+            _mm256_storeu_si256(ta.as_mut_ptr().add(l) as *mut __m256i, result);
+            l += 32;
+        }
+        // Scalar tail.
+        while l < n_literals {
+            let t = ta[l];
+            let la = active_b[l];
+            let absent = 1 - lit_b[l];
+            let excluded = (t < half) as u8;
+            let not_zero = (t > 0) as u8;
+            let inc = absent & excluded & not_zero & la;
+            ta[l] = t.saturating_add(inc).min(max_state);
+            l += 1;
+        }
     }
-
-    let mut l = 0usize;
-    while l + 32 <= n_literals {
-        // SAFETY: l + 32 <= n_literals, all reads in-bounds.
-        let t = load32!(ta, l);
-        let lit_v = load32!(lit_b, l);
-        let la = load32!(active_b, l);
-
-        let absent = _mm256_sub_epi8(ones, lit_v); // 1 - lit (0 or 1)
-        let t_biased = _mm256_xor_si256(t, bias);
-        // excluded: 0xFF where t < half, 0 elsewhere
-        let excluded = _mm256_cmpgt_epi8(half_biased, t_biased);
-        // not_zero: 0xFF where t > 0, 0 where t == 0
-        let not_zero = _mm256_cmpgt_epi8(t_biased, zero_biased);
-
-        // inc = absent & la (0 or 1) masked by excluded & not_zero (0x00 or 0xFF)
-        let inc = _mm256_and_si256(
-            _mm256_and_si256(absent, la),
-            _mm256_and_si256(excluded, not_zero),
-        );
-
-        // t + inc, clamped to max_state
-        let result = _mm256_min_epu8(_mm256_adds_epu8(t, inc), max_state_v);
-        _mm256_storeu_si256(ta.as_mut_ptr().add(l) as *mut __m256i, result);
-        l += 32;
-    }
-    // Scalar tail.
-    while l < n_literals {
-        let t = ta[l];
-        let la = active_b[l];
-        let absent = 1 - lit_b[l];
-        let excluded = (t < half) as u8;
-        let not_zero = (t > 0) as u8;
-        let inc = absent & excluded & not_zero & la;
-        ta[l] = t.saturating_add(inc).min(max_state);
-        l += 1;
-    }
-}}
+}
 
 /// Type Ia / Ib feedback for one clause from packed bit inputs (test helper).
 ///
@@ -889,6 +891,7 @@ pub(crate) fn first_false_literal(
 ///
 /// The AVX2 path expands 32 bits at a time to 32 byte lanes via `vpshufb` + bit isolation,
 /// then applies the same saturating arithmetic as [`type_iii_ind_bytes_avx2`].
+#[allow(clippy::too_many_arguments)]
 fn type_iii_ind_words(
     ind: &mut [u8],
     n_literals: usize,
@@ -903,14 +906,19 @@ fn type_iii_ind_words(
     {
         if is_x86_feature_detected!("avx2") {
             return unsafe {
-                type_iii_ind_words_avx2(ind, n_literals, lit_active, cat, lit, valid, do_inc, max_ind)
+                type_iii_ind_words_avx2(
+                    ind, n_literals, lit_active, cat, lit, valid, do_inc, max_ind,
+                )
             };
         }
     }
-    type_iii_ind_words_scalar(ind, n_literals, lit_active, cat, lit, valid, do_inc, max_ind);
+    type_iii_ind_words_scalar(
+        ind, n_literals, lit_active, cat, lit, valid, do_inc, max_ind,
+    );
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn type_iii_ind_words_scalar(
     ind: &mut [u8],
     n_literals: usize,
@@ -921,16 +929,20 @@ fn type_iii_ind_words_scalar(
     do_inc: bool,
     max_ind: u8,
 ) {
-    for l in 0..n_literals {
+    for (l, ind_l) in ind.iter_mut().enumerate().take(n_literals) {
         let w = l / WORD_BITS;
         let b = l % WORD_BITS;
         let active = (lit_active[w] >> b) & 1;
         let cat_b = (cat[w] >> b) & 1;
         let lit_b = (lit[w] >> b) & 1;
         let valid_b = (valid[w] >> b) & 1;
-        let inc = if do_inc { (active & cat_b & lit_b) as u8 } else { 0u8 };
+        let inc = if do_inc {
+            (active & cat_b & lit_b) as u8
+        } else {
+            0u8
+        };
         let dec = (active & (1 - cat_b) & lit_b & valid_b) as u8;
-        ind[l] = ind[l].saturating_add(inc).min(max_ind).saturating_sub(dec);
+        *ind_l = ind_l.saturating_add(inc).min(max_ind).saturating_sub(dec);
     }
 }
 
@@ -946,6 +958,7 @@ fn type_iii_ind_words_scalar(
 /// `ind` slice (loop guard: `l + 32 <= n_literals`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn type_iii_ind_words_avx2(
     ind: &mut [u8],
     n_literals: usize,
@@ -955,88 +968,116 @@ unsafe fn type_iii_ind_words_avx2(
     valid: &[u64],
     do_inc: bool,
     max_ind: u8,
-) { unsafe {
-    use std::arch::x86_64::*;
+) {
+    unsafe {
+        use std::arch::x86_64::*;
 
-    let max_ind_v = _mm256_set1_epi8(max_ind as i8);
-    let zero = _mm256_setzero_si256();
-    let ones_v = _mm256_set1_epi8(1i8);
+        let max_ind_v = _mm256_set1_epi8(max_ind as i8);
+        let zero = _mm256_setzero_si256();
+        let ones_v = _mm256_set1_epi8(1i8);
 
-    // Shuffle control: within each 128-bit lane, route source bytes so that
-    // output bytes 0-7 all hold source byte 0, bytes 8-15 hold byte 1, etc.
-    // _mm256_set_epi8 order: (e31, e30, ..., e1, e0) where e0 is byte 0.
-    let shuf = _mm256_set_epi8(
-        3, 3, 3, 3, 3, 3, 3, 3,
-        2, 2, 2, 2, 2, 2, 2, 2,
-        1, 1, 1, 1, 1, 1, 1, 1,
-        0, 0, 0, 0, 0, 0, 0, 0,
-    );
-    // Bit-isolation masks: lane i gets the mask for bit (i % 8).
-    let bit_masks = _mm256_set_epi8(
-        0x80u8 as i8, 0x40u8 as i8, 0x20u8 as i8, 0x10u8 as i8,
-        0x08u8 as i8, 0x04u8 as i8, 0x02u8 as i8, 0x01u8 as i8,
-        0x80u8 as i8, 0x40u8 as i8, 0x20u8 as i8, 0x10u8 as i8,
-        0x08u8 as i8, 0x04u8 as i8, 0x02u8 as i8, 0x01u8 as i8,
-        0x80u8 as i8, 0x40u8 as i8, 0x20u8 as i8, 0x10u8 as i8,
-        0x08u8 as i8, 0x04u8 as i8, 0x02u8 as i8, 0x01u8 as i8,
-        0x80u8 as i8, 0x40u8 as i8, 0x20u8 as i8, 0x10u8 as i8,
-        0x08u8 as i8, 0x04u8 as i8, 0x02u8 as i8, 0x01u8 as i8,
-    );
+        // Shuffle control: within each 128-bit lane, route source bytes so that
+        // output bytes 0-7 all hold source byte 0, bytes 8-15 hold byte 1, etc.
+        // _mm256_set_epi8 order: (e31, e30, ..., e1, e0) where e0 is byte 0.
+        let shuf = _mm256_set_epi8(
+            3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0,
+            0, 0, 0,
+        );
+        // Bit-isolation masks: lane i gets the mask for bit (i % 8).
+        let bit_masks = _mm256_set_epi8(
+            0x80u8 as i8,
+            0x40u8 as i8,
+            0x20u8 as i8,
+            0x10u8 as i8,
+            0x08u8 as i8,
+            0x04u8 as i8,
+            0x02u8 as i8,
+            0x01u8 as i8,
+            0x80u8 as i8,
+            0x40u8 as i8,
+            0x20u8 as i8,
+            0x10u8 as i8,
+            0x08u8 as i8,
+            0x04u8 as i8,
+            0x02u8 as i8,
+            0x01u8 as i8,
+            0x80u8 as i8,
+            0x40u8 as i8,
+            0x20u8 as i8,
+            0x10u8 as i8,
+            0x08u8 as i8,
+            0x04u8 as i8,
+            0x02u8 as i8,
+            0x01u8 as i8,
+            0x80u8 as i8,
+            0x40u8 as i8,
+            0x20u8 as i8,
+            0x10u8 as i8,
+            0x08u8 as i8,
+            0x04u8 as i8,
+            0x02u8 as i8,
+            0x01u8 as i8,
+        );
 
-    // Expand a u32 mask to a __m256i with 0x01 per set bit, 0x00 per clear bit.
-    macro_rules! bits32_to_vec {
-        ($bits:expr) => {{
-            let v = _mm256_set1_epi32($bits as i32);
-            let spread = _mm256_shuffle_epi8(v, shuf);
-            let masked = _mm256_and_si256(spread, bit_masks);
-            let is_zero = _mm256_cmpeq_epi8(masked, zero);
-            _mm256_andnot_si256(is_zero, ones_v)
-        }};
+        // Expand a u32 mask to a __m256i with 0x01 per set bit, 0x00 per clear bit.
+        macro_rules! bits32_to_vec {
+            ($bits:expr) => {{
+                let v = _mm256_set1_epi32($bits as i32);
+                let spread = _mm256_shuffle_epi8(v, shuf);
+                let masked = _mm256_and_si256(spread, bit_masks);
+                let is_zero = _mm256_cmpeq_epi8(masked, zero);
+                _mm256_andnot_si256(is_zero, ones_v)
+            }};
+        }
+
+        let mut l = 0usize;
+        while l + 32 <= n_literals {
+            let widx = l / WORD_BITS;
+            let boff = l % WORD_BITS; // 0 for the low half, 32 for the high half of each word.
+
+            let w_active = lit_active[widx];
+            let w_cat = cat[widx];
+            let w_lit = lit[widx];
+            let w_valid = valid[widx];
+
+            let inc_bits: u32 = if do_inc {
+                ((w_active & w_cat & w_lit) >> boff) as u32
+            } else {
+                0
+            };
+            let dec_bits: u32 = ((w_active & !w_cat & w_lit & w_valid) >> boff) as u32;
+
+            let inc_v = bits32_to_vec!(inc_bits);
+            let dec_v = bits32_to_vec!(dec_bits);
+
+            // SAFETY: l + 32 <= n_literals, all reads/writes in-bounds.
+            let ptr = ind.as_mut_ptr().add(l) as *mut __m256i;
+            let v = _mm256_loadu_si256(ptr as *const __m256i);
+            let incremented = _mm256_min_epu8(_mm256_adds_epu8(v, inc_v), max_ind_v);
+            let result = _mm256_subs_epu8(incremented, dec_v);
+            _mm256_storeu_si256(ptr, result);
+
+            l += 32;
+        }
+        // Scalar tail.
+        while l < n_literals {
+            let w = l / WORD_BITS;
+            let b = l % WORD_BITS;
+            let active = (lit_active[w] >> b) & 1;
+            let cat_b = (cat[w] >> b) & 1;
+            let lit_b_v = (lit[w] >> b) & 1;
+            let valid_b = (valid[w] >> b) & 1;
+            let inc = if do_inc {
+                (active & cat_b & lit_b_v) as u8
+            } else {
+                0u8
+            };
+            let dec = (active & (1 - cat_b) & lit_b_v & valid_b) as u8;
+            ind[l] = ind[l].saturating_add(inc).min(max_ind).saturating_sub(dec);
+            l += 1;
+        }
     }
-
-    let mut l = 0usize;
-    while l + 32 <= n_literals {
-        let widx = l / WORD_BITS;
-        let boff = l % WORD_BITS; // 0 for the low half, 32 for the high half of each word.
-
-        let w_active = lit_active[widx];
-        let w_cat = cat[widx];
-        let w_lit = lit[widx];
-        let w_valid = valid[widx];
-
-        let inc_bits: u32 = if do_inc {
-            ((w_active & w_cat & w_lit) >> boff) as u32
-        } else {
-            0
-        };
-        let dec_bits: u32 = ((w_active & !w_cat & w_lit & w_valid) >> boff) as u32;
-
-        let inc_v = bits32_to_vec!(inc_bits);
-        let dec_v = bits32_to_vec!(dec_bits);
-
-        // SAFETY: l + 32 <= n_literals, all reads/writes in-bounds.
-        let ptr = ind.as_mut_ptr().add(l) as *mut __m256i;
-        let v = _mm256_loadu_si256(ptr as *const __m256i);
-        let incremented = _mm256_min_epu8(_mm256_adds_epu8(v, inc_v), max_ind_v);
-        let result = _mm256_subs_epu8(incremented, dec_v);
-        _mm256_storeu_si256(ptr, result);
-
-        l += 32;
-    }
-    // Scalar tail.
-    while l < n_literals {
-        let w = l / WORD_BITS;
-        let b = l % WORD_BITS;
-        let active = (lit_active[w] >> b) & 1;
-        let cat_b = (cat[w] >> b) & 1;
-        let lit_b_v = (lit[w] >> b) & 1;
-        let valid_b = (valid[w] >> b) & 1;
-        let inc = if do_inc { (active & cat_b & lit_b_v) as u8 } else { 0u8 };
-        let dec = (active & (1 - cat_b) & lit_b_v & valid_b) as u8;
-        ind[l] = ind[l].saturating_add(inc).min(max_ind).saturating_sub(dec);
-        l += 1;
-    }
-}}
+}
 
 /// Fused [`type_iii_ind_words`] + [`type_iii_ta_dec_bytes`] in a single pass over `ind`.
 ///
@@ -1100,9 +1141,16 @@ fn type_iii_ind_words_and_ta_dec_scalar(
         let cat_b = (cat[w] >> b) & 1;
         let lit_bv = (lit[w] >> b) & 1;
         let valid_b = (valid[w] >> b) & 1;
-        let inc = if do_inc { (active & cat_b & lit_bv) as u8 } else { 0u8 };
+        let inc = if do_inc {
+            (active & cat_b & lit_bv) as u8
+        } else {
+            0u8
+        };
         let dec_ind = (active & (1 - cat_b) & lit_bv & valid_b) as u8;
-        let new_ind = ind[l].saturating_add(inc).min(max_ind).saturating_sub(dec_ind);
+        let new_ind = ind[l]
+            .saturating_add(inc)
+            .min(max_ind)
+            .saturating_sub(dec_ind);
         ind[l] = new_ind;
         ta[l] = ta[l].saturating_sub(active_b[l] & (new_ind < half_ind) as u8);
     }
@@ -1131,104 +1179,138 @@ unsafe fn type_iii_ind_words_and_ta_dec_avx2(
     do_inc: bool,
     max_ind: u8,
     half_ind: u8,
-) { unsafe {
-    use std::arch::x86_64::*;
+) {
+    unsafe {
+        use std::arch::x86_64::*;
 
-    let max_ind_v = _mm256_set1_epi8(max_ind as i8);
-    let zero = _mm256_setzero_si256();
-    let ones_v = _mm256_set1_epi8(1i8);
-    let bias = _mm256_set1_epi8(i8::MIN);
-    // `new_ind < half_ind` via unsigned-compare bias trick (identical to type_iii_ta_dec_bytes_avx2).
-    let half_biased = _mm256_set1_epi8((half_ind ^ 0x80) as i8);
+        let max_ind_v = _mm256_set1_epi8(max_ind as i8);
+        let zero = _mm256_setzero_si256();
+        let ones_v = _mm256_set1_epi8(1i8);
+        let bias = _mm256_set1_epi8(i8::MIN);
+        // `new_ind < half_ind` via unsigned-compare bias trick (identical to type_iii_ta_dec_bytes_avx2).
+        let half_biased = _mm256_set1_epi8((half_ind ^ 0x80) as i8);
 
-    let shuf = _mm256_set_epi8(
-        3, 3, 3, 3, 3, 3, 3, 3,
-        2, 2, 2, 2, 2, 2, 2, 2,
-        1, 1, 1, 1, 1, 1, 1, 1,
-        0, 0, 0, 0, 0, 0, 0, 0,
-    );
-    let bit_masks = _mm256_set_epi8(
-        0x80u8 as i8, 0x40u8 as i8, 0x20u8 as i8, 0x10u8 as i8,
-        0x08u8 as i8, 0x04u8 as i8, 0x02u8 as i8, 0x01u8 as i8,
-        0x80u8 as i8, 0x40u8 as i8, 0x20u8 as i8, 0x10u8 as i8,
-        0x08u8 as i8, 0x04u8 as i8, 0x02u8 as i8, 0x01u8 as i8,
-        0x80u8 as i8, 0x40u8 as i8, 0x20u8 as i8, 0x10u8 as i8,
-        0x08u8 as i8, 0x04u8 as i8, 0x02u8 as i8, 0x01u8 as i8,
-        0x80u8 as i8, 0x40u8 as i8, 0x20u8 as i8, 0x10u8 as i8,
-        0x08u8 as i8, 0x04u8 as i8, 0x02u8 as i8, 0x01u8 as i8,
-    );
-
-    macro_rules! bits32_to_vec {
-        ($bits:expr) => {{
-            let v = _mm256_set1_epi32($bits as i32);
-            let spread = _mm256_shuffle_epi8(v, shuf);
-            let masked = _mm256_and_si256(spread, bit_masks);
-            let is_zero = _mm256_cmpeq_epi8(masked, zero);
-            _mm256_andnot_si256(is_zero, ones_v)
-        }};
-    }
-
-    macro_rules! load32 {
-        ($slice:expr, $off:expr) => {
-            _mm256_loadu_si256($slice.as_ptr().add($off) as *const __m256i)
-        };
-    }
-
-    let mut l = 0usize;
-    while l + 32 <= n_literals {
-        let widx = l / WORD_BITS;
-        let boff = l % WORD_BITS;
-
-        let w_active = lit_active[widx];
-        let w_cat = cat[widx];
-        let w_lit = lit[widx];
-        let w_valid = valid[widx];
-
-        let inc_bits: u32 = if do_inc {
-            ((w_active & w_cat & w_lit) >> boff) as u32
-        } else {
-            0
-        };
-        let dec_bits: u32 = ((w_active & !w_cat & w_lit & w_valid) >> boff) as u32;
-
-        let inc_v = bits32_to_vec!(inc_bits);
-        let dec_v = bits32_to_vec!(dec_bits);
-
-        // Update ind.
-        let ind_ptr = ind.as_mut_ptr().add(l) as *mut __m256i;
-        let ind_v = _mm256_loadu_si256(ind_ptr as *const __m256i);
-        let new_ind = _mm256_subs_epu8(
-            _mm256_min_epu8(_mm256_adds_epu8(ind_v, inc_v), max_ind_v),
-            dec_v,
+        let shuf = _mm256_set_epi8(
+            3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0,
+            0, 0, 0,
         );
-        _mm256_storeu_si256(ind_ptr, new_ind);
+        let bit_masks = _mm256_set_epi8(
+            0x80u8 as i8,
+            0x40u8 as i8,
+            0x20u8 as i8,
+            0x10u8 as i8,
+            0x08u8 as i8,
+            0x04u8 as i8,
+            0x02u8 as i8,
+            0x01u8 as i8,
+            0x80u8 as i8,
+            0x40u8 as i8,
+            0x20u8 as i8,
+            0x10u8 as i8,
+            0x08u8 as i8,
+            0x04u8 as i8,
+            0x02u8 as i8,
+            0x01u8 as i8,
+            0x80u8 as i8,
+            0x40u8 as i8,
+            0x20u8 as i8,
+            0x10u8 as i8,
+            0x08u8 as i8,
+            0x04u8 as i8,
+            0x02u8 as i8,
+            0x01u8 as i8,
+            0x80u8 as i8,
+            0x40u8 as i8,
+            0x20u8 as i8,
+            0x10u8 as i8,
+            0x08u8 as i8,
+            0x04u8 as i8,
+            0x02u8 as i8,
+            0x01u8 as i8,
+        );
 
-        // Fused ta decrement: active_b[l] && new_ind < half_ind → decrement ta[l].
-        let active_v = load32!(active_b, l);
-        let biased_ind = _mm256_xor_si256(new_ind, bias);
-        let ind_lt_half = _mm256_cmpgt_epi8(half_biased, biased_ind);
-        let ta_dec = _mm256_and_si256(active_v, ind_lt_half);
-        let ta_ptr = ta.as_mut_ptr().add(l) as *mut __m256i;
-        _mm256_storeu_si256(ta_ptr, _mm256_subs_epu8(_mm256_loadu_si256(ta_ptr as *const __m256i), ta_dec));
+        macro_rules! bits32_to_vec {
+            ($bits:expr) => {{
+                let v = _mm256_set1_epi32($bits as i32);
+                let spread = _mm256_shuffle_epi8(v, shuf);
+                let masked = _mm256_and_si256(spread, bit_masks);
+                let is_zero = _mm256_cmpeq_epi8(masked, zero);
+                _mm256_andnot_si256(is_zero, ones_v)
+            }};
+        }
 
-        l += 32;
+        macro_rules! load32 {
+            ($slice:expr, $off:expr) => {
+                _mm256_loadu_si256($slice.as_ptr().add($off) as *const __m256i)
+            };
+        }
+
+        let mut l = 0usize;
+        while l + 32 <= n_literals {
+            let widx = l / WORD_BITS;
+            let boff = l % WORD_BITS;
+
+            let w_active = lit_active[widx];
+            let w_cat = cat[widx];
+            let w_lit = lit[widx];
+            let w_valid = valid[widx];
+
+            let inc_bits: u32 = if do_inc {
+                ((w_active & w_cat & w_lit) >> boff) as u32
+            } else {
+                0
+            };
+            let dec_bits: u32 = ((w_active & !w_cat & w_lit & w_valid) >> boff) as u32;
+
+            let inc_v = bits32_to_vec!(inc_bits);
+            let dec_v = bits32_to_vec!(dec_bits);
+
+            // Update ind.
+            let ind_ptr = ind.as_mut_ptr().add(l) as *mut __m256i;
+            let ind_v = _mm256_loadu_si256(ind_ptr as *const __m256i);
+            let new_ind = _mm256_subs_epu8(
+                _mm256_min_epu8(_mm256_adds_epu8(ind_v, inc_v), max_ind_v),
+                dec_v,
+            );
+            _mm256_storeu_si256(ind_ptr, new_ind);
+
+            // Fused ta decrement: active_b[l] && new_ind < half_ind → decrement ta[l].
+            let active_v = load32!(active_b, l);
+            let biased_ind = _mm256_xor_si256(new_ind, bias);
+            let ind_lt_half = _mm256_cmpgt_epi8(half_biased, biased_ind);
+            let ta_dec = _mm256_and_si256(active_v, ind_lt_half);
+            let ta_ptr = ta.as_mut_ptr().add(l) as *mut __m256i;
+            _mm256_storeu_si256(
+                ta_ptr,
+                _mm256_subs_epu8(_mm256_loadu_si256(ta_ptr as *const __m256i), ta_dec),
+            );
+
+            l += 32;
+        }
+        // Scalar tail.
+        while l < n_literals {
+            let w = l / WORD_BITS;
+            let b = l % WORD_BITS;
+            let active = (lit_active[w] >> b) & 1;
+            let cat_b = (cat[w] >> b) & 1;
+            let lit_bv = (lit[w] >> b) & 1;
+            let valid_b = (valid[w] >> b) & 1;
+            let inc = if do_inc {
+                (active & cat_b & lit_bv) as u8
+            } else {
+                0u8
+            };
+            let dec_ind = (active & (1 - cat_b) & lit_bv & valid_b) as u8;
+            let new_ind = ind[l]
+                .saturating_add(inc)
+                .min(max_ind)
+                .saturating_sub(dec_ind);
+            ind[l] = new_ind;
+            ta[l] = ta[l].saturating_sub(active_b[l] & (new_ind < half_ind) as u8);
+            l += 1;
+        }
     }
-    // Scalar tail.
-    while l < n_literals {
-        let w = l / WORD_BITS;
-        let b = l % WORD_BITS;
-        let active = (lit_active[w] >> b) & 1;
-        let cat_b = (cat[w] >> b) & 1;
-        let lit_bv = (lit[w] >> b) & 1;
-        let valid_b = (valid[w] >> b) & 1;
-        let inc = if do_inc { (active & cat_b & lit_bv) as u8 } else { 0u8 };
-        let dec_ind = (active & (1 - cat_b) & lit_bv & valid_b) as u8;
-        let new_ind = ind[l].saturating_add(inc).min(max_ind).saturating_sub(dec_ind);
-        ind[l] = new_ind;
-        ta[l] = ta[l].saturating_sub(active_b[l] & (new_ind < half_ind) as u8);
-        l += 1;
-    }
-}}
+}
 
 /// Decrement `ta[l]` by 1 (saturating) for each literal that is active and has `ind[l] < half_ind`.
 ///
@@ -1239,7 +1321,13 @@ unsafe fn type_iii_ind_words_and_ta_dec_avx2(
 ///
 /// **Scalar fallback**: branchless per-literal arithmetic.
 #[inline(always)]
-fn type_iii_ta_dec_bytes(ta: &mut [u8], ind: &[u8], n_literals: usize, active_b: &[u8], half_ind: u8) {
+fn type_iii_ta_dec_bytes(
+    ta: &mut [u8],
+    ind: &[u8],
+    n_literals: usize,
+    active_b: &[u8],
+    half_ind: u8,
+) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
@@ -1280,44 +1368,46 @@ unsafe fn type_iii_ta_dec_bytes_avx2(
     n_literals: usize,
     active_b: &[u8],
     half_ind: u8,
-) { unsafe {
-    use std::arch::x86_64::*;
+) {
+    unsafe {
+        use std::arch::x86_64::*;
 
-    let ones = _mm256_set1_epi8(1);
-    let bias = _mm256_set1_epi8(i8::MIN);
-    // ind < half_ind  ↔  (ind ^ 0x80) < (half_ind ^ 0x80)  as signed i8
-    //                 ↔  (half_ind ^ 0x80) > (ind ^ 0x80)   [cmpgt argument order]
-    let half_biased = _mm256_set1_epi8((half_ind ^ 0x80) as i8);
+        let ones = _mm256_set1_epi8(1);
+        let bias = _mm256_set1_epi8(i8::MIN);
+        // ind < half_ind  ↔  (ind ^ 0x80) < (half_ind ^ 0x80)  as signed i8
+        //                 ↔  (half_ind ^ 0x80) > (ind ^ 0x80)   [cmpgt argument order]
+        let half_biased = _mm256_set1_epi8((half_ind ^ 0x80) as i8);
 
-    macro_rules! load32 {
-        ($slice:expr, $off:expr) => {
-            _mm256_loadu_si256($slice.as_ptr().add($off) as *const __m256i)
-        };
+        macro_rules! load32 {
+            ($slice:expr, $off:expr) => {
+                _mm256_loadu_si256($slice.as_ptr().add($off) as *const __m256i)
+            };
+        }
+
+        let mut l = 0usize;
+        while l + 32 <= n_literals {
+            // SAFETY: l + 32 <= n_literals, all reads in-bounds.
+            let t = load32!(ta, l);
+            let ind_v = load32!(ind, l);
+            let active = load32!(active_b, l);
+
+            let ind_biased = _mm256_xor_si256(ind_v, bias);
+            // below_half: 0xFF where ind < half_ind, 0x00 elsewhere
+            let below_half = _mm256_cmpgt_epi8(half_biased, ind_biased);
+            // dec: 0 or 1 per literal  (active_b is 0/1; below_half is 0/0xFF → mask to 0/1 via `& ones`)
+            let dec = _mm256_and_si256(active, _mm256_and_si256(below_half, ones));
+            let result = _mm256_subs_epu8(t, dec);
+            _mm256_storeu_si256(ta.as_mut_ptr().add(l) as *mut __m256i, result);
+            l += 32;
+        }
+        // Scalar tail.
+        while l < n_literals {
+            let dec = active_b[l] & (ind[l] < half_ind) as u8;
+            ta[l] = ta[l].saturating_sub(dec);
+            l += 1;
+        }
     }
-
-    let mut l = 0usize;
-    while l + 32 <= n_literals {
-        // SAFETY: l + 32 <= n_literals, all reads in-bounds.
-        let t = load32!(ta, l);
-        let ind_v = load32!(ind, l);
-        let active = load32!(active_b, l);
-
-        let ind_biased = _mm256_xor_si256(ind_v, bias);
-        // below_half: 0xFF where ind < half_ind, 0x00 elsewhere
-        let below_half = _mm256_cmpgt_epi8(half_biased, ind_biased);
-        // dec: 0 or 1 per literal  (active_b is 0/1; below_half is 0/0xFF → mask to 0/1 via `& ones`)
-        let dec = _mm256_and_si256(active, _mm256_and_si256(below_half, ones));
-        let result = _mm256_subs_epu8(t, dec);
-        _mm256_storeu_si256(ta.as_mut_ptr().add(l) as *mut __m256i, result);
-        l += 32;
-    }
-    // Scalar tail.
-    while l < n_literals {
-        let dec = active_b[l] & (ind[l] < half_ind) as u8;
-        ta[l] = ta[l].saturating_sub(dec);
-        l += 1;
-    }
-}}
+}
 
 /// Apply Type III TA feedback to one clause — mirrors TMU's `cb_type_iii_feedback`.
 ///
@@ -1390,7 +1480,9 @@ pub(crate) fn type_iii_update(
         }
 
         // update_p check failed: still update ind (and cat), but skip ta decrement.
-        type_iii_ind_words(ind, n_literals, lit_active, cat, lit, valid, do_inc, max_ind);
+        type_iii_ind_words(
+            ind, n_literals, lit_active, cat, lit, valid, do_inc, max_ind,
+        );
         for k in 0..words {
             cat[k] = if target { !cat[k] & valid[k] } else { valid[k] };
         }
@@ -1480,7 +1572,15 @@ mod tests {
         let (old_ta, old_ind, old_cat) = (ta.clone(), ind.clone(), cat.clone());
 
         let (new_nl, new_words) = grow_dense_state(
-            n_clauses, old_nf, new_nf, half, &mut ta, &mut include, &mut ind, &mut cat, &mut valid,
+            n_clauses,
+            old_nf,
+            new_nf,
+            half,
+            &mut ta,
+            &mut include,
+            &mut ind,
+            &mut cat,
+            &mut valid,
         );
         assert_eq!(new_nl, 2 * new_nf);
         assert_eq!(new_words, words_for(2 * new_nf));
@@ -1491,8 +1591,16 @@ mod tests {
 
         for j in 0..n_clauses {
             for l in 0..old_nl {
-                assert_eq!(ta[j * new_nl + remap(l)], old_ta[j * old_nl + l], "ta j={j} l={l}");
-                assert_eq!(ind[j * new_nl + remap(l)], old_ind[j * old_nl + l], "ind j={j} l={l}");
+                assert_eq!(
+                    ta[j * new_nl + remap(l)],
+                    old_ta[j * old_nl + l],
+                    "ta j={j} l={l}"
+                );
+                assert_eq!(
+                    ind[j * new_nl + remap(l)],
+                    old_ind[j * old_nl + l],
+                    "ind j={j} l={l}"
+                );
             }
             for l in 0..new_nl {
                 if !is_old_slot(l) {
@@ -1501,7 +1609,11 @@ mod tests {
                 }
                 // include consistent with ta everywhere.
                 let inc_bit = include[j * new_words + l / WORD_BITS] >> (l % WORD_BITS) & 1;
-                assert_eq!(inc_bit == 1, ta[j * new_nl + l] >= half, "include j={j} l={l}");
+                assert_eq!(
+                    inc_bit == 1,
+                    ta[j * new_nl + l] >= half,
+                    "include j={j} l={l}"
+                );
                 // cat bits appear exactly at remapped positions.
                 let cat_bit = cat[j * new_words + l / WORD_BITS] >> (l % WORD_BITS) & 1;
                 let expected = if is_old_slot(l) {
@@ -1522,7 +1634,10 @@ mod tests {
         // include padding bits above new_nl are zero.
         for j in 0..n_clauses {
             for l in new_nl..new_words * WORD_BITS {
-                assert_eq!(include[j * new_words + l / WORD_BITS] >> (l % WORD_BITS) & 1, 0);
+                assert_eq!(
+                    include[j * new_words + l / WORD_BITS] >> (l % WORD_BITS) & 1,
+                    0
+                );
             }
         }
     }
@@ -1730,7 +1845,10 @@ mod tests {
         let lit = vec![0b0111u64]; // bit 0 present
         let valid = vec![0xFu64];
         let lit_active = vec![!0u64];
-        assert_eq!(first_false_literal(&inc, &lit, &valid, &lit_active, words), None);
+        assert_eq!(
+            first_false_literal(&inc, &lit, &valid, &lit_active, words),
+            None
+        );
     }
 
     #[test]
@@ -1756,7 +1874,10 @@ mod tests {
         let lit = vec![0b0001u64];
         let valid = vec![0xFu64];
         let lit_active = vec![0b0001u64]; // only bit 0 active; bit 2 inactive
-        assert_eq!(first_false_literal(&inc, &lit, &valid, &lit_active, words), None);
+        assert_eq!(
+            first_false_literal(&inc, &lit, &valid, &lit_active, words),
+            None
+        );
     }
 
     // ---- type_iii_update ----------------------------------------------------
@@ -1770,22 +1891,37 @@ mod tests {
         let mut ta = vec![0u8; n_literals];
         let mut ind = vec![0u8; n_literals];
         let mut cat = vec![0u64; words]; // cat starts all-zero
-        let inc = vec![0u64; words];     // empty clause always fires
-        let lit = vec![0b0011u64];       // bits 0 and 1 present
+        let inc = vec![0u64; words]; // empty clause always fires
+        let lit = vec![0b0011u64]; // bits 0 and 1 present
         let lit_active = vec![!0u64];
         let mut rng = crate::rng::Rng::new(42);
 
         let active_b = expand_bits_to_bytes(&lit_active, n_literals);
         type_iii_update(
-            &mut ta, &mut ind, &mut cat, &inc,
-            &lit, &valid, &lit_active, &active_b,
-            words, n_literals,
-            200.0, 0.0, // update_p=0: TA decrement never fires
-            true, &mut rng, 128, 255,
+            &mut ta,
+            &mut ind,
+            &mut cat,
+            &inc,
+            &lit,
+            &valid,
+            &lit_active,
+            &active_b,
+            words,
+            n_literals,
+            200.0,
+            0.0, // update_p=0: TA decrement never fires
+            true,
+            &mut rng,
+            128,
+            255,
         );
 
         // cat was 0; target=true → cat = ~0 & 0xF = 0xF
-        assert_eq!(cat[0] & 0xF, 0xF, "cat should be bitwise-NOT of original (all-valid)");
+        assert_eq!(
+            cat[0] & 0xF,
+            0xF,
+            "cat should be bitwise-NOT of original (all-valid)"
+        );
     }
 
     #[test]
@@ -1804,10 +1940,22 @@ mod tests {
 
         let active_b = expand_bits_to_bytes(&lit_active, n_literals);
         type_iii_update(
-            &mut ta, &mut ind, &mut cat, &inc,
-            &lit, &valid, &lit_active, &active_b,
-            words, n_literals,
-            200.0, 0.0, false, &mut rng, 128, 255,
+            &mut ta,
+            &mut ind,
+            &mut cat,
+            &inc,
+            &lit,
+            &valid,
+            &lit_active,
+            &active_b,
+            words,
+            n_literals,
+            200.0,
+            0.0,
+            false,
+            &mut rng,
+            128,
+            255,
         );
 
         // non-target fire → cat = valid = 0xF
@@ -1833,10 +1981,22 @@ mod tests {
 
         let active_b = expand_bits_to_bytes(&lit_active, n_literals);
         type_iii_update(
-            &mut ta, &mut ind, &mut cat, &inc,
-            &lit, &valid, &lit_active, &active_b,
-            words, n_literals,
-            200.0, 0.0, true, &mut rng, 128, 255,
+            &mut ta,
+            &mut ind,
+            &mut cat,
+            &inc,
+            &lit,
+            &valid,
+            &lit_active,
+            &active_b,
+            words,
+            n_literals,
+            200.0,
+            0.0,
+            true,
+            &mut rng,
+            128,
+            255,
         );
 
         // bit 0 was blocking and cat[0] was 0 → cat bit 0 should be set
@@ -1861,11 +2021,22 @@ mod tests {
 
         let active_b = expand_bits_to_bytes(&lit_active, n_literals);
         let changed = type_iii_update(
-            &mut ta, &mut ind, &mut cat, &inc,
-            &lit, &valid, &lit_active, &active_b,
-            words, n_literals,
-            200.0, 1.0, // update_p=1: always decrement
-            false, &mut rng, 4, 7,
+            &mut ta,
+            &mut ind,
+            &mut cat,
+            &inc,
+            &lit,
+            &valid,
+            &lit_active,
+            &active_b,
+            words,
+            n_literals,
+            200.0,
+            1.0, // update_p=1: always decrement
+            false,
+            &mut rng,
+            4,
+            7,
         );
 
         assert!(changed, "TA state should have been modified");

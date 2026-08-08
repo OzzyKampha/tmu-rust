@@ -22,7 +22,9 @@ fn make_xor(n: usize, seed: u64) -> (Vec<Vec<u8>>, Vec<usize>) {
     let mut xs = Vec::with_capacity(n);
     let mut ys = Vec::with_capacity(n);
     for _ in 0..n {
-        let f: Vec<u8> = (0..N_FEATURES).map(|_| (rng.next_u64() & 1) as u8).collect();
+        let f: Vec<u8> = (0..N_FEATURES)
+            .map(|_| (rng.next_u64() & 1) as u8)
+            .collect();
         let y = (f[0] ^ f[1]) as usize;
         xs.push(f);
         ys.push(y);
@@ -39,7 +41,13 @@ fn render(rule: &[(usize, bool)]) -> String {
         return "(empty — clause always fires)".to_string();
     }
     rule.iter()
-        .map(|&(f, neg)| if neg { format!("¬x{f}") } else { format!("x{f}") })
+        .map(|&(f, neg)| {
+            if neg {
+                format!("¬x{f}")
+            } else {
+                format!("x{f}")
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ∧ ")
 }
@@ -76,19 +84,17 @@ fn main() {
     let bte = enc.encode_batch(&as_slices(&xte));
 
     // --- Baseline: no Type III ---
-    let mut base = TsetlinMachine::with_config(
-        2, N_FEATURES, CLAUSES, THRESHOLD, S, MAX_STATE, true, 42,
-    );
+    let mut base =
+        TsetlinMachine::with_config(2, N_FEATURES, CLAUSES, THRESHOLD, S, MAX_STATE, true, 42);
     for _ in 0..EPOCHS {
         base.fit_epoch(&btr, &ytr);
     }
     let base_acc = base.accuracy(&bte, &yte);
 
     // --- Type III: d = 200 ---
-    let mut t3 = TsetlinMachine::with_config(
-        2, N_FEATURES, CLAUSES, THRESHOLD, S, MAX_STATE, true, 42,
-    )
-    .type_iii_feedback(200.0);
+    let mut t3 =
+        TsetlinMachine::with_config(2, N_FEATURES, CLAUSES, THRESHOLD, S, MAX_STATE, true, 42)
+            .type_iii_feedback(200.0);
     for _ in 0..EPOCHS {
         t3.fit_epoch(&btr, &ytr);
     }
@@ -98,10 +104,16 @@ fn main() {
     print_rules(&base);
 
     println!();
-    println!("=== With Type III d=200  (acc = {:.1}%) ===", t3_acc * 100.0);
+    println!(
+        "=== With Type III d=200  (acc = {:.1}%) ===",
+        t3_acc * 100.0
+    );
     print_rules(&t3);
 
     println!();
     println!("XOR uses only x0 and x1.  Type III should yield clauses with fewer");
-    println!("spurious features (x2..x{}) while maintaining accuracy.", N_FEATURES - 1);
+    println!(
+        "spurious features (x2..x{}) while maintaining accuracy.",
+        N_FEATURES - 1
+    );
 }

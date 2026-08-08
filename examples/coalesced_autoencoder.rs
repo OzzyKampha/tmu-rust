@@ -91,7 +91,9 @@ fn main() {
     let show_clauses = 6.min(N_CLAUSES);
     let show_outputs = 10.min(N_FEATURES);
 
-    println!("\nSigned weight matrix (first {show_clauses} shared clauses × first {show_outputs} outputs):");
+    println!(
+        "\nSigned weight matrix (first {show_clauses} shared clauses × first {show_outputs} outputs):"
+    );
     print!("{:>8}", "clause");
     for o in 0..show_outputs {
         print!("{:>6}", format!("out{o}"));

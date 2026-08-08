@@ -688,8 +688,14 @@ mod tests {
         let c = &b.clauses[0];
         // Positive index 1 unchanged; negated indices shifted by (7 - 4) = 3.
         assert!(c.included.contains(&1), "positive index must be unchanged");
-        assert!(c.included.contains(&(6 + 3)), "negated index must shift by 3");
-        assert!(c.unallocated.contains(&(5 + 3)), "unallocated negated index must shift");
+        assert!(
+            c.included.contains(&(6 + 3)),
+            "negated index must shift by 3"
+        );
+        assert!(
+            c.unallocated.contains(&(5 + 3)),
+            "unallocated negated index must shift"
+        );
         // New literals present as just-excluded: new positives 4,5,6 and new
         // negateds 7+4..14 = 11,12,13.
         for l in [4u32, 5, 6, 11, 12, 13] {

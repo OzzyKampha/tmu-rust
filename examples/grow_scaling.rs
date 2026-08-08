@@ -33,7 +33,9 @@ fn make_xor(n: usize, noise: f64, seed: u64) -> (Vec<Vec<u8>>, Vec<usize>) {
     let mut xs = Vec::with_capacity(n);
     let mut ys = Vec::with_capacity(n);
     for _ in 0..n {
-        let f: Vec<u8> = (0..BASE_FEATURES).map(|_| (rng.next_u64() & 1) as u8).collect();
+        let f: Vec<u8> = (0..BASE_FEATURES)
+            .map(|_| (rng.next_u64() & 1) as u8)
+            .collect();
         let mut y = (f[0] ^ f[1]) as usize;
         if rng.next_f64() <= noise {
             y = 1 - y;
@@ -110,17 +112,36 @@ fn main() {
     let e = Encoder::for_binary(BASE_FEATURES);
     let btr = e.encode_batch(&as_slices(&xtr));
 
-    let mut dense =
-        TsetlinMachine::with_config(N_CLASSES, BASE_FEATURES, CLAUSES_PER_CLASS, 20, 3.9, 8, true, 7);
-    let mut sparse =
-        TMSparseClassifier::with_config(N_CLASSES, BASE_FEATURES, CLAUSES_PER_CLASS, 20, 3.9, 8, true, 7)
-            .max_included_literals(8);
+    let mut dense = TsetlinMachine::with_config(
+        N_CLASSES,
+        BASE_FEATURES,
+        CLAUSES_PER_CLASS,
+        20,
+        3.9,
+        8,
+        true,
+        7,
+    );
+    let mut sparse = TMSparseClassifier::with_config(
+        N_CLASSES,
+        BASE_FEATURES,
+        CLAUSES_PER_CLASS,
+        20,
+        3.9,
+        8,
+        true,
+        7,
+    )
+    .max_included_literals(8);
     for _ in 0..20 {
         dense.fit_epoch(&btr, &ytr);
         sparse.fit_epoch(&btr, &ytr);
     }
-    println!("trained base models (dense acc {:.3}, sparse acc {:.3})\n",
-        dense.accuracy(&btr, &ytr), sparse.accuracy(&btr, &ytr));
+    println!(
+        "trained base models (dense acc {:.3}, sparse acc {:.3})\n",
+        dense.accuracy(&btr, &ytr),
+        sparse.accuracy(&btr, &ytr)
+    );
 
     println!(
         "{:>9} | {:>7} {:>11} {:>9} | {:>7} {:>11} {:>9}",
@@ -159,9 +180,15 @@ fn main() {
             * (1.0 - sparse.absorbed_exclude_fraction());
         let sparse_mem = (tracked * 5.0) as usize;
 
-        let d_grow = dense_grow_ms.map(|g| format!("{g:.0}ms")).unwrap_or("—".into());
-        let d_inf = dense_eps.map(|e| format!("{}/s", (e as u64))).unwrap_or("too big".into());
-        let d_mem = dense_mem.map(human_bytes).unwrap_or_else(|| human_bytes(dense_bytes(size)) + "*");
+        let d_grow = dense_grow_ms
+            .map(|g| format!("{g:.0}ms"))
+            .unwrap_or("—".into());
+        let d_inf = dense_eps
+            .map(|e| format!("{}/s", (e as u64)))
+            .unwrap_or("too big".into());
+        let d_mem = dense_mem
+            .map(human_bytes)
+            .unwrap_or_else(|| human_bytes(dense_bytes(size)) + "*");
         println!(
             "{:>9} | {:>7} {:>11} {:>9} | {:>7} {:>11} {:>9}",
             size,
@@ -173,7 +200,11 @@ fn main() {
             human_bytes(sparse_mem),
         );
     }
-    println!("\n* dense memory past {DENSE_LIMIT} features is the estimate it *would* need (not allocated).");
-    println!("  s.mem is freshly-grown (untrained) sparse state; absorbing actions shrink it as training converges.");
+    println!(
+        "\n* dense memory past {DENSE_LIMIT} features is the estimate it *would* need (not allocated)."
+    );
+    println!(
+        "  s.mem is freshly-grown (untrained) sparse state; absorbing actions shrink it as training converges."
+    );
     println!("Compare the two runs (scalar vs --features parallel) to see the Rayon effect.");
 }

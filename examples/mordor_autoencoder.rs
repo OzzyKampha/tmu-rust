@@ -202,8 +202,7 @@ fn file_path_tokens(path: &str) -> Vec<String> {
 fn cmd_tokens(cmdline: &str) -> Vec<String> {
     cmdline
         .split(|c: char| {
-            c.is_whitespace()
-                || matches!(c, ',' | ';' | '|' | '&' | '(' | ')' | '"' | '\'' | '`')
+            c.is_whitespace() || matches!(c, ',' | ';' | '|' | '&' | '(' | ')' | '"' | '\'' | '`')
         })
         .map(|tok| tok.to_lowercase())
         .filter(|tok| tok.len() >= 3 && !tok.chars().all(|c| c.is_ascii_hexdigit()))
@@ -437,11 +436,7 @@ fn per_feature_error(
 
 // ── run one autoencoder experiment ────────────────────────────────────────────
 
-fn run_vanilla(
-    encoder: &Encoder,
-    train: &[Vec<String>],
-    test: &[(Vec<String>, usize)],
-) {
+fn run_vanilla(encoder: &Encoder, train: &[Vec<String>], test: &[(Vec<String>, usize)]) {
     println!("\n━━━ TMAutoEncoder ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
     let nf = encoder.n_features();
@@ -511,7 +506,11 @@ fn run_vanilla(
     }
 
     let mean = |v: &[f64]| -> f64 {
-        if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 }
+        if v.is_empty() {
+            0.0
+        } else {
+            v.iter().sum::<f64>() / v.len() as f64
+        }
     };
 
     println!("\nper-tactic reconstruction error (higher = more unusual):");
@@ -561,14 +560,8 @@ fn run_vanilla(
     }
 }
 
-fn run_coalesced(
-    encoder: &Encoder,
-    train: &[Vec<String>],
-    test: &[(Vec<String>, usize)],
-) {
-    println!(
-        "\n━━━ TMCoalescedAutoEncoder ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    );
+fn run_coalesced(encoder: &Encoder, train: &[Vec<String>], test: &[(Vec<String>, usize)]) {
+    println!("\n━━━ TMCoalescedAutoEncoder ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
 
     let nf = encoder.n_features();
     let n_clauses = 40;
@@ -635,7 +628,11 @@ fn run_coalesced(
     }
 
     let mean = |v: &[f64]| -> f64 {
-        if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 }
+        if v.is_empty() {
+            0.0
+        } else {
+            v.iter().sum::<f64>() / v.len() as f64
+        }
     };
 
     println!("\nper-tactic reconstruction error (higher = more unusual):");
@@ -736,7 +733,10 @@ fn main() {
         .take(MAX_VOCAB)
         .map(|(t, _)| t.clone())
         .collect();
-    println!("top-{MAX_VOCAB} vocabulary tokens selected (raw vocab: {})", freq_vec.len());
+    println!(
+        "top-{MAX_VOCAB} vocabulary tokens selected (raw vocab: {})",
+        freq_vec.len()
+    );
 
     let filter_tokens = |tokens: &[String]| -> Vec<String> {
         tokens
@@ -746,10 +746,8 @@ fn main() {
             .collect()
     };
 
-    let train_filtered: Vec<Vec<String>> = train_events
-        .iter()
-        .map(|(t, _)| filter_tokens(t))
-        .collect();
+    let train_filtered: Vec<Vec<String>> =
+        train_events.iter().map(|(t, _)| filter_tokens(t)).collect();
     let test_filtered: Vec<(Vec<String>, usize)> = test_events
         .iter()
         .map(|(t, idx)| (filter_tokens(t), *idx))

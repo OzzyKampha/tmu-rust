@@ -5,11 +5,11 @@
 //! from [`crate::CoalescedTsetlinMachine`].
 
 #[cfg(feature = "parallel")]
-use crate::clause_bank::dense::{use_parallel, DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN};
+use crate::clause_bank::dense::{DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN, use_parallel};
 use crate::clause_bank::dense::{
-    bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, rebuild_include,
-    type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for, GOLDEN, MASK_BITS,
-    WORD_BITS,
+    GOLDEN, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of, expand_bits_to_bytes,
+    fire_predict, rebuild_include, type_i_update_bytes, type_ii_update_bytes, type_iii_update,
+    words_for,
 };
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
@@ -24,6 +24,12 @@ use crate::rng::Rng;
 ///
 /// Feature masking is applied during training: when updating output bit `o`, literals `o`
 /// and `o + n_features` are excluded from the active set to prevent trivial self-prediction.
+///
+/// Each shared clause also carries a per-sample confidence gate (mirroring TMU's
+/// `update_clause` mechanism): as a clause's average `|weight|` across all outputs
+/// approaches `threshold`, it becomes progressively less likely to receive further
+/// feedback that sample. This protects clauses that have already specialised from
+/// being repeatedly pulled in conflicting directions by other outputs' training signal.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TMCoalescedAutoEncoder {
@@ -63,6 +69,11 @@ pub struct TMCoalescedAutoEncoder {
     cat: Vec<u64>,
     d: f64,
     type_iii: bool,
+
+    /// RNG stream for the per-sample confidence-based clause gate (see
+    /// [`Self::confidence_gate`]). Kept separate from `rngs`/`output_rngs` so this
+    /// gate's draws don't perturb the per-clause feedback sequence.
+    clause_gate_rng: Rng,
 
     literals: Vec<u64>,
     rng: Rng,
@@ -221,6 +232,7 @@ impl TMCoalescedAutoEncoder {
             .collect();
 
         let literal_rng = Rng::new(seed ^ 0x4C49_5445_5241_4C21u64);
+        let clause_gate_rng = Rng::new(seed ^ 0x434C_4155_5345_4754u64); // "CLAUSEGT"
 
         TMCoalescedAutoEncoder {
             n_features,
@@ -249,6 +261,7 @@ impl TMCoalescedAutoEncoder {
             cat: vec![0u64; n_clauses * words],
             d: 200.0,
             type_iii: false,
+            clause_gate_rng,
             literals: vec![0u64; words],
             rng,
         }
@@ -393,14 +406,17 @@ impl TMCoalescedAutoEncoder {
     /// Update all shared clauses for output `o`.
     ///
     /// `clause_outputs[j]` must already be computed (under the output-`o` feature mask)
-    /// before this call.  Clause dropout and Bernoulli inv/keep masks are drawn from
-    /// `output_rngs[o]`.
+    /// before this call.  `update_clause[j]` is the per-sample confidence gate (see
+    /// [`Self::confidence_gate`]), shared across every output for this sample.  Clause
+    /// dropout and Bernoulli inv/keep masks are drawn from `output_rngs[o]`.
+    #[allow(clippy::too_many_arguments)]
     fn update_output_coalesced(
         &mut self,
         o: usize,
         target: u8,
         sum: i32,
         clause_outputs: &[bool],
+        update_clause: &[bool],
         lit_b: &[u8],
         active_b: &[u8],
         lit: &[u64],
@@ -442,10 +458,13 @@ impl TMCoalescedAutoEncoder {
         let val = valid.as_slice();
         let orng = &mut output_rngs[o];
 
+        // Empty means "all active" (checked via `is_empty()` below) — matches the
+        // `drop_mask` convention in vanilla_autoencoder.rs so the default (no dropout)
+        // path allocates nothing instead of materialising an all-true Vec every call.
         let clause_active: Vec<bool> = if drop_p > 0.0 {
             (0..nc).map(|_| orng.next_f64() >= drop_p).collect()
         } else {
-            vec![true; nc]
+            Vec::new()
         };
 
         let inv_mask: Vec<u64> = (0..words).map(|_| bmask_word(orng, dig_inv)).collect();
@@ -467,18 +486,50 @@ impl TMCoalescedAutoEncoder {
                     .zip(cat.par_chunks_mut(words))
                     .enumerate()
                     .for_each(|(j, (((((ta_j, inc_j), w), rng), ind_j), cat_j))| {
+                        let active_j =
+                            (clause_active.is_empty() || clause_active[j]) && update_clause[j];
                         apply_one_clause_coalesced(
-                            ta_j, inc_j, w, rng, target, p, clause_outputs[j], clause_active[j],
-                            val, words, lit_b, &inv_b, &keep_b, active_b, n_literals, boost,
-                            max_inc, half, max_state,
+                            ta_j,
+                            inc_j,
+                            w,
+                            rng,
+                            target,
+                            p,
+                            clause_outputs[j],
+                            active_j,
+                            val,
+                            words,
+                            lit_b,
+                            &inv_b,
+                            &keep_b,
+                            active_b,
+                            n_literals,
+                            boost,
+                            max_inc,
+                            half,
+                            max_state,
                         );
-                        if clause_active[j] {
-                            if type_iii_update(
-                                ta_j, ind_j, cat_j, inc_j, lit, val, lit_active, active_b, words, n_literals,
-                                d_val, p, target_bool, rng, half, max_state,
-                            ) {
-                                rebuild_include(ta_j, inc_j, val, words, n_literals, half);
-                            }
+                        if active_j
+                            && type_iii_update(
+                                ta_j,
+                                ind_j,
+                                cat_j,
+                                inc_j,
+                                lit,
+                                val,
+                                lit_active,
+                                active_b,
+                                words,
+                                n_literals,
+                                d_val,
+                                p,
+                                target_bool,
+                                rng,
+                                half,
+                                max_state,
+                            )
+                        {
+                            rebuild_include(ta_j, inc_j, val, words, n_literals, half);
                         }
                     });
             } else {
@@ -488,10 +539,28 @@ impl TMCoalescedAutoEncoder {
                     .zip(rngs.par_iter_mut())
                     .enumerate()
                     .for_each(|(j, (((ta_j, inc_j), w), rng))| {
+                        let active_j =
+                            (clause_active.is_empty() || clause_active[j]) && update_clause[j];
                         apply_one_clause_coalesced(
-                            ta_j, inc_j, w, rng, target, p, clause_outputs[j], clause_active[j],
-                            val, words, lit_b, &inv_b, &keep_b, active_b, n_literals, boost,
-                            max_inc, half, max_state,
+                            ta_j,
+                            inc_j,
+                            w,
+                            rng,
+                            target,
+                            p,
+                            clause_outputs[j],
+                            active_j,
+                            val,
+                            words,
+                            lit_b,
+                            &inv_b,
+                            &keep_b,
+                            active_b,
+                            n_literals,
+                            boost,
+                            max_inc,
+                            half,
+                            max_state,
                         );
                     });
             }
@@ -499,6 +568,7 @@ impl TMCoalescedAutoEncoder {
         }
 
         for j in 0..nc {
+            let active_j = (clause_active.is_empty() || clause_active[j]) && update_clause[j];
             apply_one_clause_coalesced(
                 &mut ta[j * n_literals..(j + 1) * n_literals],
                 &mut include[j * words..(j + 1) * words],
@@ -507,7 +577,7 @@ impl TMCoalescedAutoEncoder {
                 target,
                 p,
                 clause_outputs[j],
-                clause_active[j],
+                active_j,
                 val,
                 words,
                 lit_b,
@@ -520,8 +590,9 @@ impl TMCoalescedAutoEncoder {
                 half,
                 max_state,
             );
-            if type_iii_en && clause_active[j] {
-                if type_iii_update(
+            if type_iii_en
+                && active_j
+                && type_iii_update(
                     &mut ta[j * n_literals..(j + 1) * n_literals],
                     &mut ind[j * n_literals..(j + 1) * n_literals],
                     &mut cat[j * words..(j + 1) * words],
@@ -538,17 +609,39 @@ impl TMCoalescedAutoEncoder {
                     &mut rngs[j],
                     half,
                     max_state,
-                ) {
-                    rebuild_include(
-                        &ta[j * n_literals..(j + 1) * n_literals],
-                        &mut include[j * words..(j + 1) * words],
-                        val,
-                        words,
-                        n_literals,
-                        half,
-                    );
-                }
+                )
+            {
+                rebuild_include(
+                    &ta[j * n_literals..(j + 1) * n_literals],
+                    &mut include[j * words..(j + 1) * words],
+                    val,
+                    words,
+                    n_literals,
+                    half,
+                );
             }
+        }
+    }
+
+    /// Confidence-based clause gate (ported from TMU's `update_clause`): for each shared
+    /// clause, average `|weight|` across all outputs, then draw a Bernoulli with
+    /// probability `(threshold - avg_abs_weight) / threshold`. A clause with high average
+    /// magnitude (confident/specialised across outputs) becomes progressively less likely
+    /// to receive further feedback this sample; a fresh, unspecialised clause stays highly
+    /// eligible. Writes into `out`, sized `n_clauses`, reused across samples by the caller.
+    fn confidence_gate(&mut self, out: &mut [bool]) {
+        debug_assert_eq!(out.len(), self.n_clauses);
+        let nc = self.n_clauses;
+        let n_features = self.n_features;
+        let t = self.threshold as f64;
+        for (j, slot) in out.iter_mut().enumerate() {
+            let mut avg_abs = 0.0f64;
+            for o in 0..n_features {
+                avg_abs += (self.weights[o * nc + j] as f64).abs();
+            }
+            avg_abs /= n_features as f64;
+            let p_update = (t - avg_abs.min(t)) / t;
+            *slot = self.clause_gate_rng.next_f64() < p_update;
         }
     }
 
@@ -572,6 +665,15 @@ impl TMCoalescedAutoEncoder {
         };
         let mut active_b = expand_bits_to_bytes(&lit_active, n_literals);
 
+        // Reused across every output below — was reallocated per output (n_features
+        // times per sample) before; now allocated once per sample.
+        let mut clause_outputs = vec![false; nc];
+
+        // Confidence gate is drawn once per sample and shared by every output's
+        // update this round (matches TMU's `update_clause` timing).
+        let mut update_clause = vec![true; nc];
+        self.confidence_gate(&mut update_clause);
+
         for o in 0..n_features {
             let target = ((lit[o / WORD_BITS] >> (o % WORD_BITS)) & 1) as u8;
 
@@ -588,23 +690,21 @@ impl TMCoalescedAutoEncoder {
             active_b[o] = 0;
             active_b[neg_o] = 0;
 
-            // Compute clause fires under this output's feature mask.
-            let clause_outputs: Vec<bool> = {
+            // Compute clause fires under this output's feature mask (into the reused buffer).
+            {
                 let include = self.include.as_slice();
                 let valid = self.valid.as_slice();
                 let litv = self.literals.as_slice();
-                (0..nc)
-                    .map(|j| {
-                        clause_fire(
-                            &include[j * words..(j + 1) * words],
-                            litv,
-                            valid,
-                            words,
-                            &lit_active,
-                        )
-                    })
-                    .collect()
-            };
+                for (j, out) in clause_outputs.iter_mut().enumerate() {
+                    *out = clause_fire(
+                        &include[j * words..(j + 1) * words],
+                        litv,
+                        valid,
+                        words,
+                        &lit_active,
+                    );
+                }
+            }
 
             // Weighted sum (no clause dropout — matches vanilla AE convention).
             let sum = {
@@ -618,7 +718,17 @@ impl TMCoalescedAutoEncoder {
                 s.clamp(-self.threshold, self.threshold)
             };
 
-            self.update_output_coalesced(o, target, sum, &clause_outputs, &lit_b, &active_b, lit, &lit_active);
+            self.update_output_coalesced(
+                o,
+                target,
+                sum,
+                &clause_outputs,
+                &update_clause,
+                &lit_b,
+                &active_b,
+                lit,
+                &lit_active,
+            );
 
             // Restore feature mask for the next output's iteration.
             lit_active[word_o] = save_word_o;
@@ -923,8 +1033,7 @@ mod tests {
     #[test]
     fn type_iii_d_must_be_greater_than_one() {
         let result = std::panic::catch_unwind(|| {
-            TMCoalescedAutoEncoder::with_config(12, 10, 10, 3.0, 8, true, 42)
-                .type_iii_feedback(0.5)
+            TMCoalescedAutoEncoder::with_config(12, 10, 10, 3.0, 8, true, 42).type_iii_feedback(0.5)
         });
         assert!(result.is_err(), "expected panic for d <= 1.0");
     }

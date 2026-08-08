@@ -247,10 +247,10 @@ impl Encoder {
                         if !vocab.contains_key(token) {
                             new_tokens.insert(token.to_string());
                         }
-                        if let Some(col) = token.split("::").next() {
-                            if !known_columns.contains_key(col) {
-                                new_cols.insert(col.to_string());
-                            }
+                        if let Some(col) = token.split("::").next()
+                            && !known_columns.contains_key(col)
+                        {
+                            new_cols.insert(col.to_string());
                         }
                     }
                 }
@@ -365,9 +365,7 @@ impl Encoder {
             } => {
                 // Looked up rather than assumed last: extend_categorical appends
                 // new tokens after the "<OOV>" sentinel.
-                let oov_idx = *vocab
-                    .get("<OOV>")
-                    .expect("categorical vocab missing <OOV>");
+                let oov_idx = *vocab.get("<OOV>").expect("categorical vocab missing <OOV>");
                 let mut bin = vec![0u8; self.n_features];
                 for &token in tokens {
                     let idx = if let Some(&i) = vocab.get(token) {
@@ -460,8 +458,9 @@ mod grow_tests {
     fn extend_categorical_keeps_indices_stable() {
         let mut e = fit_ab();
         let before_n = e.n_features();
-        let before_tokens: Vec<String> =
-            (0..before_n).map(|i| e.vocab_token(i).to_string()).collect();
+        let before_tokens: Vec<String> = (0..before_n)
+            .map(|i| e.vocab_token(i).to_string())
+            .collect();
 
         // Two new tokens in known columns plus one new column (adds its UNK too).
         let n1: Vec<&str> = vec!["proc::rundll32.exe", "user::carol", "host::web01"];
@@ -509,7 +508,11 @@ mod grow_tests {
 
         let n1: Vec<&str> = vec!["proc::rundll32.exe"];
         e.extend_categorical(&[n1.as_slice()]);
-        assert_ne!(oov_idx, e.n_features() - 1, "<OOV> should no longer be last");
+        assert_ne!(
+            oov_idx,
+            e.n_features() - 1,
+            "<OOV> should no longer be last"
+        );
 
         // A token with an unknown column still maps to the original OOV index.
         let s = e.encode_one_categorical(&["zzz"]);

@@ -13,7 +13,7 @@
 //! Optional arg: number of epochs (default 40).
 
 use std::time::Instant;
-use tmu_rs::{data, Encoder, TsetlinMachine};
+use tmu_rs::{Encoder, TsetlinMachine, data};
 
 const N_FEATURES: usize = 5000; // must match scripts/prepare_imdb.py
 

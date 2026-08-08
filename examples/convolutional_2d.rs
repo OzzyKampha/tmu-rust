@@ -64,7 +64,9 @@ fn main() {
          patch={PATCH_ROWS}×{PATCH_COLS}, stride={STRIDE}, {n_patches} patches"
     );
     println!("  {CLAUSES} clauses/class, T={THRESHOLD}, s={S}");
-    println!("Pattern: x[0,0] XOR x[1,0]  (vertical XOR, signal at patch (0,0); patches (0,1),(0,2) = noise)");
+    println!(
+        "Pattern: x[0,0] XOR x[1,0]  (vertical XOR, signal at patch (0,0); patches (0,1),(0,2) = noise)"
+    );
     println!("(shared data: data/cmp_conv2d_*.bin — identical to Python side)");
     println!("{:>5}  {:>10}  {:>10}", "epoch", "train acc", "test acc");
 

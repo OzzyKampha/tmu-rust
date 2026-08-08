@@ -5,9 +5,9 @@
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::DENSE_TRAIN_PARALLEL_MIN;
 use crate::clause_bank::dense::{
-    bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, rebuild_include,
-    type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for, GOLDEN, MASK_BITS,
-    WORD_BITS,
+    GOLDEN, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of, expand_bits_to_bytes,
+    fire_predict, rebuild_include, type_i_update_bytes, type_ii_update_bytes, type_iii_update,
+    words_for,
 };
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
@@ -420,17 +420,50 @@ impl TMRegressor {
                     .enumerate()
                     .for_each(|(j, (((((ta_j, inc_j), w), rng_j), ind_j), cat_j))| {
                         apply_one_clause(
-                            j, ta_j, inc_j, w, rng_j, push_up, update_p, &drop_mask, lit, val,
-                            &lit_active, words, &lit_b, &inv_b, &keep_b, &active_b, n_literals,
-                            boost, wmax, max_inc, half, max_state,
+                            j,
+                            ta_j,
+                            inc_j,
+                            w,
+                            rng_j,
+                            push_up,
+                            update_p,
+                            &drop_mask,
+                            lit,
+                            val,
+                            &lit_active,
+                            words,
+                            &lit_b,
+                            &inv_b,
+                            &keep_b,
+                            &active_b,
+                            n_literals,
+                            boost,
+                            wmax,
+                            max_inc,
+                            half,
+                            max_state,
                         );
-                        if drop_mask.is_empty() || !drop_mask[j] {
-                            if type_iii_update(
-                                ta_j, ind_j, cat_j, inc_j, lit, val, &lit_active, &active_b, words,
-                                n_literals, d_val, update_p, target_bool, rng_j, half, max_state,
-                            ) {
-                                rebuild_include(ta_j, inc_j, val, words, n_literals, half);
-                            }
+                        if (drop_mask.is_empty() || !drop_mask[j])
+                            && type_iii_update(
+                                ta_j,
+                                ind_j,
+                                cat_j,
+                                inc_j,
+                                lit,
+                                val,
+                                &lit_active,
+                                &active_b,
+                                words,
+                                n_literals,
+                                d_val,
+                                update_p,
+                                target_bool,
+                                rng_j,
+                                half,
+                                max_state,
+                            )
+                        {
+                            rebuild_include(ta_j, inc_j, val, words, n_literals, half);
                         }
                     });
             } else {
@@ -441,9 +474,28 @@ impl TMRegressor {
                     .enumerate()
                     .for_each(|(j, (((ta_j, inc_j), w), rng_j))| {
                         apply_one_clause(
-                            j, ta_j, inc_j, w, rng_j, push_up, update_p, &drop_mask, lit, val,
-                            &lit_active, words, &lit_b, &inv_b, &keep_b, &active_b, n_literals,
-                            boost, wmax, max_inc, half, max_state,
+                            j,
+                            ta_j,
+                            inc_j,
+                            w,
+                            rng_j,
+                            push_up,
+                            update_p,
+                            &drop_mask,
+                            lit,
+                            val,
+                            &lit_active,
+                            words,
+                            &lit_b,
+                            &inv_b,
+                            &keep_b,
+                            &active_b,
+                            n_literals,
+                            boost,
+                            wmax,
+                            max_inc,
+                            half,
+                            max_state,
                         );
                     });
             }
@@ -475,8 +527,9 @@ impl TMRegressor {
                 half,
                 max_state,
             );
-            if type_iii_en && (drop_mask.is_empty() || !drop_mask[j]) {
-                if type_iii_update(
+            if type_iii_en
+                && (drop_mask.is_empty() || !drop_mask[j])
+                && type_iii_update(
                     &mut ta[j * n_literals..(j + 1) * n_literals],
                     &mut ind[j * n_literals..(j + 1) * n_literals],
                     &mut cat[j * words..(j + 1) * words],
@@ -493,16 +546,16 @@ impl TMRegressor {
                     &mut rngs[j],
                     half,
                     max_state,
-                ) {
-                    rebuild_include(
-                        &ta[j * n_literals..(j + 1) * n_literals],
-                        &mut include[j * words..(j + 1) * words],
-                        val,
-                        words,
-                        n_literals,
-                        half,
-                    );
-                }
+                )
+            {
+                rebuild_include(
+                    &ta[j * n_literals..(j + 1) * n_literals],
+                    &mut include[j * words..(j + 1) * words],
+                    val,
+                    words,
+                    n_literals,
+                    half,
+                );
             }
         }
     }
@@ -707,8 +760,7 @@ mod tests {
 
     #[test]
     fn type_iii_constructs_without_panic() {
-        let _tm = TMRegressor::with_config(10, 20, 100, 3.0, 8, true, 42)
-            .type_iii_feedback(200.0);
+        let _tm = TMRegressor::with_config(10, 20, 100, 3.0, 8, true, 42).type_iii_feedback(200.0);
     }
 
     #[test]
@@ -725,8 +777,8 @@ mod tests {
         let enc = Encoder::for_binary(10);
         let rows: Vec<&[u8]> = xs.iter().map(|v| v.as_slice()).collect();
         let batch = enc.encode_batch(&rows);
-        let mut tm = TMRegressor::with_config(10, 40, 100, 3.0, 8, true, 42)
-            .type_iii_feedback(200.0);
+        let mut tm =
+            TMRegressor::with_config(10, 40, 100, 3.0, 8, true, 42).type_iii_feedback(200.0);
         for _ in 0..5 {
             tm.fit_epoch(&batch, &ys);
         }
