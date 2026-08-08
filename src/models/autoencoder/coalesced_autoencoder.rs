@@ -5,11 +5,11 @@
 //! from [`crate::CoalescedTsetlinMachine`].
 
 #[cfg(feature = "parallel")]
-use crate::clause_bank::dense::{use_parallel, DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN};
+use crate::clause_bank::dense::{DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN, use_parallel};
 use crate::clause_bank::dense::{
-    bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, rebuild_include,
-    type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for, GOLDEN, MASK_BITS,
-    WORD_BITS,
+    GOLDEN, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of, expand_bits_to_bytes,
+    fire_predict, rebuild_include, type_i_update_bytes, type_ii_update_bytes, type_iii_update,
+    words_for,
 };
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
@@ -409,6 +409,7 @@ impl TMCoalescedAutoEncoder {
     /// before this call.  `update_clause[j]` is the per-sample confidence gate (see
     /// [`Self::confidence_gate`]), shared across every output for this sample.  Clause
     /// dropout and Bernoulli inv/keep masks are drawn from `output_rngs[o]`.
+    #[allow(clippy::too_many_arguments)]
     fn update_output_coalesced(
         &mut self,
         o: usize,
@@ -488,17 +489,47 @@ impl TMCoalescedAutoEncoder {
                         let active_j =
                             (clause_active.is_empty() || clause_active[j]) && update_clause[j];
                         apply_one_clause_coalesced(
-                            ta_j, inc_j, w, rng, target, p, clause_outputs[j], active_j,
-                            val, words, lit_b, &inv_b, &keep_b, active_b, n_literals, boost,
-                            max_inc, half, max_state,
+                            ta_j,
+                            inc_j,
+                            w,
+                            rng,
+                            target,
+                            p,
+                            clause_outputs[j],
+                            active_j,
+                            val,
+                            words,
+                            lit_b,
+                            &inv_b,
+                            &keep_b,
+                            active_b,
+                            n_literals,
+                            boost,
+                            max_inc,
+                            half,
+                            max_state,
                         );
-                        if active_j {
-                            if type_iii_update(
-                                ta_j, ind_j, cat_j, inc_j, lit, val, lit_active, active_b, words, n_literals,
-                                d_val, p, target_bool, rng, half, max_state,
-                            ) {
-                                rebuild_include(ta_j, inc_j, val, words, n_literals, half);
-                            }
+                        if active_j
+                            && type_iii_update(
+                                ta_j,
+                                ind_j,
+                                cat_j,
+                                inc_j,
+                                lit,
+                                val,
+                                lit_active,
+                                active_b,
+                                words,
+                                n_literals,
+                                d_val,
+                                p,
+                                target_bool,
+                                rng,
+                                half,
+                                max_state,
+                            )
+                        {
+                            rebuild_include(ta_j, inc_j, val, words, n_literals, half);
                         }
                     });
             } else {
@@ -511,9 +542,25 @@ impl TMCoalescedAutoEncoder {
                         let active_j =
                             (clause_active.is_empty() || clause_active[j]) && update_clause[j];
                         apply_one_clause_coalesced(
-                            ta_j, inc_j, w, rng, target, p, clause_outputs[j], active_j,
-                            val, words, lit_b, &inv_b, &keep_b, active_b, n_literals, boost,
-                            max_inc, half, max_state,
+                            ta_j,
+                            inc_j,
+                            w,
+                            rng,
+                            target,
+                            p,
+                            clause_outputs[j],
+                            active_j,
+                            val,
+                            words,
+                            lit_b,
+                            &inv_b,
+                            &keep_b,
+                            active_b,
+                            n_literals,
+                            boost,
+                            max_inc,
+                            half,
+                            max_state,
                         );
                     });
             }
@@ -543,8 +590,9 @@ impl TMCoalescedAutoEncoder {
                 half,
                 max_state,
             );
-            if type_iii_en && active_j {
-                if type_iii_update(
+            if type_iii_en
+                && active_j
+                && type_iii_update(
                     &mut ta[j * n_literals..(j + 1) * n_literals],
                     &mut ind[j * n_literals..(j + 1) * n_literals],
                     &mut cat[j * words..(j + 1) * words],
@@ -561,16 +609,16 @@ impl TMCoalescedAutoEncoder {
                     &mut rngs[j],
                     half,
                     max_state,
-                ) {
-                    rebuild_include(
-                        &ta[j * n_literals..(j + 1) * n_literals],
-                        &mut include[j * words..(j + 1) * words],
-                        val,
-                        words,
-                        n_literals,
-                        half,
-                    );
-                }
+                )
+            {
+                rebuild_include(
+                    &ta[j * n_literals..(j + 1) * n_literals],
+                    &mut include[j * words..(j + 1) * words],
+                    val,
+                    words,
+                    n_literals,
+                    half,
+                );
             }
         }
     }
@@ -985,8 +1033,7 @@ mod tests {
     #[test]
     fn type_iii_d_must_be_greater_than_one() {
         let result = std::panic::catch_unwind(|| {
-            TMCoalescedAutoEncoder::with_config(12, 10, 10, 3.0, 8, true, 42)
-                .type_iii_feedback(0.5)
+            TMCoalescedAutoEncoder::with_config(12, 10, 10, 3.0, 8, true, 42).type_iii_feedback(0.5)
         });
         assert!(result.is_err(), "expected panic for d <= 1.0");
     }

@@ -14,13 +14,19 @@
 //!
 //! Optional args: <epochs> <seeds> (defaults 40 5).
 
-use tmu_rs::{data, Encoder, Rng, TsetlinMachine};
+use tmu_rs::{Encoder, Rng, TsetlinMachine, data};
 
 fn split_encode(
     xs: &[Vec<f64>],
     ys: &[usize],
     seed: u64,
-) -> (Encoder, tmu_rs::EncodedBatch, Vec<usize>, tmu_rs::EncodedBatch, Vec<usize>) {
+) -> (
+    Encoder,
+    tmu_rs::EncodedBatch,
+    Vec<usize>,
+    tmu_rs::EncodedBatch,
+    Vec<usize>,
+) {
     let mut idx: Vec<usize> = (0..xs.len()).collect();
     let mut rng = Rng::new(seed);
     for i in (1..idx.len()).rev() {
@@ -55,9 +61,18 @@ fn main() {
     #[cfg(not(feature = "parallel"))]
     let mode = "SCALAR (data-parallel falls back to exact)".to_string();
 
-    println!("Breast Cancer — {} samples, {} features, {n_classes} classes [{mode}]", xs.len(), xs[0].len());
-    println!("exact fit_epoch  vs  fit_epoch + data_parallel(true), {epochs} epochs, {seeds} seeds\n");
-    println!("  {:>4} | {:>12} | {:>12} | {:>7}", "seed", "exact test", "DP test", "gap");
+    println!(
+        "Breast Cancer — {} samples, {} features, {n_classes} classes [{mode}]",
+        xs.len(),
+        xs[0].len()
+    );
+    println!(
+        "exact fit_epoch  vs  fit_epoch + data_parallel(true), {epochs} epochs, {seeds} seeds\n"
+    );
+    println!(
+        "  {:>4} | {:>12} | {:>12} | {:>7}",
+        "seed", "exact test", "DP test", "gap"
+    );
     println!("  {}", "-".repeat(46));
 
     let (mut sum_exact, mut sum_dp) = (0.0f64, 0.0f64);
@@ -69,8 +84,8 @@ fn main() {
         // Both call fit_epoch; only the data_parallel flag differs (exact vs
         // approximate data-parallel). Same config + seed otherwise.
         let mut exact = TsetlinMachine::with_config(n_classes, nf, 300, 100, 5.0, 8, true, 7);
-        let mut dp =
-            TsetlinMachine::with_config(n_classes, nf, 300, 100, 5.0, 8, true, 7).data_parallel(true);
+        let mut dp = TsetlinMachine::with_config(n_classes, nf, 300, 100, 5.0, 8, true, 7)
+            .data_parallel(true);
         for _ in 0..epochs {
             exact.fit_epoch(&btr, &ytr);
             dp.fit_epoch(&btr, &ytr);
@@ -84,7 +99,11 @@ fn main() {
 
     let (me, md) = (sum_exact / seeds as f64, sum_dp / seeds as f64);
     println!("  {}", "-".repeat(46));
-    println!("  {:>4} | {me:>11.4} | {md:>11.4} | {:>+7.4}", "mean", md - me);
+    println!(
+        "  {:>4} | {me:>11.4} | {md:>11.4} | {:>+7.4}",
+        "mean",
+        md - me
+    );
     println!(
         "\nData-parallel mean test accuracy is {:+.2} pts vs exact.",
         (md - me) * 100.0

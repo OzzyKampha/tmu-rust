@@ -8,7 +8,7 @@
 //!
 //! Optional arg: number of epochs (default 25).
 
-use tmu_rs::{data, Encoder, Rng, TsetlinMachine};
+use tmu_rs::{Encoder, Rng, TsetlinMachine, data};
 
 /// Load the Breast Cancer CSV, booleanize numeric features, and train a TM with 80/20 split.
 fn main() {

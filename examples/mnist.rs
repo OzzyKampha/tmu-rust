@@ -17,7 +17,7 @@
 
 use std::io::Write;
 use std::time::Instant;
-use tmu_rs::{data, Encoder, TsetlinMachine};
+use tmu_rs::{Encoder, TsetlinMachine, data};
 
 /// Load binarized MNIST, encode it once, and run the training loop reporting per-epoch accuracy and throughput.
 fn main() {

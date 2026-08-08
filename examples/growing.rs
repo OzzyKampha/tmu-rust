@@ -93,10 +93,18 @@ fn triage(enc: &Encoder, tm: &TsetlinMachine, tokens: &[&str], truth: usize) {
     let s = enc.encode_one_categorical(tokens);
     let mut scores = [0i32; 2];
     tm.scores(&s, &mut scores);
-    let verdict = if tm.predict(&s) == MAL { "MALICIOUS" } else { "BENIGN   " };
+    let verdict = if tm.predict(&s) == MAL {
+        "MALICIOUS"
+    } else {
+        "BENIGN   "
+    };
     let margin = scores[MAL] - scores[1 - MAL];
     let truth_s = if truth == MAL { "malicious" } else { "benign" };
-    let hit = if tm.predict(&s) == truth { "✓" } else { "✗ MISS" };
+    let hit = if tm.predict(&s) == truth {
+        "✓"
+    } else {
+        "✗ MISS"
+    };
     println!(
         "  [{verdict}] margin {margin:+5}  (truth: {truth_s:<9}) {hit}   {}",
         tokens.join(", ")
@@ -131,7 +139,10 @@ fn print_detection_logic(enc: &Encoder, tm: &TsetlinMachine, top_n: usize) {
             })
             .collect::<Vec<_>>()
             .join(" ∧ ");
-        println!("    flag malicious when:  {body}   (weight {})", tm.clause_weight(MAL, j));
+        println!(
+            "    flag malicious when:  {body}   (weight {})",
+            tm.clause_weight(MAL, j)
+        );
         shown += 1;
         if shown >= top_n {
             break;
@@ -184,9 +195,15 @@ fn main() {
     let train0_secs = t_train0.elapsed().as_secs_f64();
 
     let acc_a_before = tm.accuracy(&encode(&enc, &xa_te), &ya_te);
-    println!("Day 0 — trained on known tooling ({} vocab features)", enc.n_features());
+    println!(
+        "Day 0 — trained on known tooling ({} vocab features)",
+        enc.n_features()
+    );
     println!("  detection accuracy on known tooling: {acc_a_before:.3}");
-    println!("  initial training: {:.0} ms for 4k events × 20 epochs\n", train0_secs * 1e3);
+    println!(
+        "  initial training: {:.0} ms for 4k events × 20 epochs\n",
+        train0_secs * 1e3
+    );
 
     println!("  what the detector learned to flag:");
     print_detection_logic(&enc, &tm, 6);
@@ -197,9 +214,24 @@ fn main() {
 
     println!("\nDay N — new tooling observed in the wild (never seen in training).");
     println!("  live triage BEFORE growing (all new binaries collapse into proc::<UNK>):");
-    triage(&enc, &tm, &["proc::certutil.exe", "parent::services.exe", "user::bob"], MAL);
-    triage(&enc, &tm, &["proc::rundll32.exe", "parent::services.exe", "user::alice"], MAL);
-    triage(&enc, &tm, &["proc::outlook.exe", "parent::explorer.exe", "user::carol"], 0);
+    triage(
+        &enc,
+        &tm,
+        &["proc::certutil.exe", "parent::services.exe", "user::bob"],
+        MAL,
+    );
+    triage(
+        &enc,
+        &tm,
+        &["proc::rundll32.exe", "parent::services.exe", "user::alice"],
+        MAL,
+    );
+    triage(
+        &enc,
+        &tm,
+        &["proc::outlook.exe", "parent::explorer.exe", "user::carol"],
+        0,
+    );
     let acc_b_ungrown = tm.accuracy(&encode(&enc, &xb_te), &yb_te);
     println!("  accuracy on new tooling before growing: {acc_b_ungrown:.3}  (≈ coin flip — blind)");
 
@@ -236,12 +268,32 @@ fn main() {
 
     let acc_a_final = tm.accuracy(&encode(&enc, &xa_te), &ya_te);
     let acc_b_final = tm.accuracy(&encode(&enc, &xb_te), &yb_te);
-    println!("\n  fine-tuned on new tooling in {:.0} ms (vs. a full retrain from scratch).", ft_secs * 1e3);
+    println!(
+        "\n  fine-tuned on new tooling in {:.0} ms (vs. a full retrain from scratch).",
+        ft_secs * 1e3
+    );
     println!("  live triage AFTER growing + fine-tune:");
-    triage(&enc, &tm, &["proc::certutil.exe", "parent::services.exe", "user::bob"], MAL);
-    triage(&enc, &tm, &["proc::rundll32.exe", "parent::services.exe", "user::alice"], MAL);
-    triage(&enc, &tm, &["proc::outlook.exe", "parent::explorer.exe", "user::carol"], 0);
-    println!("  detection accuracy — known tooling: {acc_a_final:.3}   new tooling: {acc_b_final:.3}");
+    triage(
+        &enc,
+        &tm,
+        &["proc::certutil.exe", "parent::services.exe", "user::bob"],
+        MAL,
+    );
+    triage(
+        &enc,
+        &tm,
+        &["proc::rundll32.exe", "parent::services.exe", "user::alice"],
+        MAL,
+    );
+    triage(
+        &enc,
+        &tm,
+        &["proc::outlook.exe", "parent::explorer.exe", "user::carol"],
+        0,
+    );
+    println!(
+        "  detection accuracy — known tooling: {acc_a_final:.3}   new tooling: {acc_b_final:.3}"
+    );
 
     println!("\n  what the detector flags now (old rules survive, new rules added):");
     print_detection_logic(&enc, &tm, 8);
@@ -261,10 +313,22 @@ fn main() {
     let infer_secs = t_infer.elapsed().as_secs_f64();
     let eps = xbench.len() as f64 / infer_secs;
     let correct = preds.iter().zip(&ybench).filter(|(p, y)| p == y).count();
-    println!("\nThroughput — classified {} events in {:.1} ms", xbench.len(), infer_secs * 1e3);
-    println!("  {eps:.0} events/sec   ({:.3} accuracy on the mixed stream)", correct as f64 / xbench.len() as f64);
+    println!(
+        "\nThroughput — classified {} events in {:.1} ms",
+        xbench.len(),
+        infer_secs * 1e3
+    );
+    println!(
+        "  {eps:.0} events/sec   ({:.3} accuracy on the mixed stream)",
+        correct as f64 / xbench.len() as f64
+    );
 
-    assert!(acc_a_final > 0.95, "known-tooling detection degraded: {acc_a_final}");
+    assert!(
+        acc_a_final > 0.95,
+        "known-tooling detection degraded: {acc_a_final}"
+    );
     assert!(acc_b_final > 0.95, "new tooling not learned: {acc_b_final}");
-    println!("\n✓ Detector learned new adversary tooling with zero forgetting of prior detections.");
+    println!(
+        "\n✓ Detector learned new adversary tooling with zero forgetting of prior detections."
+    );
 }

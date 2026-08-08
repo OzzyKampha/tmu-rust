@@ -3,11 +3,11 @@
 //! Mirrors TMU's `vanilla_autoencoder.py` / `TMAutoEncoder`.
 
 #[cfg(feature = "parallel")]
-use crate::clause_bank::dense::{use_parallel, DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN};
+use crate::clause_bank::dense::{DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN, use_parallel};
 use crate::clause_bank::dense::{
-    bmask_word, clause_fire, digits_of, expand_bits_to_bytes, fire_predict, rebuild_include,
-    type_i_update_bytes, type_ii_update_bytes, type_iii_update, words_for, GOLDEN, MASK_BITS,
-    WORD_BITS,
+    GOLDEN, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of, expand_bits_to_bytes,
+    fire_predict, rebuild_include, type_i_update_bytes, type_ii_update_bytes, type_iii_update,
+    words_for,
 };
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
@@ -382,7 +382,14 @@ impl TMAutoEncoder {
         let include = self.include.as_slice();
         let valid = self.valid.as_slice();
         (0..cpo)
-            .filter(|&j| fire_predict(&include[(output * cpo + j) * words..(output * cpo + j + 1) * words], lit, valid, words))
+            .filter(|&j| {
+                fire_predict(
+                    &include[(output * cpo + j) * words..(output * cpo + j + 1) * words],
+                    lit,
+                    valid,
+                    words,
+                )
+            })
             .collect()
     }
 
@@ -499,13 +506,27 @@ impl TMAutoEncoder {
                             words, lit_b, &inv_b, &keep_b, active_b, n_literals, boost, wmax,
                             max_inc, half, max_state,
                         );
-                        if drop_mask.is_empty() || !drop_mask[j] {
-                            if type_iii_update(
-                                ta_o, ind_o, cat_o, inc_o, lit, val, lit_active, active_b, words, n_literals,
-                                d_val, p, target_bool, rng, half, max_state,
-                            ) {
-                                rebuild_include(ta_o, inc_o, val, words, n_literals, half);
-                            }
+                        if (drop_mask.is_empty() || !drop_mask[j])
+                            && type_iii_update(
+                                ta_o,
+                                ind_o,
+                                cat_o,
+                                inc_o,
+                                lit,
+                                val,
+                                lit_active,
+                                active_b,
+                                words,
+                                n_literals,
+                                d_val,
+                                p,
+                                target_bool,
+                                rng,
+                                half,
+                                max_state,
+                            )
+                        {
+                            rebuild_include(ta_o, inc_o, val, words, n_literals, half);
                         }
                     });
             } else {
@@ -551,8 +572,9 @@ impl TMAutoEncoder {
                 half,
                 max_state,
             );
-            if type_iii_en && (drop_mask.is_empty() || !drop_mask[j]) {
-                if type_iii_update(
+            if type_iii_en
+                && (drop_mask.is_empty() || !drop_mask[j])
+                && type_iii_update(
                     &mut out_ta[j * n_literals..(j + 1) * n_literals],
                     &mut out_ind[j * n_literals..(j + 1) * n_literals],
                     &mut out_cat[j * words..(j + 1) * words],
@@ -569,16 +591,16 @@ impl TMAutoEncoder {
                     &mut out_rng[j],
                     half,
                     max_state,
-                ) {
-                    rebuild_include(
-                        &out_ta[j * n_literals..(j + 1) * n_literals],
-                        &mut out_inc[j * words..(j + 1) * words],
-                        val,
-                        words,
-                        n_literals,
-                        half,
-                    );
-                }
+                )
+            {
+                rebuild_include(
+                    &out_ta[j * n_literals..(j + 1) * n_literals],
+                    &mut out_inc[j * words..(j + 1) * words],
+                    val,
+                    words,
+                    n_literals,
+                    half,
+                );
             }
         }
     }
@@ -1205,8 +1227,7 @@ mod tests {
 
     #[test]
     fn type_iii_constructs_without_panic() {
-        let _ae = TMAutoEncoder::with_config(12, 20, 15, 3.9, 8, true, 42)
-            .type_iii_feedback(200.0);
+        let _ae = TMAutoEncoder::with_config(12, 20, 15, 3.9, 8, true, 42).type_iii_feedback(200.0);
     }
 
     #[test]
@@ -1222,8 +1243,8 @@ mod tests {
         let xs = make_bits(300, 7);
         let e = enc(12);
         let batch = e.encode_batch(&as_slices(&xs));
-        let mut ae = TMAutoEncoder::with_config(12, 20, 15, 3.9, 8, true, 42)
-            .type_iii_feedback(200.0);
+        let mut ae =
+            TMAutoEncoder::with_config(12, 20, 15, 3.9, 8, true, 42).type_iii_feedback(200.0);
         for _ in 0..5 {
             ae.fit_epoch(&batch);
         }

@@ -33,7 +33,9 @@ fn make(n: usize, n_features: usize, seed: u64) -> (Vec<Vec<u8>>, Vec<usize>) {
     let mut xs = Vec::with_capacity(n);
     let mut ys = Vec::with_capacity(n);
     for _ in 0..n {
-        let f: Vec<u8> = (0..n_features).map(|_| (rng.next_u64() & 1) as u8).collect();
+        let f: Vec<u8> = (0..n_features)
+            .map(|_| (rng.next_u64() & 1) as u8)
+            .collect();
         ys.push((f[0] ^ f[1]) as usize);
         xs.push(f);
     }
@@ -46,19 +48,34 @@ fn as_slices(xs: &[Vec<u8>]) -> Vec<&[u8]> {
 
 /// Median ms/epoch of `fit_epoch` over TIMED epochs (after WARMUP), for a freshly
 /// built classifier of the given kind at (features, clauses/class).
-fn time_epoch_dense(features: usize, cpc: usize, batch: &tmu_rs::EncodedBatch, ys: &[usize]) -> f64 {
+fn time_epoch_dense(
+    features: usize,
+    cpc: usize,
+    batch: &tmu_rs::EncodedBatch,
+    ys: &[usize],
+) -> f64 {
     let mut tm = TsetlinMachine::with_config(N_CLASSES, features, cpc, 20, 3.9, 8, true, 7);
     median_epoch(|| tm.fit_epoch(batch, ys))
 }
 
 /// Dense **data-parallel** (approximate) training via the data_parallel flag.
-fn time_epoch_dense_dp(features: usize, cpc: usize, batch: &tmu_rs::EncodedBatch, ys: &[usize]) -> f64 {
-    let mut tm =
-        TsetlinMachine::with_config(N_CLASSES, features, cpc, 20, 3.9, 8, true, 7).data_parallel(true);
+fn time_epoch_dense_dp(
+    features: usize,
+    cpc: usize,
+    batch: &tmu_rs::EncodedBatch,
+    ys: &[usize],
+) -> f64 {
+    let mut tm = TsetlinMachine::with_config(N_CLASSES, features, cpc, 20, 3.9, 8, true, 7)
+        .data_parallel(true);
     median_epoch(|| tm.fit_epoch(batch, ys))
 }
 
-fn time_epoch_sparse(features: usize, cpc: usize, batch: &tmu_rs::EncodedBatch, ys: &[usize]) -> f64 {
+fn time_epoch_sparse(
+    features: usize,
+    cpc: usize,
+    batch: &tmu_rs::EncodedBatch,
+    ys: &[usize],
+) -> f64 {
     let mut tm = TMSparseClassifier::with_config(N_CLASSES, features, cpc, 20, 3.9, 8, true, 7)
         .max_included_literals(32);
     median_epoch(|| tm.fit_epoch(batch, ys))
@@ -92,7 +109,10 @@ fn main() {
     let (xtr, ytr) = make(SAMPLES, feats_a, 1);
     let e = Encoder::for_binary(feats_a);
     let btr = e.encode_batch(&as_slices(&xtr));
-    println!("Sweep A — {feats_a} features (words={}), vary clauses/class:", feats_a / 32);
+    println!(
+        "Sweep A — {feats_a} features (words={}), vary clauses/class:",
+        feats_a / 32
+    );
     println!(
         "  {:>7} | {:>12} | {:>12} | {:>10}",
         "clauses", "dense(exact)", "dense(DP)", "sparse"
@@ -109,7 +129,10 @@ fn main() {
     // ── Sweep B: FIX low clause count, widen features (the headline) ────────
     let cpc_b = 32; // below PARALLEL_MIN=128
     println!("\nSweep B — FIXED {cpc_b} clauses/class (< 128), widen features:");
-    println!("  {:>8} | {:>6} | {:>10} | {:>10}", "features", "words", "dense", "sparse");
+    println!(
+        "  {:>8} | {:>6} | {:>10} | {:>10}",
+        "features", "words", "dense", "sparse"
+    );
     println!("  {}", "-".repeat(50));
     for &feats in &[128usize, 1_000, 5_000, 20_000] {
         let (xtr, ytr) = make(SAMPLES, feats, 2);
@@ -121,7 +144,11 @@ fn main() {
         let s = time_epoch_sparse(feats, cpc_b, &btr, &ytr);
         // Dense training is count-only (32 < 128 → scalar). Sparse training is
         // work-aware (parallelises once cps×words ≥ 256).
-        let sparse_par = if work >= 256 { "sparse∥" } else { "sparse scalar" };
+        let sparse_par = if work >= 256 {
+            "sparse∥"
+        } else {
+            "sparse scalar"
+        };
         println!(
             "  {feats:>8} | {words:>6} | {d:>8.1}ms | {s:>8.1}ms   (cps×words={work}: dense scalar, {sparse_par})"
         );
