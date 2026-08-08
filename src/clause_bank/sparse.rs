@@ -66,6 +66,25 @@ pub(crate) struct SparseClause {
     unallocated: Vec<u32>,
 }
 
+/// A contiguous copy of every clause's included-literal list, for inference only.
+///
+/// Firing a clause reads nothing but `included`, and in the [`SparseClause`] layout
+/// each of those is its own heap allocation — so scoring a 47-class model walks
+/// 9400 scattered `Vec`s per event and is bound by cache misses rather than by the
+/// ~20 bit tests each one does. Copying them into one `offsets`/`lits` pair makes
+/// the scan sequential and prefetchable.
+///
+/// Not serialised: it is derived state, and rebuilding it after `load` is cheaper
+/// than storing it. `valid == false` means a mutation has invalidated it and
+/// inference must fall back to walking the clauses directly.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Arena {
+    /// `lits[offsets[cj] as usize..offsets[cj + 1] as usize]` is clause `cj`.
+    offsets: Vec<u32>,
+    lits: Vec<u32>,
+    valid: bool,
+}
+
 /// A bank of [`SparseClause`]s sharing the same literal geometry and TA bounds.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -77,6 +96,10 @@ pub(crate) struct SparseClauseBank {
     /// Absorbing include state (maximum TA counter value).
     max_state: u8,
     clauses: Vec<SparseClause>,
+    /// Inference-side mirror of `clauses[*].included`. Rebuilt by
+    /// [`SparseClauseBank::sync_arena`]; invalidated by every mutating method.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    arena: Arena,
 }
 
 /// Returns `true` if literal `l` is present in the packed input `lit`.
@@ -262,13 +285,45 @@ impl SparseClauseBank {
         };
         let clauses = vec![proto; n_clauses];
 
-        SparseClauseBank {
+        let mut bank = SparseClauseBank {
             n_clauses,
             n_literals,
             half,
             max_state,
             clauses,
+            arena: Arena::default(),
+        };
+        bank.sync_arena();
+        bank
+    }
+
+    // ---- inference arena -------------------------------------------------
+
+    /// Rebuild the contiguous inference mirror of the clauses' included lists.
+    ///
+    /// One pass over the bank, so it belongs at the end of an epoch (or after a
+    /// load), never in the scoring path. Leaving it stale is not a correctness
+    /// problem — [`fire_predict`](SparseClauseBank::fire_predict) falls back to the
+    /// scattered clauses — only a throughput one.
+    pub(crate) fn sync_arena(&mut self) {
+        let total: usize = self.clauses.iter().map(|c| c.included.len()).sum();
+        self.arena.offsets.clear();
+        self.arena.offsets.reserve(self.clauses.len() + 1);
+        self.arena.lits.clear();
+        self.arena.lits.reserve(total);
+        for c in &self.clauses {
+            self.arena.offsets.push(self.arena.lits.len() as u32);
+            self.arena.lits.extend_from_slice(&c.included);
         }
+        self.arena.offsets.push(self.arena.lits.len() as u32);
+        self.arena.valid = true;
+    }
+
+    /// Mark the inference mirror stale. Called by every method that can change an
+    /// `included` list.
+    #[inline]
+    fn invalidate_arena(&mut self) {
+        self.arena.valid = false;
     }
 
     // ---- growing ---------------------------------------------------------
@@ -286,6 +341,7 @@ impl SparseClauseBank {
     /// firing on inputs whose new features are all 0 is unchanged — the same
     /// zero-forgetting guarantee as the dense bank.
     pub(crate) fn grow(&mut self, new_n_literals: usize) {
+        self.invalidate_arena();
         debug_assert!(new_n_literals >= self.n_literals);
         debug_assert_eq!(new_n_literals % 2, 0);
         if new_n_literals == self.n_literals {
@@ -329,6 +385,9 @@ impl SparseClauseBank {
 
     /// Mutable slice of all clauses, for clause-parallel feedback (Rayon).
     pub(crate) fn clauses_mut(&mut self) -> &mut [SparseClause] {
+        // Coarse but sound: the caller gets unrestricted access to every clause, so
+        // the arena has to be assumed stale from here.
+        self.invalidate_arena();
         &mut self.clauses
     }
 
@@ -343,6 +402,29 @@ impl SparseClauseBank {
     /// Predict-semantics fire check for clause `cj`: an **empty** clause returns
     /// `false`.  Mirrors dense [`fire_predict`](crate::clause_bank::dense::fire_predict).
     pub(crate) fn fire_predict(&self, cj: usize, lit: &[u64]) -> bool {
+        if self.arena.valid {
+            let (a, b) = (
+                self.arena.offsets[cj] as usize,
+                self.arena.offsets[cj + 1] as usize,
+            );
+            // A stale-but-valid arena would silently return the pre-mutation
+            // verdict, which is the one failure mode of this design that no
+            // throughput number would reveal. Checking the single clause being read
+            // is O(20) and catches any mutation route that skipped
+            // `invalidate_arena` — including direct field access from inside this
+            // module, which is how the first version of this got caught.
+            debug_assert_eq!(
+                &self.arena.lits[a..b],
+                &self.clauses[cj].included[..],
+                "inference arena is stale for clause {cj}: a mutation path did not \
+                 call invalidate_arena"
+            );
+            if a == b {
+                // Predict semantics: an empty clause does not fire.
+                return false;
+            }
+            return self.arena.lits[a..b].iter().all(|&l| lit_present(lit, l));
+        }
         self.clauses[cj].fire_predict(lit)
     }
 
@@ -409,6 +491,7 @@ impl SparseClauseBank {
     /// Test-only convenience wrapper; see [`SparseClauseBank::type_i`].
     #[cfg(test)]
     pub(crate) fn type_ii(&mut self, cj: usize, lit: &[u64], lit_active_mask: &[u64]) {
+        self.invalidate_arena();
         let (half, max_state) = (self.half, self.max_state);
         self.clauses[cj].type_ii(lit, lit_active_mask, half, max_state);
     }
@@ -526,6 +609,9 @@ mod tests {
         }
         c.included.push(l);
         c.included_state.push(state);
+        // Reaches into the clause directly rather than through `clauses_mut`, so it
+        // has to refresh the inference mirror itself.
+        b.sync_arena();
     }
 
     #[test]

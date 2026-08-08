@@ -116,6 +116,18 @@ pub trait SaveLoad: Serialize + DeserializeOwned + Sized {
 
     /// Read from any [`Read`] source (used by [`load`](Self::load)).
     fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
-        read_artifact(r, Self::TAG)
+        let mut v: Self = read_artifact(r, Self::TAG)?;
+        v.after_load();
+        Ok(v)
     }
+
+    /// Hook run once after deserialisation, for state that is derived rather than
+    /// stored.
+    ///
+    /// The sparse clause bank keeps a contiguous inference mirror of its clauses
+    /// that is deliberately not serialised — it is rebuildable in one pass and
+    /// would otherwise double the artifact. Without this hook a freshly loaded
+    /// model still *scores correctly*, because inference falls back to walking the
+    /// clauses, but it silently runs at the slower rate. Defaults to a no-op.
+    fn after_load(&mut self) {}
 }

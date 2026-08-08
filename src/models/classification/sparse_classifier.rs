@@ -74,6 +74,11 @@ pub struct TMSparseClassifier {
 #[cfg(feature = "serde")]
 impl crate::serial::SaveLoad for TMSparseClassifier {
     const TAG: u8 = crate::serial::TAG_SPARSE;
+
+    fn after_load(&mut self) {
+        // The inference arena is derived state and is not serialised.
+        self.bank.sync_arena();
+    }
 }
 
 impl TMSparseClassifier {
@@ -548,6 +553,10 @@ impl TMSparseClassifier {
         for &i in &order {
             self.fit_one_lit(&data[i * w..(i + 1) * w], ys[i]);
         }
+        // Training invalidates the inference mirror on nearly every sample;
+        // rebuilding once per epoch is one pass over the bank and keeps scoring on
+        // the fast path without touching the feedback loop.
+        self.bank.sync_arena();
     }
 
     // ---- absorbing-state introspection -----------------------------------
