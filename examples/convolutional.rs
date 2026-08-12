@@ -73,21 +73,32 @@ fn main() {
     let final_acc = ctm.accuracy(&te, &yte);
     println!("\nFinal test accuracy: {final_acc:.4}");
 
-    println!("\nTop clause rules (first 4 positive clauses of class 0, patch-relative indices):");
-    let mut shown = 0;
-    for j in (0..CLAUSES).step_by(2) {
-        let rule = ctm.clause_rule(0, j);
-        if rule.is_empty() {
-            continue;
-        }
+    // Explain a single prediction: only clauses that actually fired on this
+    // input contribute to its class score, so rank by |weight| among those —
+    // not by clause index — to see which rules actually drove the decision.
+    let sample = te[0];
+    let predicted = ctm.predict(sample);
+    println!("\nExplaining prediction for test sample 0 (predicted class {predicted}):");
+    let mut fired: Vec<(usize, i32)> = ctm
+        .fired_clauses(sample, predicted)
+        .into_iter()
+        .map(|j| (j, ctm.clause_weight(predicted, j)))
+        .collect();
+    fired.sort_by_key(|&(_, w)| std::cmp::Reverse(w));
+    for &(j, w) in fired.iter().take(4) {
+        let polarity = if ctm.clause_is_positive(j) { "+" } else { "-" };
+        let rule = ctm.clause_rule(predicted, j);
         let features: Vec<String> = rule
             .iter()
             .map(|&(f, neg)| format!("{}x{}", if neg { "¬" } else { "" }, f))
             .collect();
-        println!("  clause {:>3}  {}", j, features.join(" ∧ "));
-        shown += 1;
-        if shown >= 4 {
-            break;
-        }
+        println!(
+            "  clause {:>3}  weight {polarity}{w:<4} {}",
+            j,
+            features.join(" ∧ ")
+        );
+    }
+    if fired.is_empty() {
+        println!("  (no clauses fired for the predicted class)");
     }
 }

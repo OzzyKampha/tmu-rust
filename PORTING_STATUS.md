@@ -85,7 +85,7 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | Clause dropout | ✅ | `clause_drop_p` builder |
 | Max included literals | ✅ | `max_included_literals` Type Ia guard |
 | Configurable TA state bits | ✅ | 2–8 bits per counter |
-| Clause rule extraction | ✅ | `clause_rule(class, clause)` returns patch-relative feature indices |
+| Clause rule extraction | ✅ | `clause_rule(class, clause)` returns patch-relative feature indices; `clause_weight(class, clause)`, `fired_clauses(x, class)` (OR across patch positions), `clause_is_positive()` |
 | Batch prediction | ✅ | `predict_batch()`, `accuracy()` |
 | Multi-threaded training | ✅ | `--features parallel` (Rayon), clause-parallel feedback |
 | Save / load | ✅ | `serde` feature; file tag `TAG_CONVOLUTIONAL = 7` |
