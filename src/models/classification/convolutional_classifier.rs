@@ -997,6 +997,42 @@ impl ConvolutionalTsetlinMachine {
 
     // ---- interpretability ----------------------------------------------------
 
+    /// Return the integer weight of `clause` for `class`.
+    pub fn clause_weight(&self, class: usize, clause: usize) -> i32 {
+        self.weights[class * self.clauses_per_class + clause]
+    }
+
+    /// Return the indices of all clauses (local to `class`) that fire on `x`.
+    ///
+    /// Uses the same OR-across-patches semantics as `predict()`/`scores()`: a
+    /// clause counts as fired if it fires on **any** patch position, matching
+    /// how its vote is counted once (not once per firing patch) in the class sum.
+    pub fn fired_clauses(&self, x: &[u8], class: usize) -> Vec<usize> {
+        assert_eq!(x.len(), self.n_input_features);
+        assert!(class < self.n_classes);
+        let mut patches_buf = vec![0u64; self.n_patches * self.words];
+        self.pack_all_patches(x, &mut patches_buf);
+
+        let cps = self.clauses_per_class;
+        let words = self.words;
+        let inc = self.include.as_slice();
+        let val = self.valid.as_slice();
+        (0..cps)
+            .filter(|&j| {
+                let cj = class * cps + j;
+                let clause_inc = &inc[cj * words..(cj + 1) * words];
+                (0..self.n_patches).any(|p| {
+                    fire_predict(
+                        clause_inc,
+                        &patches_buf[p * words..(p + 1) * words],
+                        val,
+                        words,
+                    )
+                })
+            })
+            .collect()
+    }
+
     /// Return the included literals for clause `clause` of `class`
     /// as `(patch_feature_index, is_negated)` pairs.
     ///
@@ -1138,6 +1174,31 @@ mod tests {
                 .map(|(i, _)| i)
                 .unwrap();
             assert_eq!(argmax, ctm.predict(x));
+        }
+    }
+
+    #[test]
+    fn convolutional_fired_clauses_reconstructs_class_score() {
+        let (xs, ys) = make_xor_sequence(200, 8, 3);
+        let slices = as_slices(&xs);
+        let mut ctm = ConvolutionalTsetlinMachine::new(2, 8, 2, 1, 10, 20, 3.0);
+        for _ in 0..5 {
+            ctm.fit_epoch(&slices, &ys);
+        }
+        let mut out = vec![0i32; 2];
+        for x in &xs[..20] {
+            ctm.scores(x, &mut out);
+            for class in 0..2 {
+                let fired = ctm.fired_clauses(x, class);
+                let sum: i32 = fired
+                    .iter()
+                    .map(|&j| {
+                        let w = ctm.clause_weight(class, j);
+                        if ctm.clause_is_positive(j) { w } else { -w }
+                    })
+                    .sum();
+                assert_eq!(sum.clamp(-ctm.threshold, ctm.threshold), out[class]);
+            }
         }
     }
 
