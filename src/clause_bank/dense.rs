@@ -418,8 +418,9 @@ pub(crate) fn type_i_update_bytes(
     inv_b: &[u8],
     keep_b: &[u8],
     active_b: &[u8],
+    half: u8,
     max_state: u8,
-) {
+) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
@@ -434,6 +435,7 @@ pub(crate) fn type_i_update_bytes(
                     inv_b,
                     keep_b,
                     active_b,
+                    half,
                     max_state,
                 )
             };
@@ -448,8 +450,9 @@ pub(crate) fn type_i_update_bytes(
         inv_b,
         keep_b,
         active_b,
+        half,
         max_state,
-    );
+    )
 }
 
 /// Branchless scalar fallback for [`type_i_update_bytes`] on non-AVX2 targets.
@@ -464,9 +467,11 @@ fn type_i_update_bytes_scalar(
     inv_b: &[u8],
     keep_b: &[u8],
     active_b: &[u8],
+    half: u8,
     max_state: u8,
-) {
+) -> bool {
     let boost_u8 = boost as u8;
+    let mut crossed = 0u8;
     if fired_under {
         for l in 0..n_literals {
             let la = active_b[l];
@@ -475,7 +480,9 @@ fn type_i_update_bytes_scalar(
             let inc = present & (boost_u8 | keep_b[l]) & la;
             let not_at_max = (t < max_state) as u8;
             let dec = (1 - present) & inv_b[l] & not_at_max & la;
-            ta[l] = t.saturating_add(inc).min(max_state).saturating_sub(dec);
+            let new = t.saturating_add(inc).min(max_state).saturating_sub(dec);
+            crossed |= (t >= half) as u8 ^ (new >= half) as u8;
+            ta[l] = new;
         }
     } else {
         for l in 0..n_literals {
@@ -483,9 +490,12 @@ fn type_i_update_bytes_scalar(
             let t = ta[l];
             let not_at_max = (t < max_state) as u8;
             let dec = inv_b[l] & not_at_max & la;
-            ta[l] = t.saturating_sub(dec);
+            let new = t.saturating_sub(dec);
+            crossed |= (t >= half) as u8 ^ (new >= half) as u8;
+            ta[l] = new;
         }
     }
+    crossed != 0
 }
 
 /// AVX2 implementation of [`type_i_update_bytes`]: 32 literals per iteration.
@@ -509,8 +519,9 @@ unsafe fn type_i_update_bytes_avx2(
     inv_b: &[u8],
     keep_b: &[u8],
     active_b: &[u8],
+    half: u8,
     max_state: u8,
-) {
+) -> bool {
     unsafe {
         use std::arch::x86_64::*;
 
@@ -518,6 +529,15 @@ unsafe fn type_i_update_bytes_avx2(
         let ones = _mm256_set1_epi8(1);
         let all_ones = _mm256_set1_epi8(-1);
         let boost_v = _mm256_set1_epi8(boost as i8);
+        let half_v = _mm256_set1_epi8(half as i8);
+        // Accumulates 0xFF in any lane whose inclusion bit (`ta[l] >= half`) flipped.
+        // `max_epu8(x, half) == x` is the unsigned `x >= half` test, avoiding the
+        // sign-bias dance `cmpgt_epi8` would need on `u8` counters.
+        let mut crossed = _mm256_setzero_si256();
+        macro_rules! included {
+            ($v:expr) => {{ _mm256_cmpeq_epi8(_mm256_max_epu8($v, half_v), $v) }};
+        }
+        let mut crossed_tail = 0u8;
 
         // Load 32 bytes (one full AVX2 register) from a u8 slice.
         // SAFETY: caller ensures at least 32 bytes remain at ptr (checked by loop bound).
@@ -556,6 +576,8 @@ unsafe fn type_i_update_bytes_avx2(
 
                 // native saturating unsigned byte subtract
                 let result = _mm256_subs_epu8(t_clamped, dec);
+                crossed =
+                    _mm256_or_si256(crossed, _mm256_xor_si256(included!(t), included!(result)));
                 _mm256_storeu_si256(ta.as_mut_ptr().add(l) as *mut __m256i, result);
                 l += 32;
             }
@@ -568,7 +590,9 @@ unsafe fn type_i_update_bytes_avx2(
                 let inc = present & (boost_u8 | keep_b[l]) & la;
                 let not_at_max = (t < max_state) as u8;
                 let dec = (1 - present) & inv_b[l] & not_at_max & la;
-                ta[l] = t.saturating_add(inc).min(max_state).saturating_sub(dec);
+                let new = t.saturating_add(inc).min(max_state).saturating_sub(dec);
+                crossed_tail |= (t >= half) as u8 ^ (new >= half) as u8;
+                ta[l] = new;
                 l += 1;
             }
         } else {
@@ -582,6 +606,8 @@ unsafe fn type_i_update_bytes_avx2(
                 let dec = _mm256_and_si256(_mm256_and_si256(inv_v, la), not_at_max);
 
                 let result = _mm256_subs_epu8(t, dec);
+                crossed =
+                    _mm256_or_si256(crossed, _mm256_xor_si256(included!(t), included!(result)));
                 _mm256_storeu_si256(ta.as_mut_ptr().add(l) as *mut __m256i, result);
                 l += 32;
             }
@@ -589,10 +615,13 @@ unsafe fn type_i_update_bytes_avx2(
                 let t = ta[l];
                 let not_at_max = (t < max_state) as u8;
                 let dec = inv_b[l] & not_at_max & active_b[l];
-                ta[l] = t.saturating_sub(dec);
+                let new = t.saturating_sub(dec);
+                crossed_tail |= (t >= half) as u8 ^ (new >= half) as u8;
+                ta[l] = new;
                 l += 1;
             }
         }
+        crossed_tail != 0 || _mm256_testz_si256(crossed, crossed) == 0
     }
 }
 
@@ -620,7 +649,7 @@ pub(crate) fn type_ii_update_bytes(
     active_b: &[u8],
     half: u8,
     max_state: u8,
-) {
+) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
@@ -630,7 +659,7 @@ pub(crate) fn type_ii_update_bytes(
             };
         }
     }
-    type_ii_update_bytes_scalar(ta, n_literals, lit_b, active_b, half, max_state);
+    type_ii_update_bytes_scalar(ta, n_literals, lit_b, active_b, half, max_state)
 }
 
 /// Branchless scalar fallback for [`type_ii_update_bytes`] on non-AVX2 targets.
@@ -642,7 +671,10 @@ fn type_ii_update_bytes_scalar(
     active_b: &[u8],
     half: u8,
     max_state: u8,
-) {
+) -> bool {
+    // Type II only ever increments literals that are below `half`, so a lane crosses
+    // exactly when it lands on `half`.
+    let mut crossed = 0u8;
     for l in 0..n_literals {
         let la = active_b[l];
         let t = ta[l];
@@ -650,8 +682,11 @@ fn type_ii_update_bytes_scalar(
         let excluded = (t < half) as u8;
         let not_zero = (t > 0) as u8;
         let inc = absent & excluded & not_zero & la;
-        ta[l] = t.saturating_add(inc).min(max_state);
+        let new = t.saturating_add(inc).min(max_state);
+        crossed |= (t >= half) as u8 ^ (new >= half) as u8;
+        ta[l] = new;
     }
+    crossed != 0
 }
 
 /// AVX2 implementation of [`type_ii_update_bytes`]: 32 literals per iteration.
@@ -672,7 +707,7 @@ unsafe fn type_ii_update_bytes_avx2(
     active_b: &[u8],
     half: u8,
     max_state: u8,
-) {
+) -> bool {
     unsafe {
         use std::arch::x86_64::*;
 
@@ -683,6 +718,10 @@ unsafe fn type_ii_update_bytes_avx2(
         let half_biased = _mm256_set1_epi8((half ^ 0x80) as i8);
         // t > 0  ↔  (t ^ 0x80) > (0 ^ 0x80) = 0x80 = i8::MIN  [signed i8]
         let zero_biased = bias;
+        // Unbiased `half`, for the unsigned `result >= half` crossing test via max_epu8.
+        let half_unbiased = _mm256_set1_epi8(half as i8);
+        let mut crossed = _mm256_setzero_si256();
+        let mut crossed_tail = 0u8;
 
         macro_rules! load32 {
             ($slice:expr, $off:expr) => {{ _mm256_loadu_si256($slice.as_ptr().add($off) as *const __m256i) }};
@@ -710,6 +749,10 @@ unsafe fn type_ii_update_bytes_avx2(
 
             // t + inc, clamped to max_state
             let result = _mm256_min_epu8(_mm256_adds_epu8(t, inc), max_state_v);
+            // `excluded` is already `t < half`; a lane crosses when it was excluded and
+            // the result is not, so no second comparison of `t` is needed.
+            let now_included = _mm256_cmpeq_epi8(_mm256_max_epu8(result, half_unbiased), result);
+            crossed = _mm256_or_si256(crossed, _mm256_and_si256(excluded, now_included));
             _mm256_storeu_si256(ta.as_mut_ptr().add(l) as *mut __m256i, result);
             l += 32;
         }
@@ -721,9 +764,12 @@ unsafe fn type_ii_update_bytes_avx2(
             let excluded = (t < half) as u8;
             let not_zero = (t > 0) as u8;
             let inc = absent & excluded & not_zero & la;
-            ta[l] = t.saturating_add(inc).min(max_state);
+            let new = t.saturating_add(inc).min(max_state);
+            crossed_tail |= (t >= half) as u8 ^ (new >= half) as u8;
+            ta[l] = new;
             l += 1;
         }
+        crossed_tail != 0 || _mm256_testz_si256(crossed, crossed) == 0
     }
 }
 
@@ -800,6 +846,7 @@ pub(crate) fn clause_type_i_bytes(
         &inv_b,
         &keep_b,
         &active_b,
+        half,
         max_state,
     );
     rebuild_include(ta, inc, valid, words, n_literals, half);
@@ -1801,7 +1848,16 @@ mod tests {
         let keep_b = vec![0u8; 4];
         let active_b = vec![1u8; 4];
         type_i_update_bytes(
-            &mut ta, n_literals, false, false, &lit_b, &inv_b, &keep_b, &active_b, max_state,
+            &mut ta,
+            n_literals,
+            false,
+            false,
+            &lit_b,
+            &inv_b,
+            &keep_b,
+            &active_b,
+            (max_state + 1) / 2,
+            max_state,
         );
         assert_eq!(ta[0], 4, "5 - 1 = 4");
         assert_eq!(ta[1], 0, "1 - 1 = 0");

@@ -173,7 +173,7 @@ fn apply_one_clause_coalesced(
                 (n as usize) < max_inc
             };
             let fired_under = out_j && under_limit;
-            type_i_update_bytes(
+            if type_i_update_bytes(
                 ta,
                 n_literals,
                 fired_under,
@@ -182,13 +182,18 @@ fn apply_one_clause_coalesced(
                 inv_b,
                 keep_b,
                 active_b,
+                half,
                 max_state,
-            );
-            rebuild_include(ta, inc, val, words, n_literals, half);
+            ) {
+                // Only rebuild when a counter crossed `half` — see the comment in
+                // `vanilla_classifier::apply_one_clause`.
+                rebuild_include(ta, inc, val, words, n_literals, half);
+            }
         } else if out_j {
             // Type II is only meaningful when the clause fired.
-            type_ii_update_bytes(ta, n_literals, lit_b, active_b, half, max_state);
-            rebuild_include(ta, inc, val, words, n_literals, half);
+            if type_ii_update_bytes(ta, n_literals, lit_b, active_b, half, max_state) {
+                rebuild_include(ta, inc, val, words, n_literals, half);
+            }
         }
     }
 

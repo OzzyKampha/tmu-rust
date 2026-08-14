@@ -147,6 +147,10 @@ name = "parallel_scaling"     # Training ms/epoch vs clauses × literals; work-a
 path = "examples/parallel_scaling.rs"
 
 [[example]]
+name = "traffic_profile"      # One epoch at a fixed config, for cachegrind memory-traffic counts
+path = "examples/traffic_profile.rs"
+
+[[example]]
 name = "dp_vs_exact"          # Validate data-parallel vs exact training accuracy on real data (breast cancer)
 path = "examples/dp_vs_exact.rs"
 

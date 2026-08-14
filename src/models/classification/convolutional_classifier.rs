@@ -140,7 +140,7 @@ fn apply_one_clause_conv(
         return;
     }
     let positive = j & 1 == 0;
-    if (target == 1) == positive {
+    let crossed = if (target == 1) == positive {
         // Type Ia / Ib: `fires` is the OR across all patches (TMU semantics).
         let under_limit = max_inc == usize::MAX || {
             let n: u32 = (0..words).map(|k| (inc[k] & val[k]).count_ones()).sum();
@@ -159,17 +159,22 @@ fn apply_one_clause_conv(
             inv_b,
             keep_b,
             active_b,
+            half,
             max_state,
-        );
+        )
     } else {
         // Type II: only runs when clause fires on at least one patch.
         if !fires {
             return;
         }
         *w = (*w - 1).max(1);
-        type_ii_update_bytes(ta, n_literals, lit_b, active_b, half, max_state);
+        type_ii_update_bytes(ta, n_literals, lit_b, active_b, half, max_state)
+    };
+    // Only rebuild when a counter actually crossed `half` — see the comment in
+    // `vanilla_classifier::apply_one_clause`.
+    if crossed {
+        rebuild_include(ta, inc, val, words, n_literals, half);
     }
-    rebuild_include(ta, inc, val, words, n_literals, half);
 }
 
 impl ConvolutionalTsetlinMachine {

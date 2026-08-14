@@ -156,7 +156,7 @@ fn apply_one_clause(
         return;
     }
     let positive = j & 1 == 0;
-    if (target == 1) == positive {
+    let crossed = if (target == 1) == positive {
         // Type I: fire check (O(words)), then SIMD TA update (O(n_literals)).
         let fired = clause_fire(inc, lit, val, words, lit_active);
         let under_limit = max_inc == usize::MAX || {
@@ -176,17 +176,26 @@ fn apply_one_clause(
             inv_b,
             keep_b,
             active_b,
+            half,
             max_state,
-        );
+        )
     } else {
         // Type II: fire check, then SIMD TA update.
         if !clause_fire(inc, lit, val, words, lit_active) {
             return;
         }
         *w = (*w - 1).max(1);
-        type_ii_update_bytes(ta, n_literals, lit_b, active_b, half, max_state);
+        type_ii_update_bytes(ta, n_literals, lit_b, active_b, half, max_state)
+    };
+    // The include bitset is a pure function of `ta >= half`, so it only needs
+    // rebuilding when some counter actually crossed that threshold. The update
+    // kernels report this for free (they already hold the before/after vectors), and
+    // skipping the rebuild avoids re-reading all `n_literals` counters that were just
+    // written plus rewriting `words` bitset words. As counters settle into absorbing
+    // states most updates stop crossing, so this is the common case late in training.
+    if crossed {
+        rebuild_include(ta, inc, val, words, n_literals, half);
     }
-    rebuild_include(ta, inc, val, words, n_literals, half);
 }
 
 impl TsetlinMachine {

@@ -110,7 +110,7 @@ fn apply_one_clause(
         return;
     }
     let fired = clause_fire(inc, lit, val, words, lit_active);
-    if push_up {
+    let crossed = if push_up {
         // Type I (Ia if fired and under literal limit, Ib otherwise).
         let under_limit = max_inc == usize::MAX || {
             let n: u32 = (0..words).map(|k| (inc[k] & val[k]).count_ones()).sum();
@@ -129,17 +129,22 @@ fn apply_one_clause(
             inv_b,
             keep_b,
             active_b,
+            half,
             max_state,
-        );
+        )
     } else {
         // Type II — only applies when the clause fires.
         if !fired {
             return;
         }
         *w = (*w - 1).max(0); // TMU uses neg_weights=False: floor is 0, not negative
-        type_ii_update_bytes(ta, n_literals, lit_b, active_b, half, max_state);
+        type_ii_update_bytes(ta, n_literals, lit_b, active_b, half, max_state)
+    };
+    // Only rebuild when a counter actually crossed `half` — see the comment in
+    // `vanilla_classifier::apply_one_clause`.
+    if crossed {
+        rebuild_include(ta, inc, val, words, n_literals, half);
     }
-    rebuild_include(ta, inc, val, words, n_literals, half);
 }
 
 impl TMRegressor {
