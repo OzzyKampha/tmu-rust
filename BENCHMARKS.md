@@ -138,7 +138,8 @@ Results after the u8 TA counter optimisation (PR #7/#8 — 32-wide AVX2, 4× sma
 **Notes on these numbers:**
 
 - The Rayon gain is modest (1.4×) on a 4-core VM; expect proportionally larger
-  gains on many-core hardware.
+  gains on many-core hardware. See [Data-parallel training](#data-parallel-training)
+  for why this ceiling is a property of the workload rather than of the scheduling.
 - Per-epoch time decreases sharply as clauses absorb — for Rust sequential the
   range is 6 652 ms (epoch 0) → 3 035 ms (epoch 7). The median captures the
   mid-training cost, not the steady-state cost.
@@ -421,3 +422,68 @@ due to known implementation issues:
   first output converges while others stay at ~50%.
 
 Throughput numbers from the Python benchmark are unaffected by these accuracy issues.
+
+---
+
+## Data-parallel training
+
+`fit_epoch` can shard an epoch into mini-batches, train a private replica per shard,
+and merge after each mini-batch. With `--features parallel` on more than one core this
+is selected automatically for large enough workloads (see the README). It is
+approximate; the exact clause-parallel path remains the fallback.
+
+Measured with `examples/parallel_scaling.rs` on a 4-core Intel Xeon @ 2.80 GHz,
+33 MiB L3, 1000 samples/epoch, 512 features, **minimum of 9 timed epochs**.
+
+### Throughput vs model size
+
+| clauses | TA state | exact | data-parallel | vs exact |
+|---:|---:|---:|---:|---:|
+| 16     | 0.03 MiB | 3.4 ms   | 3.4 ms   | 1.0× |
+| 256    | 0.5 MiB  | 19.2 ms  | 17.2 ms  | 1.1× |
+| 1024   | 2.1 MiB  | 51.2 ms  | 53.4 ms  | 1.0× |
+| 4096   | 8.4 MiB  | 262.1 ms | 260.6 ms | 1.0× |
+| 16384  | 33.6 MiB | 1165.6 ms| 1211.3 ms| 1.0× |
+
+**Dense TM training is memory-bandwidth bound.** A single core already saturates much
+of the available bandwidth streaming `u8` TA counters, so additional cores mostly wait
+on memory no matter how the work is divided. That is the same ceiling the exact
+clause-parallel path hits (~1.3–1.4×), and it is why neither strategy dominates here.
+What the data-parallel path adds is a multicore route that applies at *any* model size
+(the exact path is gated off below 4096 clauses/class), needs no opt-in, and costs one
+Rayon dispatch per mini-batch instead of two per sample.
+
+### Merge cadence — the setting that actually matters
+
+Samples trained per shard between merges, at 1024 clauses/class (2.1 MiB TA):
+
+| samples between merges | ms/epoch | vs exact |
+|---:|---:|---:|
+| 32   | 103.1 ms | **0.46×** |
+| 64   | 62.6 ms  | 0.76× |
+| 128  | 50.1 ms  | 0.94× |
+| 256  | 45.9 ms  | **1.03×** |
+| 512  | 48.4 ms  | 0.98× |
+| 1000 (whole epoch) | 52.3 ms | 1.05× |
+
+The curve is strongly asymmetric: merging too often is far more costly than merging
+too rarely, so the derived cadence deliberately errs large. Override it with
+`.data_parallel_batch(n)` or `TMU_RS_DP_BATCH`.
+
+### A note on measuring this
+
+These numbers were originally taken as a median of 3 epochs, which suggested a 2–3×
+data-parallel win collapsing to 0.9× on large models — an apparent cache-residency
+cliff. It was not real. The same configuration was spanning ±20% between runs on
+shared hardware, and re-measuring with a minimum of 9 epochs on an idle machine showed
+the ordering had never actually reversed. If you are re-running these, prefer the
+minimum over the median (interference only ever makes an epoch slower), and compare
+configurations back-to-back in one process — absolute timings on this class of machine
+drifted by more than 2× over the course of an afternoon.
+
+### Ensembles are the exception
+
+`TMCompositeClassifier` trains its members concurrently and **exactly**: members share
+no mutable state, so member-parallel training is bit-identical to serial (asserted
+clause-by-clause in `composite_member_parallel_matches_serial`). Ensembles therefore
+scale with member count in a way a single dense model does not.

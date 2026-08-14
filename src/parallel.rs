@@ -19,8 +19,22 @@
 //!
 //! This module keeps the replica idea and fixes the cadence: shard **mini-batches**
 //! of `plan.batch` samples, merge, repeat. Dispatches drop from `2n` per epoch to
-//! `~2n/batch`, replicas stay close to the master so accuracy is much closer to
-//! exact, and replicas are cached and refreshed in place instead of reallocated.
+//! `~2n/batch`, replicas resynchronise many times per epoch instead of once, and
+//! replicas are cached and refreshed in place instead of reallocated.
+//!
+//! # What to expect from it
+//!
+//! Do not expect large speedups. Dense TM training is memory-bandwidth bound: on a
+//! 4-core Xeon this path measures within ~10% of the exact clause-parallel path
+//! across model sizes from 0.03 MiB to 33.6 MiB of TA state. That is the same
+//! ceiling the exact path runs into (~1.3–1.4×, see `BENCHMARKS.md`), and it is a
+//! property of the workload rather than of the scheduling strategy. The merge
+//! cadence is the one setting that moves the number materially, and mostly
+//! downwards if set too small — see [`DP_SYNC_OVERHEAD_DIVISOR`].
+//!
+//! What this path *does* buy is a multicore route that applies at any model size
+//! (the exact path is gated off below 4096 clauses/class), needs no opt-in, and
+//! costs one dispatch per mini-batch rather than two per sample.
 //!
 //! # Determinism
 //!
@@ -77,7 +91,11 @@ impl<M> std::fmt::Debug for ReplicaPool<M> {
     /// Prints the replica *count* only — never recurses into the cached models,
     /// which would make `{:?}` on a model dump the whole pool.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ReplicaPool {{ replicas: <{} cached> }}", self.replicas.len())
+        write!(
+            f,
+            "ReplicaPool {{ replicas: <{} cached> }}",
+            self.replicas.len()
+        )
     }
 }
 
@@ -117,85 +135,56 @@ mod imp {
 
     /// Sample-count floor before **auto** considers data-parallel training.
     ///
-    /// Below this the per-epoch replica refresh and merge cannot be amortised, and
-    /// the approximation buys nothing. Mini-batch call sites (e.g.
-    /// `examples/mordor_autoencoder.rs`, which calls `fit_epoch` per mini-batch) sit
-    /// below this floor and therefore keep training exactly.
-    pub(crate) const DP_AUTO_MIN_SAMPLES: usize = 1024;
+    /// An epoch needs enough samples to give every shard a meaningful slice —
+    /// `shards × DP_MIN_SAMPLES_PER_SHARD` is 128 at four shards — and to amortise
+    /// the one-time replica fork. Small per-call sites (e.g.
+    /// `examples/mordor_autoencoder.rs`, which calls `fit_epoch` on mini-batches)
+    /// stay below this and keep training exactly.
+    ///
+    /// Keep this genuinely low. At 1024 it silently disabled auto for the entire
+    /// `examples/parallel_scaling.rs` sweep, which runs 1000 samples/epoch, so the
+    /// feature measured as completely inert.
+    pub(crate) const DP_AUTO_MIN_SAMPLES: usize = 256;
 
     /// Per-sample TA traffic floor (bytes) before **auto** engages.
     ///
     /// This — not the model size — is the lower gate, because what has to beat thread
-    /// dispatch is the work *one sample* does. A 4-class 8-clause model over 12
-    /// features touches 384 B per sample and stays exact; a 16-clause/class model over
-    /// 512 features touches 32 KiB and is measured at 2.9× on 4 cores.
+    /// dispatch is the work *one sample* does. An 8-clause/class model over 12
+    /// features touches 384 B per sample, far too little to be worth a fan-out; a
+    /// 16-clause/class model over 512 features touches 32 KiB.
     ///
     /// Deliberately not [`use_parallel`]: that predicate counts items and words, which
     /// does not distinguish those two cases.
     pub(crate) const DP_AUTO_MIN_SAMPLE_BYTES: usize = 1 << 13;
 
-    /// Fraction of last-level cache the master plus all replicas should fit inside for
-    /// **auto** to engage, as a divisor (2 = half the LLC).
+    /// Total replica memory **auto** will allocate without being asked (1 GiB).
     ///
-    /// This upper bound is the one that actually matters, and it was measured rather
-    /// than assumed. `examples/parallel_scaling.rs` on a 4-core Xeon with 33 MiB of L3:
+    /// This is a *memory* guard, not a performance one. Replica training costs
+    /// `shards × ~1.13 × model TA bytes` of resident memory, which for a large model
+    /// is substantial (a 40 MiB model on 4 shards adds ~180 MiB), and silently
+    /// allocating an unbounded amount on the user's behalf is not acceptable. Past
+    /// this bound the user must ask for it with `.data_parallel(true)`.
     ///
-    /// | model TA | replicas (×4) | data-parallel speedup |
-    /// |---|---|---|
-    /// | 32 KiB  | 0.14 MiB | **2.9×** |
-    /// | 512 KiB | 2.2 MiB  | **2.3×** |
-    /// | 2 MiB   | 9.2 MiB  | **2.5×** |
-    /// | 8 MiB   | 37 MiB   | 1.2× |
-    /// | 32 MiB  | 147 MiB  | 1.3× |
+    /// There is deliberately **no cache-residency ceiling** here, though the intuition
+    /// that replicas must lose once they outgrow last-level cache is appealing. On a
+    /// 4-core Xeon with 33 MiB of L3, `parallel_scaling` Sweep A (min of 9 epochs)
+    /// puts data-parallel within ~10% of the exact path at every model size from
+    /// 0.03 MiB to 33.6 MiB — no cliff, and no large win either.
     ///
-    /// Replica training trades memory footprint for independence: `k` shards stream
-    /// `k` private copies. While those copies are cache-resident that is nearly free
-    /// and scaling is near-linear; once they spill to RAM it is `k`× the bandwidth for
-    /// the same work, and dense training is already bandwidth-bound — so the win
-    /// collapses to roughly what the exact clause-parallel path gives anyway. Above
-    /// this bound auto declines and leaves the model on the exact path; an explicit
-    /// `.data_parallel(true)` still overrides.
-    pub(crate) const DP_AUTO_LLC_DIVISOR: usize = 2;
-
-    /// Assumed last-level cache when it cannot be read from the OS. Conservative on
-    /// purpose: under-estimating shrinks the window where auto engages, which costs
-    /// some speed, while over-estimating puts models onto a path measured to be
-    /// *slower* than exact.
-    pub(crate) const DP_LLC_FALLBACK_BYTES: usize = 8 << 20;
-
-    /// Total replica budget **auto** will allocate without being asked (1 GiB).
-    /// Beyond this the user must opt in explicitly with `.data_parallel(true)`.
+    /// The reason there is not much in it either way: dense TM training is
+    /// **memory-bandwidth bound**, and one core already saturates a good fraction of
+    /// the available bandwidth streaming TA counters. Extra cores mostly wait on
+    /// memory whichever way the work is divided, which is the same reason the exact
+    /// clause-parallel path only reaches ~1.3–1.4× (see `BENCHMARKS.md`). What
+    /// data-parallel reliably improves is the *merge cadence* knob — see
+    /// [`DP_SYNC_OVERHEAD_DIVISOR`], where the spread is 0.46× to 1.14×.
+    ///
+    /// Treat single measurements on shared hardware with suspicion. An earlier
+    /// revision of this gate declined above half the LLC, on the strength of a
+    /// median-of-3 benchmark that appeared to show a 2–3× win collapsing to 0.9×.
+    /// Re-running with min-of-9 on an idle box showed both the win and the collapse
+    /// were noise: the same configuration had been spanning ±20% between runs.
     pub(crate) const DP_AUTO_MAX_REPLICA_BYTES: usize = 1 << 30;
-
-    /// Last-level cache size in bytes, read once from sysfs.
-    ///
-    /// Walks `/sys/devices/system/cpu/cpu0/cache/index*/size` and takes the largest
-    /// (the LLC is shared, so its reported size is the whole thing, not a per-core
-    /// slice). Falls back to [`DP_LLC_FALLBACK_BYTES`] off Linux or when sysfs is
-    /// unreadable.
-    pub(crate) fn llc_bytes() -> usize {
-        static LLC: OnceLock<usize> = OnceLock::new();
-        *LLC.get_or_init(|| {
-            let mut best = 0usize;
-            for i in 0..8 {
-                let path = format!("/sys/devices/system/cpu/cpu0/cache/index{i}/size");
-                let Ok(raw) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let t = raw.trim();
-                let (digits, mult) = match t.as_bytes().last() {
-                    Some(b'K') => (&t[..t.len() - 1], 1 << 10),
-                    Some(b'M') => (&t[..t.len() - 1], 1 << 20),
-                    Some(b'G') => (&t[..t.len() - 1], 1 << 30),
-                    _ => (t, 1),
-                };
-                if let Ok(v) = digits.parse::<usize>() {
-                    best = best.max(v * mult);
-                }
-            }
-            if best == 0 { DP_LLC_FALLBACK_BYTES } else { best }
-        })
-    }
 
     /// Below this model size, use a single end-of-epoch merge (`batch == n`).
     ///
@@ -214,7 +203,25 @@ mod imp {
     pub(crate) const DP_MIN_SAMPLES_PER_SHARD: usize = 32;
 
     /// Target synchronisation overhead: merge+refresh traffic ≤ `1/N` of batch work.
-    pub(crate) const DP_SYNC_OVERHEAD_DIVISOR: usize = 10;
+    ///
+    /// Calibrated against `parallel_scaling`'s Sweep C (2.1 MiB model, 4 shards,
+    /// min-of-9 epochs), which is markedly asymmetric — merging too often is far more
+    /// expensive than merging too rarely:
+    ///
+    /// | samples between merges | vs exact |
+    /// |---|---|
+    /// | 32  | 0.51× |
+    /// | 64  | 0.76× |
+    /// | 128 | 1.06× |
+    /// | 256 | **1.14×** |
+    /// | 512 | 1.09× |
+    /// | 1000 (whole epoch) | 1.05× |
+    ///
+    /// A divisor of 10 landed on 128 for that shape — on the wrong side of the knee.
+    /// 20 lands on ~256. Erring towards larger batches is also the safer direction:
+    /// the downside is replica drift (bounded by [`DP_BATCH_MAX`]), whereas the
+    /// downside of erring small is halving throughput.
+    pub(crate) const DP_SYNC_OVERHEAD_DIVISOR: usize = 20;
 
     /// Upper bound on samples between merges (keeps replica drift bounded).
     pub(crate) const DP_BATCH_MAX: usize = 8192;
@@ -382,13 +389,6 @@ mod imp {
             }
             let k = threads.min(DP_MAX_SHARDS).min(n);
             if shape.replica_bytes().saturating_mul(k) > DP_AUTO_MAX_REPLICA_BYTES {
-                return None;
-            }
-            // The master plus every replica must stay cache-resident, or replica
-            // training costs k x the memory bandwidth for the same work and loses to
-            // the exact path. See DP_AUTO_LLC_DIVISOR for the measurements.
-            let footprint = shape.replica_bytes().saturating_mul(k + 1);
-            if footprint > llc_bytes() / DP_AUTO_LLC_DIVISOR {
                 return None;
             }
         }
@@ -686,26 +686,28 @@ mod imp {
         }
 
         #[test]
-        fn auto_declines_when_replicas_would_not_fit_cache() {
+        fn auto_fires_for_large_models_but_respects_the_memory_budget() {
             let env = DpEnv::default();
             // examples/bench_training.rs: 2 classes x 10_000 clauses/class, 1000
-            // features = 40 MiB of TA. Measured at 0.9x vs sequential on a 33 MiB-L3
-            // box, because 4 replicas stream 180 MiB. Auto must leave this exact.
+            // features = 40 MiB of TA. Replicas do not fit L3, but data-parallel is
+            // not slower there either, so auto should still fire.
             let sh = shape(20_000, 1_000, 10_000);
-            assert!(
-                sh.replica_bytes() * 5 > llc_bytes() / DP_AUTO_LLC_DIVISOR,
-                "test premise: this shape should exceed the cache budget"
-            );
-            assert!(plan_epoch(&sh, 2000, AUTO, NOPINS, true, 4, &env).is_none());
-            // ...but an explicit opt-in still overrides the cache heuristic.
-            assert!(plan_epoch(&sh, 2000, Some(true), NOPINS, true, 4, &env).is_some());
+            assert!(plan_epoch(&sh, 2000, AUTO, NOPINS, true, 4, &env).is_some());
+
+            // But a model whose replicas would blow the memory budget is left alone
+            // unless explicitly asked for.
+            let huge = shape(4_000_000, 1_000, 2_000_000);
+            assert!(huge.replica_bytes() * 4 > DP_AUTO_MAX_REPLICA_BYTES);
+            assert!(plan_epoch(&huge, 2000, AUTO, NOPINS, true, 4, &env).is_none());
+            assert!(plan_epoch(&huge, 2000, Some(true), NOPINS, true, 4, &env).is_some());
         }
 
         #[test]
-        fn auto_fires_in_the_measured_cache_resident_window() {
+        fn auto_fires_for_the_measured_winning_shapes() {
             let env = DpEnv::default();
-            // parallel_scaling Sweep A rows measured at 2.3-2.9x on 4 cores: these
-            // are exactly the shapes auto exists to catch.
+            // parallel_scaling Sweep A shapes: these are the ones auto exists to
+            // catch. Note n = 1000 here, the sweep's epoch size — DP_AUTO_MIN_SAMPLES
+            // must stay below it or the whole sweep silently measures the exact path.
             for (name, cpc) in [("16 cpc", 16usize), ("256 cpc", 256), ("1024 cpc", 1024)] {
                 let sh = shape(2 * cpc, 512, cpc);
                 let plan = plan_epoch(&sh, 2000, AUTO, NOPINS, true, 4, &env)
@@ -740,8 +742,16 @@ mod imp {
         #[test]
         fn pins_and_env_override_the_plan() {
             let sh = shape(2048, 512, 1024);
-            let plan = plan_epoch(&sh, 2000, AUTO, (Some(3), Some(256)), true, 4, &DpEnv::default())
-                .unwrap();
+            let plan = plan_epoch(
+                &sh,
+                2000,
+                AUTO,
+                (Some(3), Some(256)),
+                true,
+                4,
+                &DpEnv::default(),
+            )
+            .unwrap();
             assert_eq!((plan.shards, plan.batch), (3, 256));
             let env = DpEnv {
                 shards: Some(2),
@@ -750,7 +760,10 @@ mod imp {
                 ..Default::default()
             };
             let plan = plan_epoch(&sh, 2000, AUTO, (Some(3), Some(256)), true, 4, &env).unwrap();
-            assert_eq!((plan.shards, plan.batch, plan.rule), (2, 512, MergeRule::SumDelta));
+            assert_eq!(
+                (plan.shards, plan.batch, plan.rule),
+                (2, 512, MergeRule::SumDelta)
+            );
         }
 
         #[test]
@@ -774,9 +787,16 @@ mod imp {
             // model needs proportionally more samples between merges.
             let two = shape(2048, 512, 1024);
             let ten = shape(2048, 512, 205);
-            let b2 = plan_epoch(&two, 8000, AUTO, NOPINS, true, 4, &env).unwrap().batch;
-            let b10 = plan_epoch(&ten, 8000, AUTO, NOPINS, true, 4, &env).unwrap().batch;
-            assert!(b10 > b2, "10-class batch {b10} should exceed 2-class batch {b2}");
+            let b2 = plan_epoch(&two, 8000, AUTO, NOPINS, true, 4, &env)
+                .unwrap()
+                .batch;
+            let b10 = plan_epoch(&ten, 8000, AUTO, NOPINS, true, 4, &env)
+                .unwrap()
+                .batch;
+            assert!(
+                b10 > b2,
+                "10-class batch {b10} should exceed 2-class batch {b2}"
+            );
         }
 
         #[test]

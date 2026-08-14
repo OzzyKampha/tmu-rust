@@ -56,11 +56,11 @@ let accuracy = tm.accuracy(&test_x, &test_y);
   - `TMCompositeClassifier` — ensemble of per-class Tsetlin Machines with independent clause banks
   - `TMAutoEncoder` — binary reconstruction via positive-only clause banks
   - `TMSparseClassifier` — sparse clause bank with **absorbing actions**: literals are permanently dropped from each clause as training converges, so memory and per-clause evaluation scale with the number of *active* literals (a big win in high-dimensional, sparsely-relevant feature spaces)
-- Optional multi-threaded training via [Rayon](https://github.com/rayon-rs/rayon) (`--features parallel`)
+- Optional multi-threaded training via [Rayon](https://github.com/rayon-rs/rayon) (`--features parallel`) — automatic for large enough workloads; see [Multi-threaded training](#multi-threaded-training)
 - AVX2 fast paths for clause update loops with runtime dispatch — u8 TA counters processed 32-wide (4× smaller working set vs u32; scalar fallback on non-AVX2 targets)
 - Type-safe `Encoder` for binary, numeric (quantile booleanization), and categorical inputs
 - Fast booleanizer for continuous-valued inputs
-- Save/load trained models and encoders to disk via the `SaveLoad` trait (on by default through the `serde` feature) — serde + bincode preserve all learned state **and** RNG streams, so a reloaded model predicts identically and can resume training deterministically. Build with `--no-default-features` for a dependency-free build without save/load
+- Save/load trained models and encoders to disk via the `SaveLoad` trait (on by default through the `serde` feature) — serde + bincode preserve all learned state **and** RNG streams, so a reloaded model predicts identically and can resume training deterministically (on the exact path — see [Multi-threaded training](#multi-threaded-training) for the data-parallel caveat; the runtime-only data-parallel settings are not serialised, so a loaded model resumes on `auto`). Build with `--no-default-features` for a dependency-free build without save/load
 - Ports of the core TMU demos including classification, regression, convolution, autoencoder, and composite
 
 ---
@@ -79,11 +79,42 @@ Run a self-contained example:
 cargo run --release --example noisy_xor
 ```
 
-For multi-threaded training:
+### Multi-threaded training
 
 ```sh
 cargo run --release --features parallel --example mnist
 ```
+
+With `--features parallel` on more than one core, `TsetlinMachine::fit_epoch`
+**automatically** trains data-parallel once the workload is large enough to benefit
+(≥ 256 samples per epoch, ≥ 8 KiB of TA state touched per sample). The epoch is split
+into mini-batches; each shard trains a private replica and the replicas are merged
+after every mini-batch.
+
+On that path training is **approximate** — results are not bit-identical to
+sequential training, and they depend on the shard count, which by default follows the
+Rayon thread count. They *are* reproducible for a fixed shard count:
+
+```rust
+let tm = TsetlinMachine::new(2, 12, 8, 15, 3.9)
+    .data_parallel_shards(4)     // pin for reproducibility across machines
+    .data_parallel_batch(256);   // samples between merges
+```
+
+To train exactly, use any of `.data_parallel(false)`, `fit_epoch_exact(..)`, or
+`TMU_RS_DATA_PARALLEL=0`. Small models, single-core builds and Type III feedback
+always train exactly regardless.
+
+Replicas are cached between epochs, costing about `shards × 1.13 × n_clauses ×
+2 × n_features` bytes while training (a 40 MiB model on 4 shards adds ~180 MiB).
+`clear_replica_cache()` releases it.
+
+**Expect modest gains.** Dense Tsetlin Machine training is memory-bandwidth bound, so
+extra cores mostly wait on memory whichever way the work is divided. On a 4-core Xeon
+the data-parallel and exact clause-parallel paths land within ~10% of each other
+across model sizes; see [BENCHMARKS.md](BENCHMARKS.md). `TMCompositeClassifier` is the
+exception — its ensemble members are genuinely independent, so they train concurrently
+and *exactly*.
 
 For maximum performance, compile with native CPU optimizations (enables AVX2 and other extensions at compile time):
 

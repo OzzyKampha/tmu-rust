@@ -6,7 +6,56 @@ All notable changes to tmu-rs are documented here.
 
 ## [Unreleased]
 
+### Changed
+- **Data-parallel training is now automatic** for `TsetlinMachine`. Built with
+  `--features parallel` on more than one core, `fit_epoch` picks a data-parallel path
+  once an epoch has ≥ 256 samples and each sample touches ≥ 8 KiB of TA state. On that
+  path training is **approximate**: results are not bit-identical to sequential
+  training and depend on the shard count. Smaller models, single-core builds and
+  Type III feedback continue to train exactly.
+  Three ways to opt out: `.data_parallel(false)`, the new `fit_epoch_exact()`, or
+  `TMU_RS_DATA_PARALLEL=0`. A one-line notice is printed to stderr the first time auto
+  engages (silence it with `TMU_RS_DP_QUIET=1`).
+- **Data-parallel training merges per mini-batch instead of once per epoch**, and
+  reuses cached replicas rather than cloning the model every epoch. Rayon is now
+  dispatched roughly twice per mini-batch instead of twice per *sample*, and the merge
+  streams each replica sequentially (fusing the weight merge and `rebuild_include`
+  into one cache-resident pass) instead of gathering across replicas per element.
+- **`data_parallel(true)` is now honoured at any model size.** It previously also
+  required `use_parallel(n_clauses, words)`, which silently ignored the opt-in for
+  small models — the `data_parallel_learns_xor` tests had never actually exercised the
+  data-parallel path.
+- **Type III feedback no longer panics under `data_parallel(true)`**; it declines the
+  path and trains exactly. The two `assert!(!self.type_iii, ...)` calls are gone, so
+  automatic selection can never panic on a flag the user did not set.
+- **`TMCompositeClassifier` trains its ensemble members concurrently.** Unlike the
+  in-model data-parallel path this is **exact** — members share no mutable state and
+  each draws its shuffle from its own RNG — and it is asserted clause-by-clause
+  against serial training.
+
+### Performance
+- Dense TM training is memory-bandwidth bound, so multicore speedups are modest
+  regardless of strategy. On a 4-core Xeon (33 MiB L3, min of 9 epochs) the
+  data-parallel path lands within ~10% of the exact clause-parallel path across model
+  sizes from 0.03 MiB to 33.6 MiB of TA state. The merge cadence is the setting that
+  actually moves the number: at a 2.1 MiB model, merging every 256 samples measures
+  1.14× versus exact, while merging every 32 samples measures **0.46×**.
+- `examples/parallel_scaling.rs` now reports the automatic decision alongside the
+  exact and forced columns, adds a merge-cadence sweep, and takes the **minimum** of 9
+  epochs rather than the median of 3 — the previous sampling was not reproducible on
+  shared hardware (±20% between runs, wider than most effects it measured).
+- Removed a full copy of the encoded batch that `TMSparseClassifier::fit_epoch` made
+  on **every epoch**, and a per-sample copy in its `fit_one`.
+- `TMCompositeClassifier::predict_batch` no longer allocates an `EncodedSample` per
+  sample per member, and runs sample-parallel.
+
 ### Added
+- `TsetlinMachine::fit_epoch_exact`, `data_parallel_auto`, `data_parallel_shards`,
+  `data_parallel_batch` and `clear_replica_cache`. Pinning shards and batch makes the
+  approximate path bit-reproducible across machines with different core counts.
+- `TMCompositeClassifier::data_parallel` to force member-parallel training on or off.
+- Environment overrides: `TMU_RS_DATA_PARALLEL`, `TMU_RS_DP_SHARDS`,
+  `TMU_RS_DP_BATCH`, `TMU_RS_DP_MERGE`, `TMU_RS_DP_QUIET`.
 - **TMSparseClassifier** — sparse clause bank with **absorbing actions** (port of
   TMU's `ClauseBankSparse`). Each clause stores included / excluded literal index
   lists instead of a dense per-literal counter array; literals that reach the

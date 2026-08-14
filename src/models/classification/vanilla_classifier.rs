@@ -2550,6 +2550,104 @@ mod tests {
         assert!(acc > 0.95, "data_parallel XOR accuracy too low: {acc}");
     }
 
+    /// The approximation must not cost meaningful accuracy versus exact training.
+    ///
+    /// Data-parallel training exists to trade exactness for speed; this pins how much
+    /// exactness it is allowed to trade. Uses a pinned shard count and merge cadence
+    /// so the comparison does not depend on the machine's core count.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn data_parallel_accuracy_tracks_exact() {
+        let (xtr, ytr) = make_xor(6000, 0.1, 11);
+        let (xte, yte) = make_xor(2000, 0.0, 12);
+        let e = enc(12);
+        let btr = e.encode_batch(&as_slices(&xtr));
+        let bte = e.encode_batch(&as_slices(&xte));
+
+        let cfg = || TsetlinMachine::with_config(2, 12, 40, 15, 3.9, 8, true, 3);
+        let mut exact = cfg().data_parallel(false);
+        let mut dp = cfg()
+            .data_parallel(true)
+            .data_parallel_shards(4)
+            .data_parallel_batch(256);
+        for _ in 0..30 {
+            exact.fit_epoch(&btr, &ytr);
+            dp.fit_epoch(&btr, &ytr);
+        }
+        let (a_exact, a_dp) = (exact.accuracy(&bte, &yte), dp.accuracy(&bte, &yte));
+        assert!(
+            a_dp >= a_exact - 0.02,
+            "data-parallel accuracy {a_dp:.4} fell more than 2 points below exact {a_exact:.4}"
+        );
+    }
+
+    /// Data-parallel training is deterministic once the shard count and merge cadence
+    /// are pinned — the guarantee that makes an approximate default acceptable.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn data_parallel_is_reproducible_for_pinned_shards() {
+        let (xtr, ytr) = make_xor(3000, 0.1, 21);
+        let btr = enc(12).encode_batch(&as_slices(&xtr));
+        let build = || {
+            TsetlinMachine::with_config(2, 12, 40, 15, 3.9, 8, true, 5)
+                .data_parallel(true)
+                .data_parallel_shards(3)
+                .data_parallel_batch(128)
+        };
+        let (mut a, mut b) = (build(), build());
+        for _ in 0..6 {
+            a.fit_epoch(&btr, &ytr);
+            b.fit_epoch(&btr, &ytr);
+        }
+        assert_eq!(a.ta, b.ta, "TA state diverged between identical DP runs");
+        assert_eq!(a.weights, b.weights);
+        assert_eq!(a.include, b.include);
+    }
+
+    /// Replicas are cached and refreshed in place, not reallocated every epoch — and
+    /// the cache never rides along on a `clone()`, which would make forking quadratic.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn replica_cache_is_reused_and_never_cloned() {
+        let (xtr, ytr) = make_xor(3000, 0.1, 31);
+        let btr = enc(12).encode_batch(&as_slices(&xtr));
+        let mut tm = TsetlinMachine::with_config(2, 12, 40, 15, 3.9, 8, true, 5)
+            .data_parallel(true)
+            .data_parallel_shards(2);
+
+        tm.fit_epoch(&btr, &ytr);
+        assert_eq!(tm.replica_cache_len(), 2);
+        let ptr_before = tm.dp_pool.replicas[0].ta.as_ptr();
+
+        tm.fit_epoch(&btr, &ytr);
+        assert_eq!(tm.replica_cache_len(), 2);
+        assert_eq!(
+            ptr_before,
+            tm.dp_pool.replicas[0].ta.as_ptr(),
+            "replica TA was reallocated between epochs instead of refreshed in place"
+        );
+
+        assert_eq!(tm.clone().replica_cache_len(), 0, "clone copied the pool");
+        tm.clear_replica_cache();
+        assert_eq!(tm.replica_cache_len(), 0);
+    }
+
+    /// Type III feedback has no meaningful replica merge, so it must fall back to
+    /// exact training rather than panicking — including when DP is explicitly forced.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn type_iii_falls_back_to_exact_instead_of_panicking() {
+        let (xtr, ytr) = make_xor(2000, 0.1, 41);
+        let btr = enc(12).encode_batch(&as_slices(&xtr));
+        let mut tm = TsetlinMachine::with_config(2, 12, 40, 15, 3.9, 8, true, 5)
+            .type_iii_feedback(200.0)
+            .data_parallel(true);
+        for _ in 0..3 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+        assert_eq!(tm.replica_cache_len(), 0, "Type III must not fork replicas");
+    }
+
     // ---- growing the feature space --------------------------------------------
 
     /// Zero-pad every sample from its current length up to `n`.

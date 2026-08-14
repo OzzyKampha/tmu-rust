@@ -331,7 +331,9 @@ mod tests {
         let build = || {
             let mut c = TMCompositeClassifier::new();
             for seed in [11u64, 22, 33, 44] {
-                c.add(TsetlinMachine::with_config(2, 12, 10, 12, 3.9, 8, true, seed));
+                c.add(TsetlinMachine::with_config(
+                    2, 12, 10, 12, 3.9, 8, true, seed,
+                ));
             }
             c
         };

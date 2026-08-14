@@ -26,7 +26,11 @@ use tmu_rs::{Encoder, Rng, TMSparseClassifier, TsetlinMachine};
 const N_CLASSES: usize = 2;
 const SAMPLES: usize = 1000;
 const WARMUP: usize = 1;
-const TIMED: usize = 3;
+/// Timed epochs per cell. Kept high because these numbers are usually read on
+/// shared/virtualised hardware, where a median of 3 is not reproducible: the same
+/// cell was observed spanning 70–89 ms across runs, i.e. ±20%, which is wider than
+/// most of the effects this sweep is meant to resolve.
+const TIMED: usize = 9;
 
 fn make(n: usize, n_features: usize, seed: u64) -> (Vec<Vec<u8>>, Vec<usize>) {
     let mut rng = Rng::new(seed);
@@ -70,6 +74,33 @@ fn time_epoch_dense_dp(
     median_epoch(|| tm.fit_epoch(batch, ys))
 }
 
+/// Whatever `fit_epoch` does with no flags set — i.e. the automatic decision a
+/// user actually gets. Compare against the `dense(exact)` and `dense(DP)` columns
+/// to see whether the auto gate picked the faster of the two.
+fn time_epoch_dense_auto(
+    features: usize,
+    cpc: usize,
+    batch: &tmu_rs::EncodedBatch,
+    ys: &[usize],
+) -> f64 {
+    let mut tm = TsetlinMachine::with_config(N_CLASSES, features, cpc, 20, 3.9, 8, true, 7);
+    median_epoch(|| tm.fit_epoch(batch, ys))
+}
+
+/// Forced data-parallel with a pinned merge cadence, for the batch-size sweep.
+fn time_epoch_dense_dp_batch(
+    features: usize,
+    cpc: usize,
+    dp_batch: usize,
+    batch: &tmu_rs::EncodedBatch,
+    ys: &[usize],
+) -> f64 {
+    let mut tm = TsetlinMachine::with_config(N_CLASSES, features, cpc, 20, 3.9, 8, true, 7)
+        .data_parallel(true)
+        .data_parallel_batch(dp_batch);
+    median_epoch(|| tm.fit_epoch(batch, ys))
+}
+
 fn time_epoch_sparse(
     features: usize,
     cpc: usize,
@@ -81,19 +112,23 @@ fn time_epoch_sparse(
     median_epoch(|| tm.fit_epoch(batch, ys))
 }
 
+/// Fastest of [`TIMED`] epochs, in ms.
+///
+/// Deliberately the minimum, not the median. Interference from other tenants only
+/// ever makes an epoch *slower*, so on shared hardware the minimum is the least
+/// contaminated estimate of what the code can actually do, while the median drifts
+/// with whatever else is running. (The name is kept for the callers' sake.)
 fn median_epoch(mut epoch: impl FnMut()) -> f64 {
     for _ in 0..WARMUP {
         epoch();
     }
-    let mut times: Vec<f64> = (0..TIMED)
+    (0..TIMED)
         .map(|_| {
             let t = Instant::now();
             epoch();
             t.elapsed().as_secs_f64() * 1e3
         })
-        .collect();
-    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    times[times.len() / 2]
+        .fold(f64::INFINITY, f64::min)
 }
 
 fn main() {
@@ -114,16 +149,54 @@ fn main() {
         feats_a / 32
     );
     println!(
-        "  {:>7} | {:>12} | {:>12} | {:>10}",
-        "clauses", "dense(exact)", "dense(DP)", "sparse"
+        "  {:>7} | {:>9} | {:>12} | {:>16} | {:>10} | {:>10}",
+        "clauses", "TA bytes", "dense(exact)", "dense(DP forced)", "auto", "sparse"
     );
-    println!("  {}", "-".repeat(52));
+    println!("  {}", "-".repeat(80));
     for &cpc in &[16usize, 64, 256, 1024, 4096, 8192, 16384] {
         let d = time_epoch_dense(feats_a, cpc, &btr, &ytr);
         let dp = time_epoch_dense_dp(feats_a, cpc, &btr, &ytr);
+        let au = time_epoch_dense_auto(feats_a, cpc, &btr, &ytr);
         let s = time_epoch_sparse(feats_a, cpc, &btr, &ytr);
-        let sp = d / dp;
-        println!("  {cpc:>7} | {d:>10.1}ms | {dp:>8.1}ms {sp:>3.1}x | {s:>8.1}ms");
+        let ta = N_CLASSES * cpc * 2 * feats_a;
+        println!(
+            "  {cpc:>7} | {:>8.1}M | {d:>10.1}ms | {dp:>10.1}ms {:>3.1}x | {au:>6.1}ms {:>3.1}x | {s:>8.1}ms",
+            ta as f64 / 1e6,
+            d / dp,
+            d / au,
+        );
+    }
+    println!(
+        "  auto should never be materially slower than the better of the two columns\n  \
+         to its left. Note dense TM training is memory-bandwidth bound, so on most\n  \
+         hardware every column here lands within ~10% of the others — see Sweep C for\n  \
+         the one knob that does move the number."
+    );
+
+    // ── Sweep C: merge cadence (samples between merges) ──────────────────────
+    // Fewer merges = less synchronisation but more replica drift. This is the
+    // curve that sets the batch-size rule in src/parallel.rs.
+    let cpc_c = 1024;
+    println!(
+        "\nSweep C — merge cadence at {cpc_c} clauses/class, {feats_a} features \
+         ({:.1}M TA bytes):",
+        (N_CLASSES * cpc_c * 2 * feats_a) as f64 / 1e6
+    );
+    println!(
+        "  {:>12} | {:>10} | {:>8}",
+        "dp_batch", "ms/epoch", "vs exact"
+    );
+    println!("  {}", "-".repeat(36));
+    let exact_c = time_epoch_dense(feats_a, cpc_c, &btr, &ytr);
+    println!("  {:>12} | {exact_c:>8.1}ms | {:>7.2}x", "exact", 1.0);
+    for &b in &[32usize, 64, 128, 256, 512, SAMPLES] {
+        let t = time_epoch_dense_dp_batch(feats_a, cpc_c, b, &btr, &ytr);
+        let label = if b >= SAMPLES {
+            format!("{b} (epoch)")
+        } else {
+            b.to_string()
+        };
+        println!("  {label:>12} | {t:>8.1}ms | {:>7.2}x", exact_c / t);
     }
 
     // ── Sweep B: FIX low clause count, widen features (the headline) ────────
