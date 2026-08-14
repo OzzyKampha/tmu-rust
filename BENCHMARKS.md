@@ -487,3 +487,41 @@ drifted by more than 2× over the course of an afternoon.
 no mutable state, so member-parallel training is bit-identical to serial (asserted
 clause-by-clause in `composite_member_parallel_matches_serial`). Ensembles therefore
 scale with member count in a way a single dense model does not.
+
+---
+
+## Memory traffic
+
+Dense TM training is bandwidth-bound, so the lever that matters is bytes touched per
+sample. Wall-clock on shared hardware is too noisy to evaluate such changes, so use
+`examples/traffic_profile.rs` — one epoch at a fixed config on the exact path — under
+cachegrind, which *counts* rather than times and is therefore deterministic:
+
+```sh
+cargo build --release --example traffic_profile
+valgrind --tool=cachegrind --cache-sim=yes target/release/examples/traffic_profile
+```
+
+Read `D refs` (total data references) and `LLd misses` (main-memory traffic).
+
+### Conditional include rebuild
+
+The include bitset is a pure function of `ta >= half`, so it is only recomputed when
+an update actually crosses that threshold; the update kernels report this. Effect at
+1024 clauses/class × 512 features (2.1 MiB of TA state):
+
+| metric | before | after | change |
+|---|---:|---:|---:|
+| instructions | 1,859,555,177 | 1,794,370,960 | **−3.5%** |
+| data references | 563,359,676 | 512,854,061 | **−9.0%** |
+| D1 / LL misses | 21,199,911 / 83,451 | 21,199,351 / 83,453 | unchanged |
+
+**The miss counts do not move at this size, and that is the interesting part.** A
+2.1 MiB model is cache-resident, and the redundant re-read was hitting L1 — the bytes
+had just been written by the update loop. So the saving there is instructions and L1
+bandwidth, not DRAM traffic. On a 40 MiB model that genuinely exceeds the 33 MiB L3,
+paired alternating runs (min of 8 epochs each) were consistently faster by 3–13%.
+
+The general lesson: a redundant pass over data that is still in L1 costs far less than
+a byte-count argument suggests. Check where the data actually lives before assuming a
+traffic reduction becomes a memory-traffic reduction.
