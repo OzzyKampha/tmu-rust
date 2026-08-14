@@ -85,15 +85,27 @@ pub struct TsetlinMachine {
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     train_scalar: bool,
 
-    /// Opt-in: let `fit_epoch` use the faster (approximate) data-parallel path when
-    /// the workload is large enough. Off by default (exact training). Not serialised.
+    /// Data-parallel training mode: `None` = auto (decide per epoch from the
+    /// workload), `Some(true)` = always, `Some(false)` = never (exact only).
+    /// Not serialised — a loaded model resumes on `auto`.
     #[cfg_attr(feature = "serde", serde(skip))]
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    data_parallel: bool,
-    /// Whether the "use data_parallel" hint has already been printed (once per model).
+    dp_mode: Option<bool>,
+    /// Pinned shard count / samples-between-merges, for reproducible data-parallel
+    /// runs across machines with different core counts. `None` = derive.
     #[cfg_attr(feature = "serde", serde(skip))]
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    hint_shown: bool,
+    dp_shards: Option<usize>,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    dp_batch: Option<usize>,
+    /// Whether the one-time "training is now approximate" notice has been printed.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    dp_notice_shown: bool,
+    /// Cached per-shard replicas; see [`ReplicaPool`](crate::parallel::ReplicaPool).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    dp_pool: crate::parallel::ReplicaPool<TsetlinMachine>,
 }
 
 #[cfg(feature = "serde")]
@@ -303,25 +315,91 @@ impl TsetlinMachine {
             d: 200.0,
             type_iii: false,
             train_scalar: false,
-            data_parallel: false,
-            hint_shown: false,
+            dp_mode: None,
+            dp_shards: None,
+            dp_batch: None,
+            dp_notice_shown: false,
+            dp_pool: Default::default(),
         }
     }
 
-    /// Opt into **faster, approximate** training. When enabled (and built with
-    /// `--features parallel`), [`fit_epoch`](Self::fit_epoch) transparently uses a
-    /// data-parallel path for large enough models — samples are sharded across
-    /// threads, each thread trains a replica, and the replicas are merged by
-    /// averaging. Typically ~2–3× faster on multiple cores.
+    /// Force data-parallel training on or off, overriding the automatic decision.
     ///
-    /// Trade-off: results are **no longer bit-identical** to exact training and
-    /// depend on the thread count (accuracy tracks exact within noise, occasionally
-    /// ±a sample — not a strict guarantee). Leave it off (the default) for exact,
-    /// reproducible training. No effect without `--features parallel` or on models
-    /// too small to benefit. Unsupported with Type III feedback.
+    /// With `--features parallel`, [`fit_epoch`](Self::fit_epoch) **automatically**
+    /// uses mini-batch data-parallel training when the workload is large enough to
+    /// benefit (see [`fit_epoch`](Self::fit_epoch) for the thresholds), so you do not
+    /// need to call this to get multicore training.
+    ///
+    /// * `true` — always data-parallel, at any model size (still skipped on a single
+    ///   core and under Type III feedback).
+    /// * `false` — never; every epoch trains exactly. Equivalent to always calling
+    ///   [`fit_epoch_exact`](Self::fit_epoch_exact).
+    ///
+    /// Trade-off on the data-parallel path: results are **not bit-identical** to
+    /// exact training and depend on the shard count. They *are* reproducible for a
+    /// fixed shard count — see [`data_parallel_shards`](Self::data_parallel_shards).
     pub fn data_parallel(mut self, on: bool) -> Self {
-        self.data_parallel = on;
+        self.dp_mode = Some(on);
         self
+    }
+
+    /// Restore the automatic data-parallel decision (the default).
+    pub fn data_parallel_auto(mut self) -> Self {
+        self.dp_mode = None;
+        self
+    }
+
+    /// Pin the number of shards (replicas) used by data-parallel training.
+    ///
+    /// Data-parallel results depend on the shard count, which otherwise follows the
+    /// Rayon thread count and so varies by machine. Pinning this makes runs
+    /// reproducible across machines. `0` restores the default.
+    pub fn data_parallel_shards(mut self, shards: usize) -> Self {
+        self.dp_shards = (shards > 0).then_some(shards);
+        self.dp_pool.replicas.clear();
+        self
+    }
+
+    /// Pin the number of samples each shard's replica trains on between merges.
+    ///
+    /// Smaller values keep replicas closer to the master (more accurate, more
+    /// synchronisation); larger values approach one merge per epoch. `0` restores the
+    /// derived value. Together with
+    /// [`data_parallel_shards`](Self::data_parallel_shards) this makes the
+    /// data-parallel path fully reproducible.
+    pub fn data_parallel_batch(mut self, batch: usize) -> Self {
+        self.dp_batch = (batch > 0).then_some(batch);
+        self
+    }
+
+    /// Release the cached training replicas.
+    ///
+    /// Data-parallel training keeps one private replica per shard alive between
+    /// epochs to avoid reallocating them (roughly `shards × 1.13 × n_clauses ×
+    /// 2 × n_features` bytes). Call this after training to give that memory back;
+    /// the next epoch simply rebuilds what it needs.
+    pub fn clear_replica_cache(&mut self) {
+        self.dp_pool.replicas.clear();
+        self.dp_pool.replicas.shrink_to_fit();
+    }
+
+    /// Temporarily force exact training, returning the previous mode.
+    ///
+    /// Used by [`TMCompositeClassifier`](crate::TMCompositeClassifier) while it trains
+    /// its members in parallel: `rayon::current_num_threads()` does not account for
+    /// nesting, so each member would otherwise fork a full set of replicas of its own
+    /// (`members × threads` model copies).
+    #[cfg(feature = "parallel")]
+    pub(crate) fn suppress_data_parallel(&mut self) -> Option<bool> {
+        let saved = self.dp_mode;
+        self.dp_mode = Some(false);
+        saved
+    }
+
+    /// Restore the mode saved by [`suppress_data_parallel`](Self::suppress_data_parallel).
+    #[cfg(feature = "parallel")]
+    pub(crate) fn restore_data_parallel(&mut self, saved: Option<bool>) {
+        self.dp_mode = saved;
     }
 
     /// Limit how many literals each clause may include (Type Ia guard).
@@ -514,7 +592,13 @@ impl TsetlinMachine {
 
     /// Fill `out` with the clamped weighted clause sums for each class for an encoded sample.
     pub fn scores(&self, sample: &EncodedSample, out: &mut [i32]) {
-        let lit = &sample.0;
+        self.scores_lit(&sample.0, out);
+    }
+
+    /// [`scores`](Self::scores) on an already-packed literal slice, so callers that
+    /// already hold a row of an [`EncodedBatch`] need not copy it into an
+    /// [`EncodedSample`] first.
+    pub(crate) fn scores_lit(&self, lit: &[u64], out: &mut [i32]) {
         debug_assert_eq!(out.len(), self.n_classes);
         let cps = self.clauses_per_class;
         let words = self.words;
@@ -684,8 +768,18 @@ impl TsetlinMachine {
         let class_inc = &mut include[c * cps * words..(c + 1) * cps * words];
         let class_w = &mut weights[c * cps..(c + 1) * cps];
         let class_rng = &mut rngs[c * cps..(c + 1) * cps];
-        let class_ind = &mut ind[c * cps * n_literals..(c + 1) * cps * n_literals];
-        let class_cat = &mut cat[c * cps * words..(c + 1) * cps * words];
+        // `ind`/`cat` are only ever read inside the Type III branches below. Slicing
+        // them lazily lets a non-Type-III model leave both vectors empty, which halves
+        // the per-replica footprint of data-parallel training (`ind` is the same size
+        // as `ta`, `cat` mirrors `include`).
+        let (class_ind, class_cat) = if type_iii_en {
+            (
+                &mut ind[c * cps * n_literals..(c + 1) * cps * n_literals],
+                &mut cat[c * cps * words..(c + 1) * cps * words],
+            )
+        } else {
+            (&mut [][..], &mut [][..])
+        };
 
         #[cfg(feature = "parallel")]
         if !force_scalar && cps >= DENSE_TRAIN_PARALLEL_MIN {
@@ -847,32 +941,47 @@ impl TsetlinMachine {
 
     /// Run one training epoch over an encoded batch, shuffling the order each epoch.
     ///
-    /// **Exact by default** — bit-identical to sequential training and deterministic.
-    /// If [`data_parallel(true)`](Self::data_parallel) was set *and* the build has
-    /// `--features parallel` *and* the model/batch are large enough to benefit, this
-    /// transparently switches to the faster **data-parallel** path (approximate; see
-    /// [`data_parallel`](Self::data_parallel)). You always call `fit_epoch` either way.
+    /// With `--features parallel` on more than one core, this **automatically** trains
+    /// data-parallel once the workload is large enough to pay for it: at least 1024
+    /// samples, 256 KiB of TA state, and 8 KiB of TA touched per sample. On that path
+    /// the epoch is split into mini-batches, each shard trains a private replica, and
+    /// the replicas are merged after every mini-batch.
     ///
-    /// When training a large model on the exact path without the flag, a one-time
-    /// hint is printed to stderr suggesting `data_parallel(true)`.
+    /// Data-parallel training is **approximate**: results are not bit-identical to
+    /// sequential training and depend on the shard count. They are reproducible for a
+    /// fixed shard count — see [`data_parallel_shards`](Self::data_parallel_shards).
+    /// Smaller models, single-core builds, and Type III feedback always train exactly.
+    ///
+    /// To opt out entirely use [`data_parallel(false)`](Self::data_parallel),
+    /// [`fit_epoch_exact`](Self::fit_epoch_exact), or set `TMU_RS_DATA_PARALLEL=0`.
     pub fn fit_epoch(&mut self, batch: &EncodedBatch, ys: &[usize]) {
         debug_assert_eq!(batch.words, self.words);
         let n = batch.n;
         assert_eq!(n, ys.len());
 
-        // Opt-in fast path: data-parallel, but only when it actually helps.
         #[cfg(feature = "parallel")]
-        if self.data_parallel
-            && rayon::current_num_threads() > 1
-            && n >= PARALLEL_MIN
-            && use_parallel(self.n_classes * self.clauses_per_class, self.words)
         {
-            self.fit_epoch_data_parallel(batch, ys);
-            return;
+            let w = self.words;
+            let data = batch.data.as_slice();
+            if crate::parallel::fit_epoch_dp(self, n, |replica, i| {
+                replica.fit_one_lit(&data[i * w..(i + 1) * w], ys[i]);
+            }) {
+                return;
+            }
         }
-        #[cfg(feature = "parallel")]
-        self.maybe_hint_data_parallel(n);
+        self.fit_epoch_exact(batch, ys);
+    }
 
+    /// Run one training epoch **exactly**, never data-parallel.
+    ///
+    /// Bit-identical to sequential training and deterministic for a given seed,
+    /// regardless of build features or core count. This is what
+    /// [`fit_epoch`](Self::fit_epoch) falls back to; call it directly when you need
+    /// that guarantee unconditionally.
+    pub fn fit_epoch_exact(&mut self, batch: &EncodedBatch, ys: &[usize]) {
+        debug_assert_eq!(batch.words, self.words);
+        let n = batch.n;
+        assert_eq!(n, ys.len());
         let mut order: Vec<usize> = (0..n).collect();
         for i in (1..n).rev() {
             let k = self.rng.below(i + 1);
@@ -882,136 +991,6 @@ impl TsetlinMachine {
         let data = batch.data.as_slice();
         for &i in &order {
             self.fit_one_lit(&data[i * w..(i + 1) * w], ys[i]);
-        }
-    }
-
-    /// One-time stderr hint that a large model would train faster with
-    /// `data_parallel(true)`. Shown only when ALL hold: the flag is off, the model
-    /// is genuinely large, there is more than one core (so it would actually help),
-    /// and it hasn't been shown yet for this model.
-    #[cfg(feature = "parallel")]
-    fn maybe_hint_data_parallel(&mut self, n: usize) {
-        // Suppressed when the flag is already set, already shown, or single-core.
-        if self.hint_shown || self.data_parallel || rayon::current_num_threads() <= 1 {
-            return;
-        }
-        // Only nag when the workload is genuinely large enough that data-parallel
-        // clearly pays (enough samples to amortise the per-epoch clone/merge, and a
-        // model big enough — ~256+ clauses at moderate width — to scale on cores).
-        let n_clauses = self.n_classes * self.clauses_per_class;
-        if n >= 512 && n_clauses.saturating_mul(self.words) >= 8192 {
-            eprintln!(
-                "tmu-rs: training a large model ({n_clauses} clauses × {} features) on the \
-                 exact path — call .data_parallel(true) for ~2-3× faster (approximate, \
-                 data-parallel) training.",
-                self.n_features
-            );
-            self.hint_shown = true;
-        }
-    }
-
-    /// Data-parallel epoch: shard the samples across Rayon threads, train a private
-    /// replica per shard, merge by averaging per-TA counters and per-clause weights
-    /// (then rebuild the include bitsets). Approximate and thread-count dependent;
-    /// invoked only from [`fit_epoch`] when [`data_parallel`](Self::data_parallel) is
-    /// set and the workload is large enough to benefit. Panics under Type III.
-    #[cfg(feature = "parallel")]
-    fn fit_epoch_data_parallel(&mut self, batch: &EncodedBatch, ys: &[usize]) {
-        {
-            use rayon::prelude::*;
-            assert!(
-                !self.type_iii,
-                "data_parallel does not support Type III feedback; unset it or use exact fit_epoch"
-            );
-            debug_assert_eq!(batch.words, self.words);
-            let n = batch.n;
-            assert_eq!(n, ys.len());
-            if n == 0 {
-                return;
-            }
-
-            // Deterministic shuffle — same RNG stream position as fit_epoch.
-            let mut order: Vec<usize> = (0..n).collect();
-            for i in (1..n).rev() {
-                let k = self.rng.below(i + 1);
-                order.swap(i, k);
-            }
-
-            let w = self.words;
-            let data = batch.data.as_slice();
-            let n_shards = rayon::current_num_threads().clamp(1, n);
-            if n_shards == 1 {
-                for &i in &order {
-                    self.fit_one_lit(&data[i * w..(i + 1) * w], ys[i]);
-                }
-                return;
-            }
-
-            // Distinct per-replica RNG seeds, drawn deterministically from the master.
-            let seeds: Vec<u64> = (0..n_shards).map(|_| self.rng.next_u64()).collect();
-            let n_clauses = self.n_classes * self.clauses_per_class;
-            let n_cls = self.n_classes;
-
-            // Replicas: clone state, force scalar (no nested Rayon), reseed streams.
-            let mut replicas: Vec<TsetlinMachine> = seeds
-                .iter()
-                .map(|&sd| {
-                    let mut r = self.clone();
-                    r.train_scalar = true;
-                    r.rng = Rng::new(sd);
-                    r.literal_rng = Rng::new(sd ^ 0x4C49_5445_5241_4C21u64);
-                    r.rngs = (0..n_clauses)
-                        .map(|i| Rng::new(sd ^ (i as u64).wrapping_add(1).wrapping_mul(GOLDEN)))
-                        .collect();
-                    r.class_rngs = (0..n_cls)
-                        .map(|c| {
-                            Rng::new(sd ^ (c as u64 + n_clauses as u64 + 1).wrapping_mul(GOLDEN))
-                        })
-                        .collect();
-                    r
-                })
-                .collect();
-
-            // Each replica trains sequentially on a contiguous shard of the order.
-            let shard_len = n.div_ceil(n_shards);
-            replicas
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(s, replica)| {
-                    let start = s * shard_len;
-                    if start >= n {
-                        return;
-                    }
-                    let end = (start + shard_len).min(n);
-                    for &i in &order[start..end] {
-                        replica.fit_one_lit(&data[i * w..(i + 1) * w], ys[i]);
-                    }
-                });
-
-            // Merge: average TA counters and weights across replicas, then rebuild
-            // the include bitsets so they stay consistent with the merged TA.
-            let kf = replicas.len() as u32;
-            self.ta.par_iter_mut().enumerate().for_each(|(i, t)| {
-                let sum: u32 = replicas.iter().map(|r| r.ta[i] as u32).sum();
-                *t = ((sum + kf / 2) / kf) as u8;
-            });
-            let wmax = self.threshold;
-            self.weights.par_iter_mut().enumerate().for_each(|(i, wv)| {
-                let sum: i64 = replicas.iter().map(|r| r.weights[i] as i64).sum();
-                let avg = ((sum + kf as i64 / 2) / kf as i64) as i32;
-                *wv = avg.clamp(1, wmax);
-            });
-
-            let words = self.words;
-            let n_literals = self.n_literals;
-            let half = self.half;
-            let valid = self.valid.as_slice();
-            self.include
-                .par_chunks_mut(words)
-                .zip(self.ta.par_chunks(n_literals))
-                .for_each(|(inc_c, ta_c)| {
-                    rebuild_include(ta_c, inc_c, valid, words, n_literals, half);
-                });
         }
     }
 
@@ -1117,6 +1096,212 @@ impl TsetlinMachine {
     /// Return `true` if `clause` is a positive clause (even index → votes for the class).
     pub fn clause_is_positive(&self, clause: usize) -> bool {
         clause & 1 == 0
+    }
+
+    /// Number of cached training replicas (test hook for the replica-pool lifecycle).
+    #[cfg(all(test, feature = "parallel"))]
+    pub(crate) fn replica_cache_len(&self) -> usize {
+        self.dp_pool.replicas.len()
+    }
+}
+
+#[cfg(feature = "parallel")]
+impl crate::parallel::DataParallel for TsetlinMachine {
+    fn dp_shape(&self) -> crate::parallel::DpShape {
+        crate::parallel::DpShape {
+            n_clauses: self.n_classes * self.clauses_per_class,
+            n_literals: self.n_literals,
+            words: self.words,
+            // Only the true class and one sampled negative class are updated per
+            // sample — not the whole bank. This is why the merge cadence ends up
+            // depending on the class count rather than on the clause count.
+            clauses_per_sample: 2 * self.clauses_per_class,
+        }
+    }
+
+    fn dp_supported(&self) -> bool {
+        // Type III's indicator/category arrays have no meaningful average, so
+        // replica training is not supported. Declining here (rather than asserting)
+        // is what lets `auto` stay safe for Type III models.
+        !self.type_iii
+    }
+
+    fn dp_mode(&self) -> Option<bool> {
+        self.dp_mode
+    }
+
+    fn dp_pins(&self) -> (Option<usize>, Option<usize>) {
+        (self.dp_shards, self.dp_batch)
+    }
+
+    fn dp_rng(&mut self) -> &mut Rng {
+        &mut self.rng
+    }
+
+    fn dp_pool_mut(&mut self) -> &mut crate::parallel::ReplicaPool<Self> {
+        &mut self.dp_pool
+    }
+
+    fn dp_notice(&mut self, plan: &crate::parallel::DpPlan) {
+        if self.dp_notice_shown || crate::parallel::dp_env().quiet {
+            return;
+        }
+        self.dp_notice_shown = true;
+        eprintln!(
+            "tmu-rs: auto-enabled data-parallel training ({} clauses × {} features, \
+             {} shards, merging every {} samples). Results are approximate and depend \
+             on the shard count; use .data_parallel(false), fit_epoch_exact(), or \
+             TMU_RS_DATA_PARALLEL=0 for exact training.",
+            self.n_classes * self.clauses_per_class,
+            self.n_features,
+            plan.shards,
+            plan.batch,
+        );
+    }
+
+    fn dp_fork(&self) -> Self {
+        let mut r = self.clone();
+        r.train_scalar = true;
+        r.dp_mode = Some(false);
+        r.dp_notice_shown = true;
+        // A replica never runs Type III (see `dp_supported`), so it does not need the
+        // indicator/category arrays — dropping them takes a replica from ~2.1x to
+        // ~1.13x the model's TA bytes.
+        r.ind = Vec::new();
+        r.cat = Vec::new();
+        r
+    }
+
+    fn dp_sync_from(&mut self, master: &Self) {
+        use crate::parallel::sync_vec;
+        sync_vec(&mut self.ta, &master.ta);
+        sync_vec(&mut self.include, &master.include);
+        sync_vec(&mut self.weights, &master.weights);
+        sync_vec(&mut self.valid, &master.valid);
+        sync_vec(&mut self.literals, &master.literals);
+        sync_vec(&mut self.dig_inv, &master.dig_inv);
+        sync_vec(&mut self.dig_keep, &master.dig_keep);
+        sync_vec(&mut self.dig_lit_active, &master.dig_lit_active);
+        sync_vec(&mut self.class_weights, &master.class_weights);
+        // Hyperparameters are copied too, so a replica self-heals after any builder
+        // call or `grow_features` on the master rather than needing invalidation.
+        self.n_classes = master.n_classes;
+        self.n_features = master.n_features;
+        self.n_literals = master.n_literals;
+        self.words = master.words;
+        self.clauses_per_class = master.clauses_per_class;
+        self.threshold = master.threshold;
+        self.s = master.s;
+        self.boost_true_positive = master.boost_true_positive;
+        self.max_included_literals = master.max_included_literals;
+        self.clause_drop_p = master.clause_drop_p;
+        self.literal_drop_p = master.literal_drop_p;
+        self.half = master.half;
+        self.max_state = master.max_state;
+        self.d = master.d;
+        self.type_iii = master.type_iii;
+    }
+
+    fn dp_reseed(&mut self, seed: u64) {
+        let n_clauses = self.n_classes * self.clauses_per_class;
+        let n_cls = self.n_classes;
+        self.rng = Rng::new(seed);
+        self.literal_rng = Rng::new(seed ^ 0x4C49_5445_5241_4C21u64);
+        self.rngs = (0..n_clauses)
+            .map(|i| Rng::new(seed ^ (i as u64).wrapping_add(1).wrapping_mul(GOLDEN)))
+            .collect();
+        self.class_rngs = (0..n_cls)
+            .map(|c| Rng::new(seed ^ (c as u64 + n_clauses as u64 + 1).wrapping_mul(GOLDEN)))
+            .collect();
+    }
+
+    fn dp_merge(&mut self, replicas: &[Self], plan: &crate::parallel::DpPlan) {
+        use crate::parallel::{merge_group, merge_i32_chunk, merge_ta_chunk};
+        use rayon::prelude::*;
+
+        let k = replicas.len();
+        let n_literals = self.n_literals;
+        let words = self.words;
+        let half = self.half;
+        let max_state = self.max_state;
+        let wmax = self.threshold;
+        let rule = plan.rule;
+        let group = merge_group(n_literals);
+
+        let Self {
+            ta,
+            include,
+            weights,
+            valid,
+            ..
+        } = self;
+        let valid = valid.as_slice();
+
+        // One pass over memory does all three steps for a group of clauses: average
+        // the TA counters (replicas streamed sequentially), average the weights, then
+        // rebuild the include bitsets while the counters are still in L2.
+        let work = |g: usize,
+                    ta_g: &mut [u8],
+                    inc_g: &mut [u64],
+                    w_g: &mut [i32],
+                    acc: &mut [u16],
+                    wacc: &mut [i64]| {
+            let tlen = ta_g.len();
+            let wlen = w_g.len();
+            let toff = g * group * n_literals;
+            let woff = g * group;
+            merge_ta_chunk(
+                ta_g,
+                replicas.iter().map(|r| &r.ta[toff..toff + tlen]),
+                k,
+                acc,
+                rule,
+                max_state,
+            );
+            merge_i32_chunk(
+                w_g,
+                replicas.iter().map(|r| &r.weights[woff..woff + wlen]),
+                k,
+                wacc,
+                rule,
+                1,
+                wmax,
+            );
+            for j in 0..(tlen / n_literals) {
+                rebuild_include(
+                    &ta_g[j * n_literals..(j + 1) * n_literals],
+                    &mut inc_g[j * words..(j + 1) * words],
+                    valid,
+                    words,
+                    n_literals,
+                    half,
+                );
+            }
+        };
+
+        if plan.merge_parallel {
+            ta.par_chunks_mut(group * n_literals)
+                .zip(include.par_chunks_mut(group * words))
+                .zip(weights.par_chunks_mut(group))
+                .enumerate()
+                .for_each_init(
+                    || (vec![0u16; group * n_literals], vec![0i64; group]),
+                    |(acc, wacc), (g, ((ta_g, inc_g), w_g))| {
+                        work(g, ta_g, inc_g, w_g, acc, wacc);
+                    },
+                );
+        } else {
+            let mut acc = vec![0u16; group * n_literals];
+            let mut wacc = vec![0i64; group];
+            for (g, ((ta_g, inc_g), w_g)) in ta
+                .chunks_mut(group * n_literals)
+                .zip(include.chunks_mut(group * words))
+                .zip(weights.chunks_mut(group))
+                .enumerate()
+            {
+                work(g, ta_g, inc_g, w_g, &mut acc, &mut wacc);
+            }
+        }
     }
 }
 

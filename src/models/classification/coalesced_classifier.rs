@@ -1355,8 +1355,10 @@ mod tests {
 
     #[test]
     fn large_shared_bank_learns() {
-        // n_clauses >= PARALLEL_MIN (128) so the rayon feedback branch is exercised
-        // under `--features parallel` (and the scalar loop otherwise). Both must learn.
+        // A larger shared bank (160 clauses) than the other tests use. Note this is
+        // *below* DENSE_TRAIN_PARALLEL_MIN (4096), so training runs the scalar clause
+        // loop in both feature configurations; the point of the test is that a wide
+        // shared bank with signed per-class weights still learns 4 classes.
         let (xtr, ytr) = make_4class(3000, 33);
         let (xte, yte) = make_4class(500, 34);
         let e = enc(8);

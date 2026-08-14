@@ -15,7 +15,7 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | `TMCoalescedAutoEncoder` | ✅ Ported | Coalesced variant: shared clause bank + signed per-output weights |
 | `TMCompositeClassifier` | ✅ Ported | Ensemble of `TsetlinMachine` models; class scores summed at inference |
 | Convolutional TM | ✅ Ported | 1-D receptive-field clauses; weight tying across patch positions |
-| `ClauseBankSparse` / `TMSparseClassifier` | ✅ Ported | Per-clause included/excluded index lists with **absorbing actions** (literals removed at the exclude floor); vanilla-only, scalar, no Type III / parallel / AVX2 in v1 |
+| `ClauseBankSparse` / `TMSparseClassifier` | ✅ Ported | Per-clause included/excluded index lists with **absorbing actions** (literals removed at the exclude floor); vanilla-only. Rayon clause-parallel training and sample-parallel inference are supported; AVX2 and Type III are not (the gather/RNG/`swap_remove` hot path does not vectorise, and the Type III indicator array conflicts with literal removal) |
 
 ---
 

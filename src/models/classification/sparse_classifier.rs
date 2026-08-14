@@ -530,8 +530,7 @@ impl TMSparseClassifier {
 
     /// Train on a single encoded sample with true label `y`.
     pub fn fit_one(&mut self, sample: &EncodedSample, y: usize) {
-        let lit = sample.0.clone();
-        self.fit_one_lit(&lit, y);
+        self.fit_one_lit(&sample.0, y);
     }
 
     /// Run one training epoch over an encoded batch, shuffling the order each epoch.
@@ -544,7 +543,7 @@ impl TMSparseClassifier {
             order.swap(i, k);
         }
         let w = self.words;
-        let data = batch.data.clone();
+        let data = batch.data.as_slice();
         for &i in &order {
             self.fit_one_lit(&data[i * w..(i + 1) * w], ys[i]);
         }

@@ -31,6 +31,9 @@ mod clause_inspect;
 pub mod data;
 pub mod encoder;
 pub mod models;
+/// Mini-batch data-parallel training. Declared unconditionally because
+/// `ReplicaPool` is a model field type; everything else inside is feature-gated.
+pub(crate) mod parallel;
 mod rng;
 #[cfg(feature = "serde")]
 mod serial;

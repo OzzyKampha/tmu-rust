@@ -29,6 +29,11 @@ use crate::models::classification::TsetlinMachine;
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TMCompositeClassifier {
     classifiers: Vec<TsetlinMachine>,
+    /// Whether to train members concurrently: `None` = auto, `Some(_)` = forced.
+    /// Not serialised. Member-parallel training is exact, so this only affects speed.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    member_parallel: Option<bool>,
 }
 
 impl TMCompositeClassifier {
@@ -36,7 +41,17 @@ impl TMCompositeClassifier {
     pub fn new() -> Self {
         TMCompositeClassifier {
             classifiers: Vec::new(),
+            member_parallel: None,
         }
+    }
+
+    /// Force concurrent (or serial) training of the ensemble members.
+    ///
+    /// Member-parallel training is **exact** — bit-identical to serial — so this is a
+    /// pure speed control, unlike `TsetlinMachine::data_parallel`. Auto by default.
+    pub fn data_parallel(&mut self, on: bool) -> &mut Self {
+        self.member_parallel = Some(on);
+        self
     }
 
     /// Add a `TsetlinMachine` to the ensemble.
@@ -128,14 +143,40 @@ impl TMCompositeClassifier {
         self.assert_nonempty();
         let n = batch.len();
         let words = batch.words;
-        let packed = &batch.data;
+        let packed = batch.data.as_slice();
+        #[cfg(feature = "parallel")]
+        if n >= crate::clause_bank::dense::PARALLEL_MIN {
+            use rayon::prelude::*;
+            return (0..n)
+                .into_par_iter()
+                .map(|i| self.predict_lit(&packed[i * words..(i + 1) * words]))
+                .collect();
+        }
         (0..n)
-            .map(|i| {
-                let sample_words = &packed[i * words..(i + 1) * words];
-                let sample = crate::encoder::EncodedSample(sample_words.to_vec());
-                self.predict(&sample)
-            })
+            .map(|i| self.predict_lit(&packed[i * words..(i + 1) * words]))
             .collect()
+    }
+
+    /// [`predict`](Self::predict) on an already-packed literal slice.
+    ///
+    /// Avoids copying a row of an [`EncodedBatch`] into an
+    /// [`EncodedSample`] just to score it.
+    fn predict_lit(&self, lit: &[u64]) -> usize {
+        let n_classes = self.n_classes();
+        let mut combined = vec![0i32; n_classes];
+        let mut buf = vec![0i32; n_classes];
+        for model in &self.classifiers {
+            model.scores_lit(lit, &mut buf);
+            for (c, &s) in buf.iter().enumerate() {
+                combined[c] += s;
+            }
+        }
+        combined
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, &v)| v)
+            .map(|(i, _)| i)
+            .unwrap()
     }
 
     // ---- training ------------------------------------------------------------
@@ -144,11 +185,52 @@ impl TMCompositeClassifier {
     ///
     /// Each model trains on the same batch in a fresh random order (determined
     /// by its own internal RNG, so they diverge as expected for an ensemble).
+    ///
+    /// With `--features parallel` the members train concurrently. Unlike the
+    /// data-parallel path inside a single model, this is **exact**: members share no
+    /// mutable state and each draws its shuffle from its own RNG, so the result is
+    /// bit-identical to training them one after another.
     pub fn fit_epoch(&mut self, batch: &EncodedBatch, ys: &[usize]) {
         self.assert_nonempty();
+        #[cfg(feature = "parallel")]
+        if self.member_parallel_enabled(batch.len()) {
+            use rayon::prelude::*;
+            // Suppress each member's *own* data-parallel path for the duration.
+            // `rayon::current_num_threads()` does not account for nesting, so every
+            // member would otherwise fork a full set of replicas — `members ×
+            // threads` copies of the model. Their clause-parallel path is left
+            // enabled: it is bit-identical, and it lets Rayon work-steal to fill the
+            // pool when there are fewer members than cores.
+            let saved: Vec<Option<bool>> = self
+                .classifiers
+                .iter_mut()
+                .map(|m| m.suppress_data_parallel())
+                .collect();
+            self.classifiers
+                .par_iter_mut()
+                .for_each(|model| model.fit_epoch(batch, ys));
+            for (model, s) in self.classifiers.iter_mut().zip(saved) {
+                model.restore_data_parallel(s);
+            }
+            return;
+        }
         for model in &mut self.classifiers {
             model.fit_epoch(batch, ys);
         }
+    }
+
+    /// Whether to train members concurrently. Costs one Rayon dispatch per epoch (no
+    /// replicas, no merge), so the bar is just "more than one member, more than one
+    /// core, and enough total work to notice".
+    #[cfg(feature = "parallel")]
+    fn member_parallel_enabled(&self, n: usize) -> bool {
+        if let Some(on) = self.member_parallel {
+            return on && self.classifiers.len() > 1 && rayon::current_num_threads() > 1;
+        }
+        self.classifiers.len() > 1
+            && rayon::current_num_threads() > 1
+            && n.saturating_mul(self.classifiers.len())
+                >= crate::clause_bank::dense::PARALLEL_WORK_MIN
     }
 
     // ---- metrics -------------------------------------------------------------
@@ -231,6 +313,54 @@ mod tests {
 
         let preds = c.predict_batch(&batch);
         assert!(preds.iter().all(|&p| p < 2));
+    }
+
+    /// Member-parallel training must be **bit-identical** to serial training.
+    ///
+    /// This is the anchor test for the whole multicore effort: unlike the
+    /// data-parallel path inside a single model, ensemble members share no mutable
+    /// state, so there is no averaging and no approximation to excuse a difference.
+    /// If this ever fails, member-parallelism has introduced real cross-talk.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn composite_member_parallel_matches_serial() {
+        let (xtr, ytr) = make_xor(2000, 7);
+        let enc = Encoder::for_binary(12);
+        let btr = enc.encode_batch(&as_slices(&xtr));
+
+        let build = || {
+            let mut c = TMCompositeClassifier::new();
+            for seed in [11u64, 22, 33, 44] {
+                c.add(TsetlinMachine::with_config(2, 12, 10, 12, 3.9, 8, true, seed));
+            }
+            c
+        };
+        let mut par = build();
+        let mut ser = build();
+        par.data_parallel(true);
+        ser.data_parallel(false);
+
+        for _ in 0..8 {
+            par.fit_epoch(&btr, &ytr);
+            ser.fit_epoch(&btr, &ytr);
+        }
+
+        // Compare the learned rules clause by clause, not just the predictions —
+        // identical predictions could hide diverged internal state.
+        assert_eq!(par.len(), ser.len());
+        for (m_par, m_ser) in par.classifiers().iter().zip(ser.classifiers()) {
+            for c in 0..m_par.n_classes() {
+                for j in 0..m_par.clauses_per_class() {
+                    assert_eq!(
+                        m_par.clause_rule(c, j),
+                        m_ser.clause_rule(c, j),
+                        "clause ({c}, {j}) diverged between member-parallel and serial"
+                    );
+                    assert_eq!(m_par.clause_weight(c, j), m_ser.clause_weight(c, j));
+                }
+            }
+        }
+        assert_eq!(par.predict_batch(&btr), ser.predict_batch(&btr));
     }
 
     #[test]
