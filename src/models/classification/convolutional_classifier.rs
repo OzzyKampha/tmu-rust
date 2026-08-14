@@ -15,9 +15,9 @@
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::DENSE_TRAIN_PARALLEL_MIN;
 use crate::clause_bank::dense::{
-    GOLDEN, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of, expand_bits_to_bytes,
-    fire_predict, pack, rebuild_include, type_i_update_bytes, type_ii_update_bytes,
-    type_iii_update, words_for,
+    GOLDEN, MASK_BITS, WORD_BITS, bmask_word, clause_fire, debug_assert_include_synced, digits_of,
+    expand_bits_to_bytes, fire_predict, pack, rebuild_include, type_i_update_bytes,
+    type_ii_update_bytes, type_iii_update, words_for,
 };
 use crate::rng::Rng;
 
@@ -175,6 +175,7 @@ fn apply_one_clause_conv(
     if crossed {
         rebuild_include(ta, inc, val, words, n_literals, half);
     }
+    debug_assert_include_synced(ta, inc, val, words, n_literals, half);
 }
 
 impl ConvolutionalTsetlinMachine {

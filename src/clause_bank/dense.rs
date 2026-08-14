@@ -169,6 +169,44 @@ pub(crate) fn clause_fire(
     violation == 0
 }
 
+/// Debug-only check that a clause's include bitset still equals the bitset a full
+/// [`rebuild_include`] would produce from its TA counters.
+///
+/// This is the invariant that lets `apply_one_clause` skip the rebuild when no counter
+/// crossed `half`. It is worth asserting explicitly because the obvious-looking guard
+/// does not cover it: `clause_rule_consistent_with_include_bitset` compares
+/// `clause_rule()` against `include`, and `clause_rule()` reads `include`, so it would
+/// pass even if the bitset had drifted entirely away from the counters. Likewise
+/// `same_seed_same_result` compares two models that would share any such bug.
+///
+/// Compiled out of release builds. `cargo test` runs in debug, so every training test
+/// in the suite exercises this on every clause update.
+#[inline]
+pub(crate) fn debug_assert_include_synced(
+    ta: &[u8],
+    inc: &[u64],
+    valid: &[u64],
+    words: usize,
+    n_literals: usize,
+    half: u8,
+) {
+    #[cfg(debug_assertions)]
+    {
+        let mut expected = vec![0u64; words];
+        rebuild_include(ta, &mut expected, valid, words, n_literals, half);
+        assert_eq!(
+            expected.as_slice(),
+            inc,
+            "include bitset out of sync with TA counters: a rebuild was skipped when \
+             some literal had in fact crossed the inclusion threshold"
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = (ta, inc, valid, words, n_literals, half);
+    }
+}
+
 /// Recompute the include bitset from TA counters after a clause update.
 ///
 /// A literal `l` is included when `ta[l] >= half`.  The result is ANDed with `valid`
