@@ -11,6 +11,11 @@ All notable changes to tmu-rs are documented here.
   samples (any order, repeats allowed) into a new batch. Lets a training loop
   encode its data once and draw every epoch's shuffled or class-balanced batches
   by copying words instead of re-encoding.
+
+### Changed
+- **`Encoder::encode_batch_categorical` encodes rows in parallel** with the
+  `parallel` feature (identical output). Encoding 210k samples × 54k features
+  drops from ~47 s to the time a single core needs divided by the core count.
 - **CUDA GPU support for every model, training and inference** (`--features cuda`).
   `to_cuda(&CudaDevice)` moves any model (`TsetlinMachine`,
   `CoalescedTsetlinMachine`, `ConvolutionalTsetlinMachine` 1-D/2-D,
