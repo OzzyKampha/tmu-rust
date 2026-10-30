@@ -7,6 +7,10 @@ All notable changes to tmu-rs are documented here.
 ## [Unreleased]
 
 ### Added
+- **`EncodedBatch::select(rows)`** and **`EncodedBatch::words()`** — copy chosen
+  samples (any order, repeats allowed) into a new batch. Lets a training loop
+  encode its data once and draw every epoch's shuffled or class-balanced batches
+  by copying words instead of re-encoding.
 - **CUDA GPU support for every model, training and inference** (`--features cuda`).
   `to_cuda(&CudaDevice)` moves any model (`TsetlinMachine`,
   `CoalescedTsetlinMachine`, `ConvolutionalTsetlinMachine` 1-D/2-D,

@@ -57,6 +57,33 @@ impl EncodedBatch {
         self.n == 0
     }
 
+    /// 64-bit words per sample.
+    pub fn words(&self) -> usize {
+        self.words
+    }
+
+    /// A new batch of the given samples, in the given order (repeats allowed).
+    ///
+    /// Copies words, so it is far cheaper than encoding the samples again: a
+    /// training loop can encode its data once and draw every epoch's (shuffled,
+    /// class-balanced) batches from it.
+    ///
+    /// # Panics
+    /// If a row index is out of range.
+    pub fn select(&self, rows: &[usize]) -> EncodedBatch {
+        let w = self.words;
+        let mut data = Vec::with_capacity(rows.len() * w);
+        for &r in rows {
+            assert!(r < self.n, "row {r} out of range for a batch of {}", self.n);
+            data.extend_from_slice(&self.data[r * w..(r + 1) * w]);
+        }
+        EncodedBatch {
+            data,
+            n: rows.len(),
+            words: w,
+        }
+    }
+
     /// Build an [`EncodedBatch`] from a flat, row-major word array.
     ///
     /// `data` must have exactly `n * words` elements.
@@ -601,6 +628,21 @@ mod tests {
         let mut buf = Vec::new();
         e.write_to(&mut buf).unwrap();
         Encoder::read_from(&mut buf.as_slice()).unwrap()
+    }
+
+    #[test]
+    fn select_matches_encoding_the_rows() {
+        let e = Encoder::for_binary(70); // more than one word per sample
+        let rows: Vec<Vec<u8>> = (0..4)
+            .map(|i| (0..70).map(|j| u8::from((i * 7 + j) % 3 == 0)).collect())
+            .collect();
+        let refs: Vec<&[u8]> = rows.iter().map(|r| r.as_slice()).collect();
+        let all = e.encode_batch(&refs);
+        let picked = all.select(&[3, 0, 3]);
+        let want = e.encode_batch(&[refs[3], refs[0], refs[3]]);
+        assert_eq!(picked.data, want.data);
+        assert_eq!((picked.len(), picked.words()), (3, all.words()));
+        assert!(all.select(&[]).is_empty());
     }
 
     #[test]
