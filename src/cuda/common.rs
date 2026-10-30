@@ -138,13 +138,77 @@ pub(crate) fn dense_scores(
     n_patches: usize,
     mut fill: impl FnMut(usize, &mut [u64]),
 ) -> Result<Vec<i32>> {
+    dense_scores_impl(
+        dev,
+        st,
+        n_clauses,
+        words,
+        n_outputs,
+        cpg,
+        mode,
+        n_samples,
+        n_patches,
+        Samples::Host(&mut fill),
+    )
+}
+
+/// [`dense_scores`] for samples already in GPU memory, one patch each, laid out
+/// contiguously from device address `base`: nothing is uploaded.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dense_scores_resident(
+    dev: &CudaDevice,
+    st: &DenseState,
+    n_clauses: usize,
+    words: usize,
+    n_outputs: usize,
+    cpg: usize,
+    mode: u32,
+    n_samples: usize,
+    base: u64,
+) -> Result<Vec<i32>> {
+    dense_scores_impl(
+        dev,
+        st,
+        n_clauses,
+        words,
+        n_outputs,
+        cpg,
+        mode,
+        n_samples,
+        1,
+        Samples::Resident(base),
+    )
+}
+
+/// Where [`dense_scores_impl`] gets its samples: written by the host into a
+/// buffer it uploads, or already on the device from address `base`.
+enum Samples<'a> {
+    Host(&'a mut dyn FnMut(usize, &mut [u64])),
+    Resident(u64),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dense_scores_impl(
+    dev: &CudaDevice,
+    st: &DenseState,
+    n_clauses: usize,
+    words: usize,
+    n_outputs: usize,
+    cpg: usize,
+    mode: u32,
+    n_samples: usize,
+    n_patches: usize,
+    mut samples: Samples<'_>,
+) -> Result<Vec<i32>> {
+    let resident = matches!(samples, Samples::Resident(_));
     let per_sample = n_patches * words;
     let chunk = (PREDICT_BYTES / (per_sample * 8).max(1))
         .clamp(1, 65_536)
         .min(n_samples.max(1));
-    let lits = DevBuf::<u64>::zeros(dev, chunk * per_sample)?;
+    // Resident samples are read in place; only host-filled ones need a buffer.
+    let lits = DevBuf::<u64>::zeros(dev, if resident { 1 } else { chunk * per_sample })?;
     let out = DevBuf::<i32>::zeros(dev, chunk * n_outputs)?;
-    let mut host_lits = vec![0u64; chunk * per_sample];
+    let mut host_lits = vec![0u64; if resident { 0 } else { chunk * per_sample }];
     let mut host_out = vec![0i32; chunk * n_outputs];
     let mut result = Vec::with_capacity(n_samples * n_outputs);
     // Per-output accumulators live in shared memory unless there are too many.
@@ -152,20 +216,26 @@ pub(crate) fn dense_scores(
     let mut start = 0;
     while start < n_samples {
         let len = chunk.min(n_samples - start);
-        for i in 0..len {
-            fill(
-                start + i,
-                &mut host_lits[i * per_sample..(i + 1) * per_sample],
-            );
-        }
-        lits.upload(&host_lits[..len * per_sample])?;
+        let lits_ptr = match &mut samples {
+            Samples::Resident(base) => *base + (start * per_sample * 8) as u64,
+            Samples::Host(fill) => {
+                for i in 0..len {
+                    fill(
+                        start + i,
+                        &mut host_lits[i * per_sample..(i + 1) * per_sample],
+                    );
+                }
+                lits.upload(&host_lits[..len * per_sample])?;
+                lits.ptr()
+            }
+        };
         if global_acc {
             out.zero_prefix(len * n_outputs)?;
         }
         let p = ScoresParams {
             include: st.include.ptr(),
             valid: st.valid.ptr(),
-            lits: lits.ptr(),
+            lits: lits_ptr,
             weights: st.weights.ptr(),
             out: out.ptr(),
             n_clauses: n_clauses as u32,
