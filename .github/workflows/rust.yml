@@ -42,6 +42,10 @@ jobs:
         run: cargo clippy -- -D warnings
       - name: Clippy (parallel feature)
         run: cargo clippy --features parallel -- -D warnings
+      - name: Clippy (cuda feature)
+        run: cargo clippy --features cuda -- -D warnings
+      - name: Clippy (cuda-emu feature)
+        run: cargo clippy --features cuda-emu,parallel -- -D warnings
 
   test:
     name: Test
@@ -79,6 +83,14 @@ jobs:
 
       - name: Run tests (parallel feature)
         run: cargo test --features parallel --verbose
+
+      - name: Build (cuda feature, no toolkit needed)
+        run: cargo build --features cuda --verbose
+
+      # The CUDA kernels compiled as C++ and run on the CPU emulator; checks the
+      # GPU path is bit-identical to CPU training for every model.
+      - name: Run tests (CUDA kernels on CPU emulator)
+        run: cargo test --features cuda-emu --lib cuda:: --verbose
 
       - name: Check crate packaging
         run: cargo publish --dry-run --allow-dirty

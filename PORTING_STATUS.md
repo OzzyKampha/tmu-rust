@@ -41,7 +41,7 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | Pre-packed dataset API | ✅ | `pack_dataset()` + `fit_epoch_packed()` |
 | Batch prediction | ✅ | `predict_batch_packed()` |
 | Raw class scores | ✅ | `scores_packed()` |
-| GPU / CUDA acceleration | ❌ Not planned | |
+| GPU / CUDA acceleration | ✅ | `--features cuda`: `to_cuda()` → GPU model; training bit-identical to the CPU path (see `tmu_rs::cuda`) |
 | Imbalanced-class weighting | ✅ | Per-class feedback scaling via `class_weights()` builder method |
 
 ---
@@ -65,7 +65,7 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | MAE / RMSE metrics | ✅ | `mae()`, `rmse()` over encoded batches |
 | Multi-threaded training | ✅ | `--features parallel` (Rayon), clause-parallel feedback |
 | Save / load | ✅ | `serde` feature; file tag `TAG_REGRESSOR = 6` |
-| GPU / CUDA acceleration | ❌ Not planned | |
+| GPU / CUDA acceleration | ✅ | `--features cuda`: `to_cuda()` → GPU model; training bit-identical to the CPU path (see `tmu_rs::cuda`) |
 
 ---
 
@@ -90,7 +90,7 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | Multi-threaded training | ✅ | `--features parallel` (Rayon), clause-parallel feedback |
 | Save / load | ✅ | `serde` feature; file tag `TAG_CONVOLUTIONAL = 7` |
 | 2-D (image) convolution | ❌ Not ported | TMU also supports 2-D kernels; pre-flatten rows as a workaround |
-| GPU / CUDA acceleration | ❌ Not planned | |
+| GPU / CUDA acceleration | ✅ | `--features cuda`: `to_cuda()` → GPU model; training bit-identical to the CPU path (see `tmu_rs::cuda`) |
 
 ---
 

@@ -7,6 +7,22 @@ All notable changes to tmu-rs are documented here.
 ## [Unreleased]
 
 ### Added
+- **CUDA GPU support for every model, training and inference** (`--features cuda`).
+  `to_cuda(&CudaDevice)` moves any model (`TsetlinMachine`,
+  `CoalescedTsetlinMachine`, `ConvolutionalTsetlinMachine` 1-D/2-D,
+  `TMSparseClassifier`, `TMCompositeClassifier`, `TMRegressor`, `TMAutoEncoder`,
+  `TMCoalescedAutoEncoder`) to the GPU; `fit_epoch` / `fit_one` / `predict_batch` /
+  `scores_batch` / `accuracy` (and model-specific metrics) run there, and
+  `to_cpu()` brings the learned state back. GPU training is **bit-identical** to the
+  CPU's exact training path — same RNG streams, draw order and TA arithmetic —
+  including dropout, `max_included_literals`, class weights, focused negative
+  sampling, absorbing sparse lists, and Type III feedback. The CUDA driver and
+  NVRTC are loaded at runtime, so the crate builds without the CUDA toolkit.
+- **`cuda-emu` feature** — `CudaDevice::emulator()` runs the same CUDA kernel source
+  (compiled as C++) on the CPU, so the GPU path is tested in CI without a GPU:
+  GPU-vs-CPU equivalence tests for every model (`cargo test --features cuda-emu`;
+  add `TMU_TEST_GPU=1` to run them on a real GPU).
+- **`examples/cuda.rs`** — CPU vs GPU training time and a bit-identity check.
 - **TMSparseClassifier** — sparse clause bank with **absorbing actions** (port of
   TMU's `ClauseBankSparse`). Each clause stores included / excluded literal index
   lists instead of a dense per-literal counter array; literals that reach the

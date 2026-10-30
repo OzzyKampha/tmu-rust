@@ -28,7 +28,7 @@ use crate::models::classification::TsetlinMachine;
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TMCompositeClassifier {
-    classifiers: Vec<TsetlinMachine>,
+    pub(crate) classifiers: Vec<TsetlinMachine>,
 }
 
 impl TMCompositeClassifier {

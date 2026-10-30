@@ -57,6 +57,7 @@ let accuracy = tm.accuracy(&test_x, &test_y);
   - `TMAutoEncoder` — binary reconstruction via positive-only clause banks
   - `TMSparseClassifier` — sparse clause bank with **absorbing actions**: literals are permanently dropped from each clause as training converges, so memory and per-clause evaluation scale with the number of *active* literals (a big win in high-dimensional, sparsely-relevant feature spaces)
 - Optional multi-threaded training via [Rayon](https://github.com/rayon-rs/rayon) (`--features parallel`)
+- Optional **CUDA GPU training and inference for every model** (`--features cuda`) — bit-identical to CPU training; see [GPU (CUDA)](#gpu-cuda)
 - AVX2 fast paths for clause update loops with runtime dispatch — u8 TA counters processed 32-wide (4× smaller working set vs u32; scalar fallback on non-AVX2 targets)
 - Type-safe `Encoder` for binary, numeric (quantile booleanization), and categorical inputs
 - Fast booleanizer for continuous-valued inputs
@@ -92,6 +93,45 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
 AVX2 fast paths are also activated at runtime automatically when the CPU supports it, even without `target-cpu=native`.
+
+---
+
+## GPU (CUDA)
+
+Every model can train and predict on an NVIDIA GPU. Configure it on the CPU as usual, move it with `to_cuda`, and bring it back with `to_cpu` (e.g. to save it or inspect clauses):
+
+```rust
+use tmu_rs::cuda::CudaDevice;
+
+let dev = CudaDevice::new(0)?;                                   // first GPU
+let mut tm = TsetlinMachine::new(10, 784, 2000, 50, 10.0).to_cuda(&dev)?;
+for _ in 0..epochs {
+    tm.fit_epoch(&train_x, &train_y)?;
+}
+let accuracy = tm.accuracy(&test_x, &test_y)?;
+let cpu_model = tm.to_cpu()?;
+```
+
+| CPU model | GPU model |
+|---|---|
+| `TsetlinMachine` | `CudaTsetlinMachine` |
+| `CoalescedTsetlinMachine` | `CudaCoalescedTsetlinMachine` |
+| `ConvolutionalTsetlinMachine` (1-D and 2-D) | `CudaConvolutionalTsetlinMachine` |
+| `TMSparseClassifier` | `CudaTMSparseClassifier` |
+| `TMCompositeClassifier` | `CudaTMCompositeClassifier` |
+| `TMRegressor` | `CudaTMRegressor` |
+| `TMAutoEncoder` | `CudaTMAutoEncoder` |
+| `TMCoalescedAutoEncoder` | `CudaTMCoalescedAutoEncoder` |
+
+- **Exact.** GPU training is bit-identical to the CPU model's (default, exact) training for the same seed — every option is supported, including dropout, `max_included_literals`, class weights, focused negative sampling and Type III feedback.
+- **No build-time CUDA dependency.** The driver (`libcuda`) and NVRTC (`libnvrtc`, from the CUDA toolkit or the `nvidia-cuda-nvrtc-cu12` pip wheel) are loaded at runtime and the kernels are JIT-compiled for your GPU on `CudaDevice::new`. Set `TMU_CUDA_DRIVER_PATH` / `TMU_NVRTC_PATH` for non-standard install locations.
+- **Where it helps.** Training is sequential over samples, so the GPU parallelises within each sample (across clauses and 64-literal words). Expect the biggest wins for many clauses and/or wide inputs; tiny models are dominated by kernel-launch latency. Batch inference parallelises over samples and clauses.
+- **Testing without a GPU.** `--features cuda-emu` adds `CudaDevice::emulator()`, which runs the identical kernel source on the CPU (slowly). `cargo test --features cuda-emu` checks every GPU model is bit-identical to its CPU counterpart; on a GPU machine, `TMU_TEST_GPU=1 cargo test --features cuda-emu` runs the same checks on the real device.
+
+```sh
+cargo run --release --features cuda --example cuda              # CPU vs GPU timing + identity check
+cargo run --release --features cuda-emu --example cuda -- --emu # same, on the kernel emulator
+```
 
 ---
 
@@ -134,6 +174,7 @@ The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) demos with 
 | `bench_training` | Training throughput benchmark (sequential vs parallel, IMDB-scale) |
 | `bench_autoencoder` | AutoEncoder throughput + accuracy vs Python TMU |
 | `absorb_timing` | Per-epoch accuracy and absorbing-state fraction at various `state_bits` |
+| `cuda` | GPU vs CPU training time and bit-identity check (`--features cuda`) |
 
 `bench_training` uses a synthetic dataset — no download required. Compare with and without `--features parallel`.
 
@@ -193,6 +234,11 @@ src/
       vanilla_autoencoder.rs     # TMAutoEncoder
       coalesced_autoencoder.rs   # TMCoalescedAutoEncoder
   rng.rs                  # Fast SplitMix64 RNG
+  cuda/                   # GPU backend (--features cuda)
+    kernels.cu            # CUDA kernels for every model (NVRTC-compiled at runtime)
+    emu.h                 # Shim to run the same kernels on the CPU (--features cuda-emu)
+    driver.rs, device.rs  # Runtime-loaded CUDA driver / NVRTC, device buffers, launches
+    *.rs                  # One GPU model wrapper per CPU model
 examples/               # Demo programs (ports of TMU + extras)
 benches/                # Criterion throughput benchmarks
 scripts/                # Python data preparation and comparison scripts

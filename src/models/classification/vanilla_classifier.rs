@@ -20,62 +20,62 @@ use crate::rng::Rng;
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TsetlinMachine {
-    n_classes: usize,
-    n_features: usize,
-    n_literals: usize,
-    words: usize,
-    clauses_per_class: usize,
-    threshold: i32,
-    s: f64,
-    boost_true_positive: bool,
-    max_included_literals: usize,
-    clause_drop_p: f64,
+    pub(crate) n_classes: usize,
+    pub(crate) n_features: usize,
+    pub(crate) n_literals: usize,
+    pub(crate) words: usize,
+    pub(crate) clauses_per_class: usize,
+    pub(crate) threshold: i32,
+    pub(crate) s: f64,
+    pub(crate) boost_true_positive: bool,
+    pub(crate) max_included_literals: usize,
+    pub(crate) clause_drop_p: f64,
     /// Per-literal dropout probability during training (mirrors TMU's `literal_drop_p`).
-    literal_drop_p: f64,
+    pub(crate) literal_drop_p: f64,
     /// Dedicated RNG for literal-active mask generation (independent of clause/class RNGs).
-    literal_rng: Rng,
+    pub(crate) literal_rng: Rng,
     /// Precomputed binary digits for Bernoulli(1 - literal_drop_p) mask generation.
-    dig_lit_active: Vec<u8>,
+    pub(crate) dig_lit_active: Vec<u8>,
 
     /// u8 TA counters (matches TMU's 8-bit states).  Clause `cj = c*CPC + j` occupies
     /// `ta[cj * n_literals .. (cj+1) * n_literals]`.
-    ta: Vec<u8>,
+    pub(crate) ta: Vec<u8>,
     /// Include bitset.  Clause `cj` occupies `include[cj * words .. (cj+1) * words]`.
     /// Rebuilt after every clause update; kept in sync with `ta`.
-    include: Vec<u64>,
+    pub(crate) include: Vec<u64>,
     /// TA threshold for inclusion: `ta[l] >= half` → literal l is included.
-    half: u8,
+    pub(crate) half: u8,
     /// Maximum TA counter value: `(1 << state_bits) - 1`.
-    max_state: u8,
+    pub(crate) max_state: u8,
 
     /// Per-clause integer weights (>= 1), indexed `c*CPC + j`.
-    weights: Vec<i32>,
+    pub(crate) weights: Vec<i32>,
     /// Per-clause RNG (enables lock-free parallel training).
-    rngs: Vec<Rng>,
+    pub(crate) rngs: Vec<Rng>,
     /// Per-class RNG for drop/inv/keep mask generation.
-    class_rngs: Vec<Rng>,
+    pub(crate) class_rngs: Vec<Rng>,
     /// Per-word mask of real literal bits.
-    valid: Vec<u64>,
-    dig_inv: Vec<u8>,
-    dig_keep: Vec<u8>,
+    pub(crate) valid: Vec<u64>,
+    pub(crate) dig_inv: Vec<u8>,
+    pub(crate) dig_keep: Vec<u8>,
 
-    literals: Vec<u64>,
-    rng: Rng, // for shuffling and negative-class selection only
+    pub(crate) literals: Vec<u64>,
+    pub(crate) rng: Rng, // for shuffling and negative-class selection only
 
     /// Per-class feedback scaling factors for imbalanced datasets.
     /// `class_weights[c]` multiplies the feedback probability for class `c`.
     /// Defaults to `1.0` for all classes (no reweighting).
-    class_weights: Vec<f64>,
+    pub(crate) class_weights: Vec<f64>,
 
     /// Indicator TA states for Type III feedback (same layout as `ta`).
     /// Zero-initialised; only meaningful when `type_iii` is `true`.
-    ind: Vec<u8>,
+    pub(crate) ind: Vec<u8>,
     /// `clause_and_target` bitsets for Type III feedback (same layout as `include`).
-    cat: Vec<u64>,
+    pub(crate) cat: Vec<u64>,
     /// Type III strength: indicator is incremented with probability `1 − 1/d`.
-    d: f64,
+    pub(crate) d: f64,
     /// Whether Type III feedback is active during training.
-    type_iii: bool,
+    pub(crate) type_iii: bool,
 
     /// When set, `update_class` never takes the nested Rayon path. Used to keep
     /// per-shard replica training single-threaded inside `fit_epoch_data_parallel`
@@ -83,17 +83,17 @@ pub struct TsetlinMachine {
     /// model always trains normally. Only read on `--features parallel`.
     #[cfg_attr(feature = "serde", serde(skip))]
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    train_scalar: bool,
+    pub(crate) train_scalar: bool,
 
     /// Opt-in: let `fit_epoch` use the faster (approximate) data-parallel path when
     /// the workload is large enough. Off by default (exact training). Not serialised.
     #[cfg_attr(feature = "serde", serde(skip))]
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    data_parallel: bool,
+    pub(crate) data_parallel: bool,
     /// Whether the "use data_parallel" hint has already been printed (once per model).
     #[cfg_attr(feature = "serde", serde(skip))]
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    hint_shown: bool,
+    pub(crate) hint_shown: bool,
 }
 
 #[cfg(feature = "serde")]
