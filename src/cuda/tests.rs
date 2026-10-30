@@ -328,6 +328,63 @@ mod coalesced {
             &device(),
         );
     }
+
+    /// Training on rows of a GPU-resident batch must equal training on the same
+    /// rows copied out with `select` (and therefore the CPU model).
+    fn check_resident(make: impl Fn() -> CoalescedTsetlinMachine, dev: &CudaDevice) {
+        let nf = 12;
+        let (xs, ys) = xor_data(120, nf, 0.1, 21);
+        let batch = encode(&xs, nf);
+        let resident = batch.to_cuda(dev).unwrap();
+        let mut host = make().to_cuda(dev).unwrap();
+        let mut res = make().to_cuda(dev).unwrap();
+        let mut cpu = make();
+        for epoch in 0..3usize {
+            // Class-balanced-style draws: reordered, with repeats.
+            let rows: Vec<usize> = (0..90).map(|k| (k * 7 + epoch * 13) % xs.len()).collect();
+            let sel_ys: Vec<usize> = rows.iter().map(|&r| ys[r]).collect();
+            let sel = batch.select(&rows);
+            host.fit_epoch(&sel, &sel_ys).unwrap();
+            res.fit_epoch_rows(&resident, &rows, &sel_ys).unwrap();
+            cpu.fit_epoch(&sel, &sel_ys);
+        }
+        let (h, r) = (host.to_cpu().unwrap(), res.to_cpu().unwrap());
+        assert_dense_eq!(r, h);
+        assert_dense_eq!(r, cpu);
+        assert_eq!(states(&r.class_rngs), states(&h.class_rngs));
+        assert_eq!(
+            res.predict_batch_resident(&resident).unwrap(),
+            host.predict_batch(&batch).unwrap()
+        );
+    }
+
+    #[test]
+    fn resident_rows_match_host_batches() {
+        if skip() {
+            return;
+        }
+        check_resident(
+            || CoalescedTsetlinMachine::with_config(2, 12, 16, 10, 3.9, 8, true, 1),
+            &device(),
+        );
+    }
+
+    #[test]
+    fn resident_rows_match_host_batches_all_options() {
+        if skip() {
+            return;
+        }
+        check_resident(
+            || {
+                CoalescedTsetlinMachine::with_config(2, 12, 12, 8, 2.5, 5, false, 8)
+                    .clause_drop_p(0.3)
+                    .literal_drop_p(0.15)
+                    .max_included_literals(4)
+                    .focused_negative_sampling(true)
+            },
+            &device_serial(),
+        );
+    }
 }
 
 mod convolutional {

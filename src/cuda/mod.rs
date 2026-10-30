@@ -77,6 +77,7 @@ mod coalesced_autoencoder;
 mod composite;
 mod convolutional;
 mod regressor;
+mod resident;
 mod sparse;
 mod vanilla;
 
@@ -92,6 +93,7 @@ pub use composite::CudaTMCompositeClassifier;
 pub use convolutional::CudaConvolutionalTsetlinMachine;
 pub use device::CudaDevice;
 pub use regressor::CudaTMRegressor;
+pub use resident::CudaEncodedBatch;
 pub use sparse::CudaTMSparseClassifier;
 pub use vanilla::CudaTsetlinMachine;
 

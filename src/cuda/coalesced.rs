@@ -2,10 +2,11 @@
 
 use super::common::{
     DenseState, N_DIGITS, Result, STAGE_BYTES, TRAIN_CHUNK, argmax_first, blocks, check_smem_ints,
-    dense_scores, digits_mask, max_inc, restore_rngs, rng_states, shuffle,
+    dense_scores, dense_scores_resident, digits_mask, max_inc, restore_rngs, rng_states, shuffle,
 };
 use super::device::{CudaDevice, DevBuf};
 use super::params::{CoPlanParams, CoUpdateParams, SCORE_SHARED, SharedFireParams};
+use super::resident::CudaEncodedBatch;
 use crate::clause_bank::dense::bmask_word;
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::models::CoalescedTsetlinMachine;
@@ -17,6 +18,14 @@ use crate::models::CoalescedTsetlinMachine;
 /// sampling — and feedback masks), and one launch applies both class passes.
 /// The master RNG stays on the device during training. Bit-identical to the CPU
 /// model.
+/// Where the training samples come from: a host batch (copied up chunk by
+/// chunk), or rows of a batch already in GPU memory (read in place).
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    Host(&'a EncodedBatch),
+    Resident(&'a CudaEncodedBatch, &'a [usize]),
+}
+
 pub struct CudaCoalescedTsetlinMachine {
     host: CoalescedTsetlinMachine,
     dev: CudaDevice,
@@ -116,20 +125,45 @@ impl CudaCoalescedTsetlinMachine {
         self.host.rng.0 = self.master_rng.download()?[0];
         let order = shuffle(&mut self.host.rng, batch.n);
         self.master_rng.upload(&[self.host.rng.0])?;
-        self.train(batch, ys, &order)
+        self.train(Source::Host(batch), ys, &order)
+    }
+
+    /// Train one shuffled epoch on `rows` of a batch already in GPU memory
+    /// ([`EncodedBatch::to_cuda`]), exactly like
+    /// `fit_epoch(&batch.select(rows), ys)` — same shuffle, same random draws,
+    /// same model — but nothing is copied or uploaded: each sample is read
+    /// where it lives. `ys[k]` is the label of `rows[k]`.
+    pub fn fit_epoch_rows(
+        &mut self,
+        data: &CudaEncodedBatch,
+        rows: &[usize],
+        ys: &[usize],
+    ) -> Result<()> {
+        assert_eq!(data.words, self.host.words);
+        assert_eq!(rows.len(), ys.len());
+        assert!(
+            std::sync::Arc::ptr_eq(&data.dev.inner, &self.dev.inner),
+            "the batch lives on another device"
+        );
+        assert!(rows.iter().all(|&r| r < data.n), "row out of range");
+        self.host.rng.0 = self.master_rng.download()?[0];
+        let order = shuffle(&mut self.host.rng, rows.len());
+        self.master_rng.upload(&[self.host.rng.0])?;
+        self.train(Source::Resident(data, rows), ys, &order)
     }
 
     /// Train on a single sample, exactly like [`CoalescedTsetlinMachine::fit_one`].
     pub fn fit_one(&mut self, sample: &EncodedSample, y: usize) -> Result<()> {
         let batch = EncodedBatch::from_words(sample.0.clone(), 1, self.host.words);
-        self.train(&batch, &[y], &[0])
+        self.train(Source::Host(&batch), &[y], &[0])
     }
 
-    fn train(&mut self, batch: &EncodedBatch, ys: &[usize], order: &[usize]) -> Result<()> {
+    fn train(&mut self, src: Source<'_>, ys: &[usize], order: &[usize]) -> Result<()> {
         let h = &mut self.host;
         let (words, nc, ncls) = (h.words, h.n_clauses, h.n_classes);
         let literal_drop = h.literal_drop_p > 0.0;
-        let mut lits = vec![0u64; self.chunk * words];
+        let host = matches!(src, Source::Host(_));
+        let mut lits = vec![0u64; if host { self.chunk * words } else { 0 }];
         let mut acts = vec![0u64; if literal_drop { self.chunk * words } else { 0 }];
         let ib = self.dev.inner.item_block();
         let cb = self.dev.inner.clause_block(words);
@@ -137,8 +171,10 @@ impl CudaCoalescedTsetlinMachine {
         for chunk in order.chunks(self.chunk) {
             for (s, &i) in chunk.iter().enumerate() {
                 assert!(ys[i] < ncls, "label out of range");
-                lits[s * words..(s + 1) * words]
-                    .copy_from_slice(&batch.data[i * words..(i + 1) * words]);
+                if let Source::Host(batch) = src {
+                    lits[s * words..(s + 1) * words]
+                        .copy_from_slice(&batch.data[i * words..(i + 1) * words]);
+                }
                 if literal_drop {
                     for w in &mut acts[s * words..(s + 1) * words] {
                         *w = bmask_word(&mut h.literal_rng, &h.dig_lit_active);
@@ -146,12 +182,17 @@ impl CudaCoalescedTsetlinMachine {
                 }
             }
             let n = chunk.len();
-            self.lits.upload(&lits[..n * words])?;
+            if host {
+                self.lits.upload(&lits[..n * words])?;
+            }
             if literal_drop {
                 self.acts.upload(&acts[..n * words])?;
             }
             for (s, &i) in chunk.iter().enumerate() {
-                let lit = self.lits.at(s * words);
+                let lit = match src {
+                    Source::Host(_) => self.lits.at(s * words),
+                    Source::Resident(data, rows) => data.buf.at(rows[i] * words),
+                };
                 let act = if literal_drop {
                     self.acts.at(s * words)
                 } else {
@@ -271,6 +312,29 @@ impl CudaCoalescedTsetlinMachine {
     pub fn predict_batch(&self, batch: &EncodedBatch) -> Result<Vec<usize>> {
         let s = self.raw_scores(batch)?;
         Ok(s.chunks(self.host.n_classes).map(argmax_first).collect())
+    }
+
+    /// [`predict_batch`](Self::predict_batch) for a batch already in GPU memory:
+    /// identical predictions, nothing uploaded.
+    pub fn predict_batch_resident(&self, data: &CudaEncodedBatch) -> Result<Vec<usize>> {
+        let h = &self.host;
+        assert_eq!(data.words, h.words);
+        assert!(
+            std::sync::Arc::ptr_eq(&data.dev.inner, &self.dev.inner),
+            "the batch lives on another device"
+        );
+        let s = dense_scores_resident(
+            &self.dev,
+            &self.st,
+            h.n_clauses,
+            h.words,
+            h.n_classes,
+            h.n_clauses,
+            SCORE_SHARED,
+            data.n,
+            data.buf.ptr(),
+        )?;
+        Ok(s.chunks(h.n_classes).map(argmax_first).collect())
     }
 
     /// Predict the class of one sample.
