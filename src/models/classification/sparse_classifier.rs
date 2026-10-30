@@ -41,34 +41,34 @@ use crate::rng::Rng;
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TMSparseClassifier {
-    n_classes: usize,
-    n_features: usize,
-    n_literals: usize,
-    words: usize,
-    clauses_per_class: usize,
-    threshold: i32,
-    s: f64,
-    boost_true_positive: bool,
-    max_included_literals: usize,
-    clause_drop_p: f64,
-    literal_drop_p: f64,
+    pub(crate) n_classes: usize,
+    pub(crate) n_features: usize,
+    pub(crate) n_literals: usize,
+    pub(crate) words: usize,
+    pub(crate) clauses_per_class: usize,
+    pub(crate) threshold: i32,
+    pub(crate) s: f64,
+    pub(crate) boost_true_positive: bool,
+    pub(crate) max_included_literals: usize,
+    pub(crate) clause_drop_p: f64,
+    pub(crate) literal_drop_p: f64,
 
     /// Sparse clause storage; `n_classes * clauses_per_class` clauses total.
-    bank: SparseClauseBank,
+    pub(crate) bank: SparseClauseBank,
     /// Per-clause integer weights (>= 1), indexed `c * clauses_per_class + j`.
-    weights: Vec<i32>,
+    pub(crate) weights: Vec<i32>,
 
     /// Per-clause feedback RNG (also gates the per-clause feedback probability).
-    rngs: Vec<Rng>,
+    pub(crate) rngs: Vec<Rng>,
     /// Per-class RNG for the clause-dropout mask.
-    class_rngs: Vec<Rng>,
+    pub(crate) class_rngs: Vec<Rng>,
     /// Dedicated RNG for the per-sample literal-active (dropout) mask.
-    literal_rng: Rng,
+    pub(crate) literal_rng: Rng,
     /// Master RNG: epoch shuffle + negative-class sampling only.
-    rng: Rng,
+    pub(crate) rng: Rng,
 
     /// Per-class feedback scaling factors for imbalanced datasets (default 1.0).
-    class_weights: Vec<f64>,
+    pub(crate) class_weights: Vec<f64>,
 }
 
 #[cfg(feature = "serde")]

@@ -51,49 +51,49 @@ use crate::rng::Rng;
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ConvolutionalTsetlinMachine {
-    n_classes: usize,
-    n_input_features: usize,
-    kernel_size: usize,
-    stride: usize,
-    n_patches: usize,
-    n_literals: usize,
-    words: usize,
+    pub(crate) n_classes: usize,
+    pub(crate) n_input_features: usize,
+    pub(crate) kernel_size: usize,
+    pub(crate) stride: usize,
+    pub(crate) n_patches: usize,
+    pub(crate) n_literals: usize,
+    pub(crate) words: usize,
     // 2-D convolution fields (patch_rows == 1 means 1-D mode)
-    patch_rows: usize,
-    patch_cols: usize,
-    input_rows: usize,
-    input_cols: usize,
-    n_patch_cols: usize, // patch positions along the column axis
-    clauses_per_class: usize,
-    threshold: i32,
-    s: f64,
-    boost_true_positive: bool,
-    max_included_literals: usize,
-    clause_drop_p: f64,
-    literal_drop_p: f64,
-    literal_rng: Rng,
-    dig_lit_active: Vec<u8>,
+    pub(crate) patch_rows: usize,
+    pub(crate) patch_cols: usize,
+    pub(crate) input_rows: usize,
+    pub(crate) input_cols: usize,
+    pub(crate) n_patch_cols: usize, // patch positions along the column axis
+    pub(crate) clauses_per_class: usize,
+    pub(crate) threshold: i32,
+    pub(crate) s: f64,
+    pub(crate) boost_true_positive: bool,
+    pub(crate) max_included_literals: usize,
+    pub(crate) clause_drop_p: f64,
+    pub(crate) literal_drop_p: f64,
+    pub(crate) literal_rng: Rng,
+    pub(crate) dig_lit_active: Vec<u8>,
 
     /// TA counters: clause `cj = c*CPC + j` occupies `ta[cj*n_literals..(cj+1)*n_literals]`.
-    ta: Vec<u8>,
+    pub(crate) ta: Vec<u8>,
     /// Include bitset: clause `cj` occupies `include[cj*words..(cj+1)*words]`.
-    include: Vec<u64>,
-    half: u8,
-    max_state: u8,
+    pub(crate) include: Vec<u64>,
+    pub(crate) half: u8,
+    pub(crate) max_state: u8,
 
-    weights: Vec<i32>,
-    rngs: Vec<Rng>,
-    class_rngs: Vec<Rng>,
-    valid: Vec<u64>,
-    dig_inv: Vec<u8>,
-    dig_keep: Vec<u8>,
+    pub(crate) weights: Vec<i32>,
+    pub(crate) rngs: Vec<Rng>,
+    pub(crate) class_rngs: Vec<Rng>,
+    pub(crate) valid: Vec<u64>,
+    pub(crate) dig_inv: Vec<u8>,
+    pub(crate) dig_keep: Vec<u8>,
 
-    ind: Vec<u8>,
-    cat: Vec<u64>,
-    d: f64,
-    type_iii: bool,
+    pub(crate) ind: Vec<u8>,
+    pub(crate) cat: Vec<u64>,
+    pub(crate) d: f64,
+    pub(crate) type_iii: bool,
 
-    rng: Rng,
+    pub(crate) rng: Rng,
 }
 
 #[cfg(feature = "serde")]
@@ -553,7 +553,7 @@ impl ConvolutionalTsetlinMachine {
 
     /// Pack all patches from `x` into a pre-allocated flat buffer
     /// (row-major: patch 0 at `[0..words]`, patch 1 at `[words..2*words]`, …).
-    fn pack_all_patches(&self, x: &[u8], buf: &mut [u64]) {
+    pub(crate) fn pack_all_patches(&self, x: &[u8], buf: &mut [u64]) {
         let w = self.words;
         for p in 0..self.n_patches {
             self.pack_patch(x, p, &mut buf[p * w..(p + 1) * w]);

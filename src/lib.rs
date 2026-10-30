@@ -13,7 +13,8 @@
 //! | [`TMSparseClassifier`] | Sparse-clause-bank TM: absorbing actions remove literals as training converges. |
 //! | [`data`] | CSV loaders for binary-valued datasets. |
 //! | [`Booleanizer`] | Feature booleanizer (thresholding / thermometer encoding). |
-//! | [`Rng`] | Fast xoshiro256** RNG used throughout. |
+//! | [`Rng`] | Fast SplitMix64 RNG used throughout. |
+//! | `cuda` | GPU training + inference for every model (`--features cuda`). |
 //!
 //! ## Quick start
 //!
@@ -28,6 +29,8 @@
 mod booleanizer;
 pub(crate) mod clause_bank;
 mod clause_inspect;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 pub mod data;
 pub mod encoder;
 pub mod models;

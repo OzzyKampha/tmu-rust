@@ -35,76 +35,76 @@ use crate::rng::Rng;
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CoalescedTsetlinMachine {
-    n_classes: usize,
-    n_features: usize,
-    n_literals: usize,
-    words: usize,
+    pub(crate) n_classes: usize,
+    pub(crate) n_features: usize,
+    pub(crate) n_literals: usize,
+    pub(crate) words: usize,
     /// Number of clauses in the single shared clause bank.
-    n_clauses: usize,
-    threshold: i32,
-    s: f64,
-    boost_true_positive: bool,
-    max_included_literals: usize,
-    clause_drop_p: f64,
-    literal_drop_p: f64,
+    pub(crate) n_clauses: usize,
+    pub(crate) threshold: i32,
+    pub(crate) s: f64,
+    pub(crate) boost_true_positive: bool,
+    pub(crate) max_included_literals: usize,
+    pub(crate) clause_drop_p: f64,
+    pub(crate) literal_drop_p: f64,
     /// `true` to select the negative class proportionally to its update probability
     /// (focused negative sampling); `false` for uniform random selection.
-    focused_negative_sampling: bool,
+    pub(crate) focused_negative_sampling: bool,
 
     /// Dedicated RNG for the per-sample literal-active mask.
-    literal_rng: Rng,
+    pub(crate) literal_rng: Rng,
     /// Precomputed digits for Bernoulli(1 - literal_drop_p) mask generation.
-    dig_lit_active: Vec<u8>,
+    pub(crate) dig_lit_active: Vec<u8>,
 
     /// u8 TA counters for the shared bank.  Clause `j` occupies
     /// `ta[j * n_literals .. (j+1) * n_literals]`.
-    ta: Vec<u8>,
+    pub(crate) ta: Vec<u8>,
     /// Include bitset for the shared bank.  Clause `j` occupies
     /// `include[j * words .. (j+1) * words]`.  Kept in sync with `ta`.
-    include: Vec<u64>,
+    pub(crate) include: Vec<u64>,
     /// Inclusion threshold: `ta[l] >= half` → literal l is included.
-    half: u8,
+    pub(crate) half: u8,
     /// Maximum TA counter value: `(1 << state_bits) - 1`.
-    max_state: u8,
+    pub(crate) max_state: u8,
 
     /// Signed per-class clause weights, indexed `class * n_clauses + clause`.
     /// Initialised to random `±1`; may grow positive or negative without bound
     /// (matches TMU, which does not clamp coalesced weights to the threshold).
-    weights: Vec<i32>,
+    pub(crate) weights: Vec<i32>,
     /// Per-clause RNG (one per shared clause); reused across both class passes so
     /// training stays deterministic and the per-clause loop is lock-free under rayon.
-    rngs: Vec<Rng>,
+    pub(crate) rngs: Vec<Rng>,
     /// Per-class RNG for the inv/keep Bernoulli feedback masks.
-    class_rngs: Vec<Rng>,
+    pub(crate) class_rngs: Vec<Rng>,
     /// Per-word mask of real literal bits.
-    valid: Vec<u64>,
-    dig_inv: Vec<u8>,
-    dig_keep: Vec<u8>,
+    pub(crate) valid: Vec<u64>,
+    pub(crate) dig_inv: Vec<u8>,
+    pub(crate) dig_keep: Vec<u8>,
 
-    ind: Vec<u8>,
-    cat: Vec<u64>,
-    d: f64,
-    type_iii: bool,
+    pub(crate) ind: Vec<u8>,
+    pub(crate) cat: Vec<u64>,
+    pub(crate) d: f64,
+    pub(crate) type_iii: bool,
 
-    literals: Vec<u64>,
+    pub(crate) literals: Vec<u64>,
     /// Global RNG for shuffling, clause dropout, and negative-class selection.
-    rng: Rng,
+    pub(crate) rng: Rng,
 
     /// Forces scalar training in per-shard replicas inside `fit_epoch_data_parallel`
     /// (which is already parallel across shards). Not serialised; only read on
     /// `--features parallel`.
     #[cfg_attr(feature = "serde", serde(skip))]
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    train_scalar: bool,
+    pub(crate) train_scalar: bool,
     /// Opt-in: let `fit_epoch` use the approximate data-parallel path when large
     /// enough. Off by default (exact). Not serialised.
     #[cfg_attr(feature = "serde", serde(skip))]
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    data_parallel: bool,
+    pub(crate) data_parallel: bool,
     /// Whether the fast-training hint was already printed (once per model).
     #[cfg_attr(feature = "serde", serde(skip))]
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    hint_shown: bool,
+    pub(crate) hint_shown: bool,
 }
 
 #[cfg(feature = "serde")]

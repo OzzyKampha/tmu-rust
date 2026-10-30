@@ -2,7 +2,7 @@
 /// high-frequency RNG calls in the TM inner training loop.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Rng(u64);
+pub struct Rng(pub(crate) u64);
 
 impl Rng {
     /// Create a new RNG from `seed`, mixing in the golden ratio constant to avoid state 0.

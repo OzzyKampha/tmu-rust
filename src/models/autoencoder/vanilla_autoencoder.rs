@@ -27,41 +27,41 @@ use crate::rng::Rng;
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TMAutoEncoder {
-    n_features: usize,
-    n_literals: usize,
-    words: usize,
-    clauses_per_output: usize,
-    threshold: i32,
-    s: f64,
-    boost_true_positive: bool,
-    max_included_literals: usize,
-    clause_drop_p: f64,
-    literal_drop_p: f64,
-    literal_rng: Rng,
-    dig_lit_active: Vec<u8>,
+    pub(crate) n_features: usize,
+    pub(crate) n_literals: usize,
+    pub(crate) words: usize,
+    pub(crate) clauses_per_output: usize,
+    pub(crate) threshold: i32,
+    pub(crate) s: f64,
+    pub(crate) boost_true_positive: bool,
+    pub(crate) max_included_literals: usize,
+    pub(crate) clause_drop_p: f64,
+    pub(crate) literal_drop_p: f64,
+    pub(crate) literal_rng: Rng,
+    pub(crate) dig_lit_active: Vec<u8>,
 
     /// u8 TA counters. Output `o`, clause `j` occupies
     /// `ta[(o*CPO + j) * n_literals .. (o*CPO + j + 1) * n_literals]`.
-    ta: Vec<u8>,
+    pub(crate) ta: Vec<u8>,
     /// Include bitset. Same indexing as `ta` but in 64-bit words.
-    include: Vec<u64>,
-    half: u8,
-    max_state: u8,
+    pub(crate) include: Vec<u64>,
+    pub(crate) half: u8,
+    pub(crate) max_state: u8,
 
-    weights: Vec<i32>,
-    rngs: Vec<Rng>,
-    output_rngs: Vec<Rng>,
-    valid: Vec<u64>,
-    dig_inv: Vec<u8>,
-    dig_keep: Vec<u8>,
+    pub(crate) weights: Vec<i32>,
+    pub(crate) rngs: Vec<Rng>,
+    pub(crate) output_rngs: Vec<Rng>,
+    pub(crate) valid: Vec<u64>,
+    pub(crate) dig_inv: Vec<u8>,
+    pub(crate) dig_keep: Vec<u8>,
 
-    ind: Vec<u8>,
-    cat: Vec<u64>,
-    d: f64,
-    type_iii: bool,
+    pub(crate) ind: Vec<u8>,
+    pub(crate) cat: Vec<u64>,
+    pub(crate) d: f64,
+    pub(crate) type_iii: bool,
 
-    literals: Vec<u64>,
-    rng: Rng,
+    pub(crate) literals: Vec<u64>,
+    pub(crate) rng: Rng,
 }
 
 #[cfg(feature = "serde")]

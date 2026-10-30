@@ -55,28 +55,28 @@ pub(crate) const ABSORB_EXCLUDE: u8 = 0;
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub(crate) struct SparseClause {
     /// Literal indices currently in the conjunction.
-    included: Vec<u32>,
+    pub(crate) included: Vec<u32>,
     /// TA state for each included literal (parallel to `included`).
-    included_state: Vec<u8>,
+    pub(crate) included_state: Vec<u8>,
     /// Candidate literal indices parked near the inclusion boundary.
-    excluded: Vec<u32>,
+    pub(crate) excluded: Vec<u32>,
     /// TA state for each excluded literal (parallel to `excluded`).
-    excluded_state: Vec<u8>,
+    pub(crate) excluded_state: Vec<u8>,
     /// Literal indices absorbed out of candidacy (or otherwise untracked).
-    unallocated: Vec<u32>,
+    pub(crate) unallocated: Vec<u32>,
 }
 
 /// A bank of [`SparseClause`]s sharing the same literal geometry and TA bounds.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub(crate) struct SparseClauseBank {
-    n_clauses: usize,
-    n_literals: usize,
+    pub(crate) n_clauses: usize,
+    pub(crate) n_literals: usize,
     /// Inclusion threshold: a literal with `state >= half` is included.
-    half: u8,
+    pub(crate) half: u8,
     /// Absorbing include state (maximum TA counter value).
-    max_state: u8,
-    clauses: Vec<SparseClause>,
+    pub(crate) max_state: u8,
+    pub(crate) clauses: Vec<SparseClause>,
 }
 
 /// Returns `true` if literal `l` is present in the packed input `lit`.
