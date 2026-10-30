@@ -1,26 +1,48 @@
 //! GPU-vs-CPU equivalence tests: every GPU model must end up bit-identical to
-//! its CPU counterpart after the same training. Run on the CPU kernel emulator
-//! (`cargo test --features cuda-emu`); on a machine with a GPU, set
-//! `TMU_TEST_GPU=1` to run the same checks on CUDA device 0 instead.
+//! its CPU counterpart after the same training.
+//!
+//! * `TMU_TEST_GPU=1 cargo test --features cuda` — run on CUDA device 0;
+//! * `cargo test --features cuda-emu` — run on the CPU kernel emulator;
+//! * neither — every test is skipped (there is no device to test).
 
 use super::CudaDevice;
 use crate::Encoder;
 use crate::encoder::EncodedBatch;
 use crate::rng::Rng;
 
-fn device() -> CudaDevice {
-    if std::env::var("TMU_TEST_GPU").is_ok() {
+fn use_gpu() -> bool {
+    std::env::var("TMU_TEST_GPU").is_ok()
+}
+
+/// True when there is no device to test on (no `TMU_TEST_GPU`, no emulator):
+/// the test then returns early instead of failing.
+fn skip() -> bool {
+    let skip = !use_gpu() && !cfg!(feature = "cuda-emu");
+    if skip {
+        eprintln!("skipped: set TMU_TEST_GPU=1 (GPU) or build with --features cuda-emu");
+    }
+    skip
+}
+
+/// GPU 0 under `TMU_TEST_GPU`, else the emulator with `block` threads per block.
+#[cfg_attr(not(feature = "cuda-emu"), allow(unused_variables))]
+fn device_with_block(block: u32) -> CudaDevice {
+    if use_gpu() {
         return CudaDevice::new(0).expect("TMU_TEST_GPU set but no usable CUDA device");
     }
-    CudaDevice::emulator()
+    #[cfg(feature = "cuda-emu")]
+    return CudaDevice::emulator_with_block(block);
+    #[cfg(not(feature = "cuda-emu"))]
+    unreachable!("tests call skip() first")
+}
+
+fn device() -> CudaDevice {
+    device_with_block(4)
 }
 
 /// Serial emulator: fastest, for the larger runs.
 fn device_serial() -> CudaDevice {
-    if std::env::var("TMU_TEST_GPU").is_err() {
-        return CudaDevice::emulator_with_block(1);
-    }
-    device()
+    device_with_block(1)
 }
 
 /// Noisy XOR on the first two features, other features random.
@@ -93,6 +115,9 @@ mod vanilla {
 
     #[test]
     fn matches_cpu_default() {
+        if skip() {
+            return;
+        }
         check(
             || TsetlinMachine::with_config(2, 12, 10, 8, 3.9, 8, true, 1),
             &device(),
@@ -102,6 +127,9 @@ mod vanilla {
 
     #[test]
     fn matches_cpu_all_options() {
+        if skip() {
+            return;
+        }
         check(
             || {
                 TsetlinMachine::with_config(3, 12, 8, 6, 2.5, 6, false, 9)
@@ -117,6 +145,9 @@ mod vanilla {
 
     #[test]
     fn matches_cpu_type_iii() {
+        if skip() {
+            return;
+        }
         check(
             || TsetlinMachine::with_config(2, 12, 6, 8, 3.9, 8, true, 3).type_iii_feedback(30.0),
             &device(),
@@ -153,6 +184,9 @@ mod vanilla_more {
 
     #[test]
     fn low_state_bits_hit_absorbing_states() {
+        if skip() {
+            return;
+        }
         // 3-bit TAs saturate quickly, exercising the max-state guards.
         let nf = 10;
         let (xs, ys) = xor_data(120, nf, 0.05, 11);
@@ -175,6 +209,9 @@ mod vanilla_more {
 
     #[test]
     fn fit_one_matches_and_learns() {
+        if skip() {
+            return;
+        }
         let nf = 12;
         let (xs, ys) = xor_data(200, nf, 0.0, 21);
         let batch = encode(&xs, nf);
@@ -198,6 +235,9 @@ mod vanilla_more {
 
     #[test]
     fn resumes_from_trained_cpu_model() {
+        if skip() {
+            return;
+        }
         let nf = 12;
         let (xs, ys) = xor_data(100, nf, 0.1, 3);
         let batch = encode(&xs, nf);
@@ -246,6 +286,9 @@ mod coalesced {
 
     #[test]
     fn matches_cpu_default() {
+        if skip() {
+            return;
+        }
         check(
             || CoalescedTsetlinMachine::with_config(2, 12, 16, 10, 3.9, 8, true, 1),
             2,
@@ -255,6 +298,9 @@ mod coalesced {
 
     #[test]
     fn matches_cpu_all_options() {
+        if skip() {
+            return;
+        }
         check(
             || {
                 CoalescedTsetlinMachine::with_config(4, 12, 12, 8, 2.5, 5, false, 8)
@@ -270,6 +316,9 @@ mod coalesced {
 
     #[test]
     fn matches_cpu_type_iii() {
+        if skip() {
+            return;
+        }
         check(
             || {
                 CoalescedTsetlinMachine::with_config(3, 12, 10, 8, 3.9, 8, true, 6)
@@ -312,6 +361,9 @@ mod convolutional {
 
     #[test]
     fn matches_cpu_1d() {
+        if skip() {
+            return;
+        }
         check(
             || ConvolutionalTsetlinMachine::with_config(2, 12, 4, 2, 10, 8, 3.9, 8, true, 1),
             12,
@@ -321,6 +373,9 @@ mod convolutional {
 
     #[test]
     fn matches_cpu_2d_all_options() {
+        if skip() {
+            return;
+        }
         check(
             || {
                 ConvolutionalTsetlinMachine::with_config_2d(
@@ -337,6 +392,9 @@ mod convolutional {
 
     #[test]
     fn matches_cpu_type_iii() {
+        if skip() {
+            return;
+        }
         check(
             || {
                 ConvolutionalTsetlinMachine::with_config(2, 12, 3, 1, 8, 8, 3.9, 8, true, 3)
@@ -384,6 +442,9 @@ mod regressor {
 
     #[test]
     fn matches_cpu_default() {
+        if skip() {
+            return;
+        }
         check(
             || TMRegressor::with_config(10, 16, 12, 3.9, 8, true, 1),
             &device(),
@@ -392,6 +453,9 @@ mod regressor {
 
     #[test]
     fn matches_cpu_all_options() {
+        if skip() {
+            return;
+        }
         check(
             || {
                 TMRegressor::with_config(10, 12, 12, 2.5, 4, false, 7)
@@ -405,6 +469,9 @@ mod regressor {
 
     #[test]
     fn matches_cpu_type_iii() {
+        if skip() {
+            return;
+        }
         check(
             || TMRegressor::with_config(10, 12, 12, 3.9, 8, true, 2).type_iii_feedback(15.0),
             &device(),
@@ -447,6 +514,9 @@ mod autoencoder {
 
     #[test]
     fn matches_cpu_default() {
+        if skip() {
+            return;
+        }
         check(
             || TMAutoEncoder::with_config(8, 6, 8, 3.9, 8, true, 1),
             &device(),
@@ -455,6 +525,9 @@ mod autoencoder {
 
     #[test]
     fn matches_cpu_all_options() {
+        if skip() {
+            return;
+        }
         check(
             || {
                 TMAutoEncoder::with_config(8, 6, 6, 2.5, 4, false, 4)
@@ -468,6 +541,9 @@ mod autoencoder {
 
     #[test]
     fn matches_cpu_type_iii() {
+        if skip() {
+            return;
+        }
         check(
             || TMAutoEncoder::with_config(8, 4, 8, 3.9, 8, true, 9).type_iii_feedback(20.0),
             &device_serial(),
@@ -507,6 +583,9 @@ mod coalesced_autoencoder {
 
     #[test]
     fn matches_cpu_default() {
+        if skip() {
+            return;
+        }
         check(
             || TMCoalescedAutoEncoder::with_config(8, 12, 8, 3.9, 8, true, 1),
             &device_serial(),
@@ -515,6 +594,9 @@ mod coalesced_autoencoder {
 
     #[test]
     fn matches_cpu_all_options() {
+        if skip() {
+            return;
+        }
         check(
             || {
                 TMCoalescedAutoEncoder::with_config(8, 10, 6, 2.5, 4, false, 5)
@@ -528,6 +610,9 @@ mod coalesced_autoencoder {
 
     #[test]
     fn matches_cpu_type_iii() {
+        if skip() {
+            return;
+        }
         check(
             || {
                 TMCoalescedAutoEncoder::with_config(8, 8, 8, 3.9, 8, true, 3)
@@ -584,6 +669,9 @@ mod sparse {
 
     #[test]
     fn matches_cpu_default() {
+        if skip() {
+            return;
+        }
         check(
             || TMSparseClassifier::with_config(2, 12, 10, 8, 3.9, 8, true, 1),
             2,
@@ -594,6 +682,9 @@ mod sparse {
 
     #[test]
     fn matches_cpu_absorbing_and_options() {
+        if skip() {
+            return;
+        }
         // 3-bit states absorb literals out of the excluded pool within a few epochs.
         let make = || {
             TMSparseClassifier::with_config(3, 12, 8, 6, 3.0, 3, false, 7)
@@ -622,6 +713,9 @@ mod composite {
 
     #[test]
     fn matches_cpu() {
+        if skip() {
+            return;
+        }
         let nf = 12;
         let (xs, ys) = xor_data(100, nf, 0.1, 37);
         let batch = encode(&xs, nf);
@@ -656,6 +750,9 @@ mod composite {
 
     #[test]
     fn empty_composite_is_rejected() {
+        if skip() {
+            return;
+        }
         assert!(
             TMCompositeClassifier::new()
                 .to_cuda(&device_serial())
@@ -674,14 +771,14 @@ mod wide_inputs {
     };
 
     fn dev() -> CudaDevice {
-        if std::env::var("TMU_TEST_GPU").is_err() {
-            return CudaDevice::emulator_with_block(4);
-        }
-        device()
+        device_with_block(4)
     }
 
     #[test]
     fn vanilla_type_iii_and_limit() {
+        if skip() {
+            return;
+        }
         let nf = 150; // 300 literals → 5 words
         let (xs, ys) = xor_data(80, nf, 0.1, 41);
         let batch = encode(&xs, nf);
@@ -706,6 +803,9 @@ mod wide_inputs {
 
     #[test]
     fn coalesced_type_iii() {
+        if skip() {
+            return;
+        }
         let nf = 100;
         let (xs, ys) = xor_data(60, nf, 0.1, 43);
         let batch = encode(&xs, nf);
@@ -729,6 +829,9 @@ mod wide_inputs {
 
     #[test]
     fn conv_many_patches() {
+        if skip() {
+            return;
+        }
         // 2-D 12×12 image, 7×7 patches, stride 1 → 36 patches of 98 literals (2 words);
         // 1-D 400 features, kernel 40, stride 1 → 361 patches (6 patch-bitset words,
         // more than the 4 threads per block).
@@ -767,6 +870,9 @@ mod wide_inputs {
 
     #[test]
     fn regressor_type_iii() {
+        if skip() {
+            return;
+        }
         let nf = 130;
         let (xs, _) = xor_data(60, nf, 0.0, 59);
         let ys: Vec<f64> = xs
@@ -786,6 +892,9 @@ mod wide_inputs {
 
     #[test]
     fn autoencoders() {
+        if skip() {
+            return;
+        }
         let nf = 70; // 140 literals → 3 words
         let (xs, _) = xor_data(12, nf, 0.0, 61);
         let batch = encode(&xs, nf);
@@ -814,6 +923,9 @@ mod wide_inputs {
 
 #[test]
 fn global_accumulator_scores_match() {
+    if skip() {
+        return;
+    }
     // Inference normally accumulates per-output sums in shared memory; very wide
     // autoencoders fall back to global atomics. Both must agree with the CPU.
     use crate::{CoalescedTsetlinMachine, TMAutoEncoder};

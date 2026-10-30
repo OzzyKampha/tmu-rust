@@ -126,7 +126,7 @@ let cpu_model = tm.to_cpu()?;
 - **Exact.** GPU training is bit-identical to the CPU model's (default, exact) training for the same seed — every option is supported, including dropout, `max_included_literals`, class weights, focused negative sampling and Type III feedback.
 - **No build-time CUDA dependency.** The driver (`libcuda`) and NVRTC (`libnvrtc`, from the CUDA toolkit or the `nvidia-cuda-nvrtc-cu12` pip wheel) are loaded at runtime and the kernels are JIT-compiled for your GPU on `CudaDevice::new`. Set `TMU_CUDA_DRIVER_PATH` / `TMU_NVRTC_PATH` for non-standard install locations.
 - **Where it helps.** Training is sequential over samples, so the GPU parallelises within each sample (across clauses and 64-literal words). Expect the biggest wins for many clauses and/or wide inputs; tiny models are dominated by kernel-launch latency. Batch inference parallelises over samples and clauses.
-- **Testing without a GPU.** `--features cuda-emu` adds `CudaDevice::emulator()`, which runs the identical kernel source on the CPU (slowly). `cargo test --features cuda-emu` checks every GPU model is bit-identical to its CPU counterpart; on a GPU machine, `TMU_TEST_GPU=1 cargo test --features cuda-emu` runs the same checks on the real device.
+- **Testing without a GPU.** `--features cuda-emu` adds `CudaDevice::emulator()`, which runs the identical kernel source on the CPU (slowly). `cargo test --features cuda-emu` checks every GPU model is bit-identical to its CPU counterpart; on a GPU machine, `TMU_TEST_GPU=1 cargo test --features cuda` runs the same checks on the real device (no emulator or C++ compiler needed).
 
 ```sh
 cargo run --release --features cuda --example cuda              # CPU vs GPU timing + identity check

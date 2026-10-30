@@ -80,9 +80,9 @@ mod regressor;
 mod sparse;
 mod vanilla;
 
-// Run with `cargo test --features cuda-emu` (CPU emulator), or add
-// `TMU_TEST_GPU=1` to run the same checks on CUDA device 0.
-#[cfg(all(test, feature = "cuda-emu"))]
+// `TMU_TEST_GPU=1 cargo test --features cuda` runs these on CUDA device 0;
+// `cargo test --features cuda-emu` runs them on the CPU kernel emulator.
+#[cfg(test)]
 mod tests;
 
 pub use autoencoder::CudaTMAutoEncoder;

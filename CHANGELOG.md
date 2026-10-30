@@ -21,7 +21,8 @@ All notable changes to tmu-rs are documented here.
 - **`cuda-emu` feature** — `CudaDevice::emulator()` runs the same CUDA kernel source
   (compiled as C++) on the CPU, so the GPU path is tested in CI without a GPU:
   GPU-vs-CPU equivalence tests for every model (`cargo test --features cuda-emu`;
-  add `TMU_TEST_GPU=1` to run them on a real GPU).
+  on a GPU machine, `TMU_TEST_GPU=1 cargo test --features cuda` runs them on the
+  real device without the emulator).
 - **`examples/cuda.rs`** — CPU vs GPU training time and a bit-identity check.
 - **TMSparseClassifier** — sparse clause bank with **absorbing actions** (port of
   TMU's `ClauseBankSparse`). Each clause stores included / excluded literal index
