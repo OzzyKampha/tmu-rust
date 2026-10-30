@@ -12,6 +12,13 @@ All notable changes to tmu-rs are documented here.
   encode its data once and draw every epoch's shuffled or class-balanced batches
   by copying words instead of re-encoding.
 
+- **GPU-resident training data** (`--features cuda`): `EncodedBatch::to_cuda`
+  uploads a batch once as a `CudaEncodedBatch`;
+  `CudaCoalescedTsetlinMachine::fit_epoch_rows(&data, rows, ys)` trains on chosen
+  rows of it and `predict_batch_resident(&data)` scores it, reading each sample
+  in place — no per-epoch copy or upload. `fit_epoch_rows` is bit-identical to
+  `fit_epoch(&batch.select(rows), ys)` (same shuffle and random draws).
+
 ### Changed
 - **`Encoder::encode_batch_categorical` encodes rows in parallel** with the
   `parallel` feature (identical output). Encoding 210k samples × 54k features
