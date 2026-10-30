@@ -57,6 +57,33 @@ impl EncodedBatch {
         self.n == 0
     }
 
+    /// 64-bit words per sample.
+    pub fn words(&self) -> usize {
+        self.words
+    }
+
+    /// A new batch of the given samples, in the given order (repeats allowed).
+    ///
+    /// Copies words, so it is far cheaper than encoding the samples again: a
+    /// training loop can encode its data once and draw every epoch's (shuffled,
+    /// class-balanced) batches from it.
+    ///
+    /// # Panics
+    /// If a row index is out of range.
+    pub fn select(&self, rows: &[usize]) -> EncodedBatch {
+        let w = self.words;
+        let mut data = Vec::with_capacity(rows.len() * w);
+        for &r in rows {
+            assert!(r < self.n, "row {r} out of range for a batch of {}", self.n);
+            data.extend_from_slice(&self.data[r * w..(r + 1) * w]);
+        }
+        EncodedBatch {
+            data,
+            n: rows.len(),
+            words: w,
+        }
+    }
+
     /// Build an [`EncodedBatch`] from a flat, row-major word array.
     ///
     /// `data` must have exactly `n * words` elements.
@@ -430,6 +457,18 @@ impl Encoder {
         let n = samples.len();
         let w = self.words;
         let mut data = vec![0u64; n * w];
+        // Rows are independent: with `parallel`, each is encoded on its own core
+        // straight into its slice of the output (identical bytes either way).
+        #[cfg(feature = "parallel")]
+        if w > 0 {
+            use rayon::prelude::*;
+            data.par_chunks_mut(w)
+                .zip(samples.par_iter())
+                .for_each(|(row, tokens)| {
+                    row.copy_from_slice(&self.encode_one_categorical(tokens).0)
+                });
+            return EncodedBatch { data, n, words: w };
+        }
         for (i, tokens) in samples.iter().enumerate() {
             let s = self.encode_one_categorical(tokens);
             data[i * w..(i + 1) * w].copy_from_slice(&s.0);
@@ -601,6 +640,43 @@ mod tests {
         let mut buf = Vec::new();
         e.write_to(&mut buf).unwrap();
         Encoder::read_from(&mut buf.as_slice()).unwrap()
+    }
+
+    #[test]
+    fn categorical_batch_equals_encoding_each_sample() {
+        // Many rows, so the `parallel` build really splits the work.
+        let rows: Vec<Vec<String>> = (0..2000)
+            .map(|i| vec![format!("proc::p{}", i % 37), format!("user::u{}", i % 11)])
+            .collect();
+        let owned: Vec<Vec<&str>> = rows
+            .iter()
+            .map(|r| r.iter().map(String::as_str).collect())
+            .collect();
+        let refs: Vec<&[&str]> = owned.iter().map(Vec::as_slice).collect();
+        let e = Encoder::fit_categorical(&refs[..1500]); // later rows hold unseen tokens
+        let batch = e.encode_batch_categorical(&refs);
+        let w = batch.words();
+        for (i, r) in refs.iter().enumerate() {
+            assert_eq!(
+                &batch.data[i * w..(i + 1) * w],
+                e.encode_one_categorical(r).0.as_slice()
+            );
+        }
+    }
+
+    #[test]
+    fn select_matches_encoding_the_rows() {
+        let e = Encoder::for_binary(70); // more than one word per sample
+        let rows: Vec<Vec<u8>> = (0..4)
+            .map(|i| (0..70).map(|j| u8::from((i * 7 + j) % 3 == 0)).collect())
+            .collect();
+        let refs: Vec<&[u8]> = rows.iter().map(|r| r.as_slice()).collect();
+        let all = e.encode_batch(&refs);
+        let picked = all.select(&[3, 0, 3]);
+        let want = e.encode_batch(&[refs[3], refs[0], refs[3]]);
+        assert_eq!(picked.data, want.data);
+        assert_eq!((picked.len(), picked.words()), (3, all.words()));
+        assert!(all.select(&[]).is_empty());
     }
 
     #[test]
