@@ -2,7 +2,7 @@
 //!
 //! Mirrors TMU's `tmu/models/classification/` package.
 
-mod coalesced_classifier;
+pub(crate) mod coalesced_classifier;
 mod composite_classifier;
 mod convolutional_classifier;
 mod sparse_classifier;

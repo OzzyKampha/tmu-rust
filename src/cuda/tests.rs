@@ -154,6 +154,29 @@ mod vanilla {
             2,
         );
     }
+
+    #[test]
+    fn matches_cpu_with_tmu_options() {
+        if skip() {
+            return;
+        }
+        // Unweighted, confidence-driven, Type I/II ratio, no negated literals.
+        for ratio in [0.5, 2.0] {
+            check(
+                || {
+                    TsetlinMachine::with_config(2, 12, 10, 8, 3.9, 8, true, 1)
+                        .weighted_clauses(false)
+                        .confidence_driven_updating(true)
+                        .type_i_ii_ratio(ratio)
+                        .feature_negation(false)
+                        .type_iii_feedback(5.0)
+                        .number_of_state_bits_ind(4)
+                },
+                &device(),
+                3,
+            );
+        }
+    }
 }
 
 macro_rules! assert_dense_eq {
@@ -281,6 +304,28 @@ mod coalesced {
             let mut want = vec![0i32; n_classes];
             cpu.scores(&sample(&batch, i), &mut want);
             assert_eq!(gpu.scores(&sample(&batch, i)).unwrap(), want);
+        }
+    }
+
+    #[test]
+    fn matches_cpu_with_tmu_options() {
+        if skip() {
+            return;
+        }
+        for ratio in [0.5, 2.0] {
+            check(
+                || {
+                    CoalescedTsetlinMachine::with_config(3, 12, 12, 10, 3.9, 8, true, 4)
+                        .type_i_ii_ratio(ratio)
+                        .max_positive_clauses(3)
+                        .feature_negation(false)
+                        .output_balancing(true)
+                        .type_iii_feedback(5.0)
+                        .number_of_state_bits_ind(4)
+                },
+                3,
+                &device(),
+            );
         }
     }
 
@@ -709,6 +754,7 @@ mod sparse {
             assert_eq!(a.excluded, b.excluded);
             assert_eq!(a.excluded_state, b.excluded_state);
             assert_eq!(a.unallocated, b.unallocated);
+            assert_eq!(a.absorbed, b.absorbed);
         }
         assert_eq!(back.weights, cpu.weights);
         assert_eq!(states(&back.rngs), states(&cpu.rngs));
@@ -745,6 +791,7 @@ mod sparse {
         // 3-bit states absorb literals out of the excluded pool within a few epochs.
         let make = || {
             TMSparseClassifier::with_config(3, 12, 8, 6, 3.0, 3, false, 7)
+                .absorbing(2)
                 .clause_drop_p(0.2)
                 .literal_drop_p(0.1)
                 .max_included_literals(4)
@@ -761,6 +808,45 @@ mod sparse {
             "test should absorb literals"
         );
         check(make, 3, 6, &device_serial());
+    }
+
+    #[test]
+    fn matches_cpu_with_tmu_options() {
+        if skip() {
+            return;
+        }
+        // Every TMU option of the sparse bank and the classifier at once.
+        let make = || {
+            TMSparseClassifier::with_config(3, 12, 8, 6, 3.0, 4, false, 11)
+                .feature_negation(false)
+                .literal_sampling(0.5)
+                .absorbing(3)
+                .literal_insertion_state(5)
+                .feedback_rate_excluded_literals(2)
+                .weighted_clauses(false)
+                .confidence_driven_updating(true)
+                .type_i_ii_ratio(2.0)
+                .clause_drop_p(0.1)
+        };
+        check(make, 3, 6, &device_serial());
+    }
+}
+
+mod refusals {
+    use super::*;
+    use crate::{CoalescedTsetlinMachine, TsetlinMachine};
+
+    #[test]
+    fn per_clause_feedback_masks_are_refused_on_the_gpu() {
+        if skip() {
+            return;
+        }
+        let v =
+            TsetlinMachine::with_config(2, 12, 4, 8, 3.9, 8, true, 1).reuse_random_feedback(false);
+        assert!(v.to_cuda(&device()).is_err());
+        let c = CoalescedTsetlinMachine::with_config(2, 12, 4, 8, 3.9, 8, true, 1)
+            .reuse_random_feedback(false);
+        assert!(c.to_cuda(&device()).is_err());
     }
 }
 

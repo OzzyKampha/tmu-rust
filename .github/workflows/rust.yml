@@ -90,7 +90,7 @@ jobs:
       # The CUDA kernels compiled as C++ and run on the CPU emulator; checks the
       # GPU path is bit-identical to CPU training for every model.
       - name: Run tests (CUDA kernels on CPU emulator)
-        run: cargo test --features cuda-emu --lib cuda:: --verbose
+        run: "cargo test --features cuda-emu --lib cuda:: --verbose"
 
       - name: Check crate packaging
         run: cargo publish --dry-run --allow-dirty

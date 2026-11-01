@@ -1,6 +1,7 @@
 use crate::encoder::EncodedSample;
 use crate::models::{
-    CoalescedTsetlinMachine, TMAutoEncoder, TMCoalescedAutoEncoder, TMRegressor, TsetlinMachine,
+    CoalescedTsetlinMachine, TMAutoEncoder, TMCoalescedAutoEncoder, TMRegressor,
+    TMSparseClassifier, TsetlinMachine,
 };
 
 /// Uniform clause-inspection interface across all TM model types.
@@ -54,8 +55,41 @@ impl ClauseInspect for TsetlinMachine {
     fn n_outputs(&self) -> usize {
         self.n_classes()
     }
+    // Weights are stored unsigned with polarity by index (even clauses vote for
+    // the class, odd ones against); report the signed vote, as the trait says.
     fn clause_weight(&self, output: usize, clause: usize) -> i32 {
-        self.clause_weight(output, clause)
+        let w = self.clause_weight(output, clause);
+        if self.clause_is_positive(clause) {
+            w
+        } else {
+            -w
+        }
+    }
+    fn clause_rule(&self, output: usize, clause: usize) -> Vec<(usize, bool)> {
+        self.clause_rule(output, clause)
+    }
+    fn fired_clauses(&self, sample: &EncodedSample, output: usize) -> Vec<usize> {
+        self.fired_clauses(sample, output)
+    }
+}
+
+impl ClauseInspect for TMSparseClassifier {
+    // Clauses are per class (like `TsetlinMachine`), with polarity by index:
+    // even clauses vote for the class, odd ones against. The weight is reported
+    // signed accordingly, so a fired clause adds exactly `clause_weight`.
+    fn n_clauses(&self) -> usize {
+        self.clauses_per_class()
+    }
+    fn n_outputs(&self) -> usize {
+        self.n_classes()
+    }
+    fn clause_weight(&self, output: usize, clause: usize) -> i32 {
+        let w = self.clause_weight(output, clause);
+        if self.clause_is_positive(clause) {
+            w
+        } else {
+            -w
+        }
     }
     fn clause_rule(&self, output: usize, clause: usize) -> Vec<(usize, bool)> {
         self.clause_rule(output, clause)

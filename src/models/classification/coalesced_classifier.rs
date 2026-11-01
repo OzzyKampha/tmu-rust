@@ -18,6 +18,7 @@
 //! All bit-level primitives are reused verbatim from [`crate::clause_bank::dense`]
 //! (the clause/literal bit layout is identical to the vanilla machine).
 
+use crate::clause_bank::dense::fresh_masks;
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::{DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN, use_parallel};
 use crate::clause_bank::dense::{
@@ -50,6 +51,39 @@ pub struct CoalescedTsetlinMachine {
     /// `true` to select the negative class proportionally to its update probability
     /// (focused negative sampling); `false` for uniform random selection.
     pub(crate) focused_negative_sampling: bool,
+    /// TMU's `type_i_ii_ratio` as the two factors on the literal-feedback
+    /// probability. Training setting, not saved.
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip, default = "crate::clause_bank::dense::serde_one")
+    )]
+    pub(crate) type_i_p: f64,
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip, default = "crate::clause_bank::dense::serde_one")
+    )]
+    pub(crate) type_ii_p: f64,
+    /// TMU's `max_positive_clauses`: the true class's weights are only
+    /// incremented while fewer than this many of its weights are >= 0
+    /// (`usize::MAX` = no limit). Training setting, not saved.
+    #[cfg_attr(feature = "serde", serde(skip, default = "no_limit"))]
+    pub(crate) max_positive_clauses: usize,
+    /// TMU's `output_balancing`: train on one example of every class in turn.
+    /// Training setting, not saved.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) output_balancing: bool,
+    /// TMU's `number_of_state_bits_ind` as the Type III indicator's
+    /// (inclusion state, maximum state); (0, 0) = the TA's. Training setting.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) ind_states: (u8, u8),
+    /// TMU's `reuse_random_feedback`: one set of Type I feedback masks per
+    /// class pass, shared by all clauses (true, tmu-rs's way), or fresh masks
+    /// per clause (false, TMU's default). Training setting.
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip, default = "crate::clause_bank::dense::serde_true")
+    )]
+    pub(crate) reuse_random_feedback: bool,
 
     /// Dedicated RNG for the per-sample literal-active mask.
     pub(crate) literal_rng: Rng,
@@ -107,6 +141,38 @@ pub struct CoalescedTsetlinMachine {
     pub(crate) hint_shown: bool,
 }
 
+/// TMU's `output_balancing` order: walk `order` collecting one example of every
+/// class present in `ys`; each time all are collected, emit them in class
+/// order. Examples of an already-collected class are skipped; an incomplete
+/// last round is not trained (as TMU).
+pub(crate) fn output_balanced(order: &[usize], ys: &[usize], n_classes: usize) -> Vec<usize> {
+    let mut present = vec![false; n_classes];
+    for &y in ys {
+        present[y] = true;
+    }
+    let need = present.iter().filter(|&&p| p).count();
+    let mut slot: Vec<Option<usize>> = vec![None; n_classes];
+    let mut filled = 0;
+    let mut out = Vec::with_capacity(order.len());
+    for &i in order {
+        let y = ys[i];
+        if slot[y].is_none() {
+            slot[y] = Some(i);
+            filled += 1;
+            if filled == need {
+                out.extend(slot.iter_mut().filter_map(Option::take));
+                filled = 0;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(feature = "serde")]
+fn no_limit() -> usize {
+    usize::MAX
+}
+
 #[cfg(feature = "serde")]
 impl crate::serial::SaveLoad for CoalescedTsetlinMachine {
     const TAG: u8 = crate::serial::TAG_COALESCED;
@@ -133,6 +199,8 @@ fn apply_one_clause_coalesced(
     rng: &mut Rng,
     target: u8,
     p: f64,
+    pf: (f64, f64),
+    allow_inc: bool,
     out_j: bool,
     active_j: bool,
     // Packed arrays:
@@ -155,8 +223,8 @@ fn apply_one_clause_coalesced(
     let positive = *w >= 0;
     let give_type_i = if target == 1 { positive } else { !positive };
 
-    // Literal (TA) feedback.
-    if rng.next_f64() <= p {
+    // Literal (TA) feedback, scaled by TMU's Type I / II ratio factors.
+    if rng.next_f64() <= p * if give_type_i { pf.0 } else { pf.1 } {
         if give_type_i {
             let under_limit = max_inc == usize::MAX || {
                 let n: u32 = (0..words).map(|k| (inc[k] & val[k]).count_ones()).sum();
@@ -185,11 +253,15 @@ fn apply_one_clause_coalesced(
     // Weight step: increment (true class) / decrement (negative class) every fired,
     // active clause regardless of sign — matches TMU's positive_weights / negative_weights.
     if out_j && rng.next_f64() <= p {
-        *w = if target == 1 {
-            w.saturating_add(1)
+        if target == 1 {
+            // TMU's max_positive_clauses: no increment once the class has
+            // enough non-negative weights (the draw is still taken).
+            if allow_inc {
+                *w = w.saturating_add(1);
+            }
         } else {
-            w.saturating_sub(1)
-        };
+            *w = w.saturating_sub(1);
+        }
     }
 }
 
@@ -300,6 +372,12 @@ impl CoalescedTsetlinMachine {
             clause_drop_p: 0.0,
             literal_drop_p: 0.0,
             focused_negative_sampling: false,
+            type_i_p: 1.0,
+            type_ii_p: 1.0,
+            max_positive_clauses: usize::MAX,
+            output_balancing: false,
+            ind_states: (0, 0),
+            reuse_random_feedback: true,
             literal_rng,
             dig_lit_active: digits_of(1.0, MASK_BITS),
             ta,
@@ -359,11 +437,89 @@ impl CoalescedTsetlinMachine {
         self
     }
 
+    /// TMU's `number_of_state_bits_ind` (default: the TA's state bits): the
+    /// precision of the Type III indicator automata, 2..=8 bits. Resets the
+    /// indicators: set it before training.
+    pub fn number_of_state_bits_ind(mut self, bits: u8) -> Self {
+        assert!(
+            (2..=8).contains(&bits),
+            "number_of_state_bits_ind must be in 2..=8"
+        );
+        let half = 1u8 << (bits - 1);
+        self.ind_states = (half, ((1u16 << bits) - 1) as u8);
+        self.ind.iter_mut().for_each(|v| *v = half);
+        self
+    }
+
+    /// TMU's `reuse_random_feedback` (default **true** here, as tmu-rs has
+    /// always trained; TMU's default is false): with `false` every clause draws
+    /// its own Type I feedback masks — slower, and closer to TMU's default.
+    /// CPU only: `to_cuda` refuses a model with it off.
+    pub fn reuse_random_feedback(mut self, on: bool) -> Self {
+        self.reuse_random_feedback = on;
+        self
+    }
+
+    /// The Type III indicator's (inclusion state, maximum state).
+    pub(crate) fn ind_range(&self) -> (u8, u8) {
+        if self.ind_states.0 == 0 {
+            (self.half, self.max_state)
+        } else {
+            self.ind_states
+        }
+    }
+
     /// Enable Type III feedback with indicator strength `d` (must be > 1.0).
     pub fn type_iii_feedback(mut self, d: f64) -> Self {
         assert!(d > 1.0, "d must be > 1.0");
         self.d = d;
         self.type_iii = true;
+        self
+    }
+
+    /// TMU's `feature_negation` (default true). With `false` no clause may use a
+    /// negated literal ("feature absent"): every literal in a learned rule is
+    /// something the input has. Kept across `grow_features` and save/load.
+    pub fn feature_negation(mut self, on: bool) -> Self {
+        if on {
+            for l in self.n_features..2 * self.n_features {
+                self.valid[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
+            }
+        } else {
+            crate::clause_bank::dense::clear_negated(&mut self.valid, self.n_features);
+        }
+        let half = self.half;
+        let (nl, w) = (self.n_literals, self.words);
+        for (ta, inc) in self.ta.chunks(nl).zip(self.include.chunks_mut(w)) {
+            rebuild_include(ta, inc, &self.valid, w, nl, half);
+        }
+        self
+    }
+
+    /// TMU's `type_i_ii_ratio` (default 1.0): a ratio above 1 makes Type II
+    /// literal feedback rarer by `1/ratio`, below 1 makes Type I rarer by
+    /// `ratio`. Weight steps are not scaled, as in TMU.
+    pub fn type_i_ii_ratio(mut self, ratio: f64) -> Self {
+        assert!(ratio > 0.0, "type_i_ii_ratio must be > 0");
+        (self.type_i_p, self.type_ii_p) = crate::clause_bank::dense::type_i_ii_factors(ratio);
+        self
+    }
+
+    /// TMU's `output_balancing` (default false): each epoch walks the shuffled
+    /// samples collecting one example of every class, then trains on them in
+    /// class order, and repeats; examples of a class already collected in the
+    /// current round are skipped. Every class gets the same number of updates.
+    pub fn output_balancing(mut self, on: bool) -> Self {
+        self.output_balancing = on;
+        self
+    }
+
+    /// TMU's `max_positive_clauses` (default: no limit): the true class's clause
+    /// weights are only incremented while fewer than `max` of them are >= 0, so
+    /// at most about `max` clauses come to vote for a class.
+    pub fn max_positive_clauses(mut self, max: usize) -> Self {
+        assert!(max >= 1, "max_positive_clauses must be >= 1");
+        self.max_positive_clauses = max;
         self
     }
 
@@ -430,6 +586,7 @@ impl CoalescedTsetlinMachine {
     /// Panics if `new_n_features < self.n_features()` (shrinking is not supported).
     /// A call with the current feature count is a no-op.
     pub fn grow_features(&mut self, new_n_features: usize) {
+        let negation = crate::clause_bank::dense::has_negated(&self.valid, self.n_features);
         assert!(
             new_n_features >= self.n_features,
             "grow_features cannot shrink: {} -> {new_n_features}",
@@ -444,6 +601,7 @@ impl CoalescedTsetlinMachine {
             self.n_features,
             new_n_features,
             self.half,
+            self.ind_range().0,
             &mut self.ta,
             &mut self.include,
             &mut self.ind,
@@ -454,6 +612,9 @@ impl CoalescedTsetlinMachine {
         self.n_literals = n_literals;
         self.words = words;
         self.literals = vec![0u64; words];
+        if !negation {
+            crate::clause_bank::dense::clear_negated(&mut self.valid, new_n_features);
+        }
     }
 
     // ---- inference -------------------------------------------------------
@@ -619,6 +780,8 @@ impl CoalescedTsetlinMachine {
         let words = self.words;
         let n_literals = self.n_literals;
         let boost = self.boost_true_positive;
+        let reuse = self.reuse_random_feedback;
+        let (half_ind, max_ind) = self.ind_range();
         let max_inc = self.max_included_literals;
         let half = self.half;
         let max_state = self.max_state;
@@ -636,6 +799,14 @@ impl CoalescedTsetlinMachine {
         } else {
             (t + v) / (2.0 * t)
         };
+        let pf = (self.type_i_p, self.type_ii_p);
+        let allow_inc = target != 1
+            || self.max_positive_clauses == usize::MAX
+            || self.weights[c * nc..(c + 1) * nc]
+                .iter()
+                .filter(|&&w| w >= 0)
+                .count()
+                < self.max_positive_clauses;
 
         let Self {
             ta,
@@ -673,6 +844,11 @@ impl CoalescedTsetlinMachine {
                     .zip(cat.par_chunks_mut(words))
                     .enumerate()
                     .for_each(|(j, (((((ta_j, inc_j), w), rng), ind_j), cat_j))| {
+                        let fresh = (!reuse)
+                            .then(|| fresh_masks(rng, dig_inv, dig_keep, words, n_literals));
+                        let (inv_r, keep_r) = fresh
+                            .as_ref()
+                            .map_or((&inv_b[..], &keep_b[..]), |(a, b)| (&a[..], &b[..]));
                         apply_one_clause_coalesced(
                             ta_j,
                             inc_j,
@@ -680,13 +856,15 @@ impl CoalescedTsetlinMachine {
                             rng,
                             target,
                             p,
+                            pf,
+                            allow_inc,
                             clause_outputs[j],
                             clause_active[j],
                             val,
                             words,
                             lit_b,
-                            &inv_b,
-                            &keep_b,
+                            inv_r,
+                            keep_r,
                             active_b,
                             n_literals,
                             boost,
@@ -710,8 +888,8 @@ impl CoalescedTsetlinMachine {
                                 p,
                                 target_bool,
                                 rng,
-                                half,
-                                max_state,
+                                half_ind,
+                                max_ind,
                             )
                         {
                             rebuild_include(ta_j, inc_j, val, words, n_literals, half);
@@ -724,6 +902,11 @@ impl CoalescedTsetlinMachine {
                     .zip(rngs.par_iter_mut())
                     .enumerate()
                     .for_each(|(j, (((ta_j, inc_j), w), rng))| {
+                        let fresh = (!reuse)
+                            .then(|| fresh_masks(rng, dig_inv, dig_keep, words, n_literals));
+                        let (inv_r, keep_r) = fresh
+                            .as_ref()
+                            .map_or((&inv_b[..], &keep_b[..]), |(a, b)| (&a[..], &b[..]));
                         apply_one_clause_coalesced(
                             ta_j,
                             inc_j,
@@ -731,13 +914,15 @@ impl CoalescedTsetlinMachine {
                             rng,
                             target,
                             p,
+                            pf,
+                            allow_inc,
                             clause_outputs[j],
                             clause_active[j],
                             val,
                             words,
                             lit_b,
-                            &inv_b,
-                            &keep_b,
+                            inv_r,
+                            keep_r,
                             active_b,
                             n_literals,
                             boost,
@@ -751,6 +936,11 @@ impl CoalescedTsetlinMachine {
         }
 
         for j in 0..nc {
+            let fresh =
+                (!reuse).then(|| fresh_masks(&mut rngs[j], dig_inv, dig_keep, words, n_literals));
+            let (inv_r, keep_r) = fresh
+                .as_ref()
+                .map_or((&inv_b[..], &keep_b[..]), |(a, b)| (&a[..], &b[..]));
             apply_one_clause_coalesced(
                 &mut ta[j * n_literals..(j + 1) * n_literals],
                 &mut include[j * words..(j + 1) * words],
@@ -758,13 +948,15 @@ impl CoalescedTsetlinMachine {
                 &mut rngs[j],
                 target,
                 p,
+                pf,
+                allow_inc,
                 clause_outputs[j],
                 clause_active[j],
                 val,
                 words,
                 lit_b,
-                &inv_b,
-                &keep_b,
+                inv_r,
+                keep_r,
                 active_b,
                 n_literals,
                 boost,
@@ -789,8 +981,8 @@ impl CoalescedTsetlinMachine {
                     p,
                     target_bool,
                     &mut rngs[j],
-                    half,
-                    max_state,
+                    half_ind,
+                    max_ind,
                 )
             {
                 rebuild_include(
@@ -912,6 +1104,9 @@ impl CoalescedTsetlinMachine {
         for i in (1..n).rev() {
             let k = self.rng.below(i + 1);
             order.swap(i, k);
+        }
+        if self.output_balancing {
+            order = output_balanced(&order, ys, self.n_classes);
         }
         let w = self.words;
         let data = batch.data.as_slice();
@@ -1711,5 +1906,98 @@ mod tests {
 
         let bte20 = e20.encode_batch(&as_slices(&pad_to(&xte, 20)));
         assert_eq!(tm.predict_batch(&bte20), loaded.predict_batch(&bte20));
+    }
+
+    #[test]
+    fn coalesced_without_feature_negation_uses_present_literals_only() {
+        let (xs, ys) = make_4class(2000, 31);
+        let e = enc(8);
+        let b = e.encode_batch(&as_slices(&xs));
+        let mut tm = CoalescedTsetlinMachine::with_config(4, 8, 24, 20, 3.9, 8, true, 7)
+            .feature_negation(false);
+        for _ in 0..10 {
+            tm.fit_epoch(&b, &ys);
+        }
+        let rules: Vec<(usize, bool)> = (0..24).flat_map(|j| tm.clause_rule(j)).collect();
+        assert!(!rules.is_empty());
+        assert!(
+            rules.iter().all(|&(_, neg)| !neg),
+            "a negated literal was used"
+        );
+    }
+
+    #[test]
+    fn max_positive_clauses_and_ratio_change_training_and_defaults_do_not() {
+        let (xs, ys) = make_4class(1500, 32);
+        let e = enc(8);
+        let b = e.encode_batch(&as_slices(&xs));
+        let run = |tm: CoalescedTsetlinMachine| {
+            let mut tm = tm;
+            for _ in 0..5 {
+                tm.fit_epoch(&b, &ys);
+            }
+            tm
+        };
+        let base = run(CoalescedTsetlinMachine::with_config(
+            4, 8, 24, 20, 3.9, 8, true, 7,
+        ));
+        let same = run(
+            CoalescedTsetlinMachine::with_config(4, 8, 24, 20, 3.9, 8, true, 7)
+                .type_i_ii_ratio(1.0)
+                .feature_negation(true),
+        );
+        assert_eq!(base.weights, same.weights);
+        assert_eq!(base.ta, same.ta);
+        let capped = run(
+            CoalescedTsetlinMachine::with_config(4, 8, 24, 20, 3.9, 8, true, 7)
+                .max_positive_clauses(2),
+        );
+        assert_ne!(
+            base.weights, capped.weights,
+            "max_positive_clauses had no effect"
+        );
+        let ratio = run(
+            CoalescedTsetlinMachine::with_config(4, 8, 24, 20, 3.9, 8, true, 7)
+                .type_i_ii_ratio(4.0),
+        );
+        assert_ne!(base.ta, ratio.ta, "type_i_ii_ratio had no effect");
+    }
+
+    #[test]
+    fn output_balanced_order_takes_one_example_per_class_in_turn() {
+        let ys = [0, 0, 1, 0, 2, 1, 2, 2, 0, 1];
+        let order: Vec<usize> = (0..ys.len()).collect();
+        // Round 1: first 0 (i0), first 1 (i2), first 2 (i4) -> class order.
+        // Round 2: from i5 on: 1 (i5), 2 (i6), 0 (i8) -> 0, 1, 2. i9 is left over.
+        assert_eq!(output_balanced(&order, &ys, 3), vec![0, 2, 4, 8, 5, 6]);
+        // A class with no examples does not block the others.
+        assert_eq!(output_balanced(&[0, 1, 2], &[0, 2, 0], 3), vec![0, 1]);
+    }
+
+    #[test]
+    fn number_of_state_bits_ind_bounds_the_indicators_and_reuse_off_still_learns() {
+        let (xs, ys) = make_4class(1500, 41);
+        let e = enc(8);
+        let b = e.encode_batch(&as_slices(&xs));
+        let mut tm = CoalescedTsetlinMachine::with_config(4, 8, 24, 20, 3.9, 8, true, 7)
+            .type_iii_feedback(5.0)
+            .number_of_state_bits_ind(4);
+        for _ in 0..5 {
+            tm.fit_epoch(&b, &ys);
+        }
+        assert!(
+            tm.ind.iter().all(|&v| v <= 15),
+            "4-bit indicators stay <= 15"
+        );
+
+        let mut fresh = CoalescedTsetlinMachine::with_config(4, 8, 24, 20, 3.9, 8, true, 7)
+            .reuse_random_feedback(false);
+        let mut reused = CoalescedTsetlinMachine::with_config(4, 8, 24, 20, 3.9, 8, true, 7);
+        for _ in 0..10 {
+            fresh.fit_epoch(&b, &ys);
+            reused.fit_epoch(&b, &ys);
+        }
+        assert_ne!(fresh.ta, reused.ta, "per-clause masks change training");
+        assert!(fresh.accuracy(&b, &ys) > 0.6, "and still learns");
     }
 }

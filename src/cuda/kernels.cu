@@ -221,7 +221,7 @@ __device__ void rebuild_include_block(const u8* ta, u64* inc, const u64* valid, 
 __device__ void type_iii_block(u8* ta, u8* ind, u64* cat, u64* inc, const u64* lit,
                                const u64* valid, const u64* act, int ex_a, int ex_b, int words,
                                int n_literals, double d, double update_p, int target, u64* rng,
-                               u32 half, u32 max_state) {
+                               u32 half, u32 max_state, u32 half_ind, u32 max_ind) {
     __shared__ int s_fires, s_do_inc, s_upd;
     int viol = 0;
     int first = BIG_INT;
@@ -267,11 +267,11 @@ __device__ void type_iii_block(u8* ta, u8* ind, u64* cat, u64* inc, const u64* l
                 u32 dec = active & (1u - cb) & lb & vb;
                 u32 x = (u32)ind[base + b] + incv;
                 if (x > 255u) x = 255u;
-                if (x > max_state) x = max_state;
+                if (x > max_ind) x = max_ind;
                 x = x >= dec ? x - dec : 0;
                 ind[base + b] = (u8)x;
                 if (upd) {
-                    u32 tdec = active & (u32)(x < half);
+                    u32 tdec = active & (u32)(x < half_ind);
                     u32 tv = ta[base + b];
                     ta[base + b] = (u8)(tv >= tdec ? tv - tdec : 0);
                 }
@@ -284,7 +284,7 @@ __device__ void type_iii_block(u8* ta, u8* ind, u64* cat, u64* inc, const u64* l
             int base = k * 64;
             int lim = imin(64, n_literals - base);
             for (int b = 0; b < lim; b++) {
-                u32 tdec = ((u32)(a >> b) & 1u) & (u32)(ind[base + b] < half);
+                u32 tdec = ((u32)(a >> b) & 1u) & (u32)(ind[base + b] < half_ind);
                 u32 tv = ta[base + b];
                 ta[base + b] = (u8)(tv >= tdec ? tv - tdec : 0);
             }
@@ -385,11 +385,14 @@ struct GroupedUpdateParams {
     const double* class_weights;  // per gid; null => 1.0
     double drop_p;
     double d;
+    double type_i_p, type_ii_p;   // TMU's type_i_ii_ratio factors
     u64 max_inc;
     u32 n_groups, cpg, words, n_literals;
     int threshold;
     int ae_nf;
     u32 boost, half, max_state, type_iii;
+    u32 confidence, weighted;     // TMU's confidence_driven_updating, weighted_clauses
+    u32 half_ind, max_ind;        // Type III indicator states (TMU's number_of_state_bits_ind)
 };
 
 extern "C" __global__ void tm_grouped_update(const GroupedUpdateParams p) {
@@ -404,23 +407,31 @@ extern "C" __global__ void tm_grouped_update(const GroupedUpdateParams p) {
     int target = p.ae_nf > 0 ? (int)((p.lit[gid >> 6] >> (gid & 63)) & 1ULL) : (g == 0);
     int sum = iclamp(p.sums[g], -p.threshold, p.threshold);
     double cw = p.class_weights ? p.class_weights[gid] : 1.0;
-    double prob = feedback_p(target, sum, p.threshold, cw);
+    double prob;
+    if (p.confidence) {
+        double t = (double)p.threshold, v = (double)(sum < 0 ? -sum : sum);
+        prob = (t - v) / t * cw;
+        prob = prob < 1.0 ? prob : 1.0;
+    } else {
+        prob = feedback_p(target, sum, p.threshold, cw);
+    }
     int n_inc = p.max_inc != NO_LIMIT ? block_included(inc, p.valid, p.words) : 0;
 
     if (threadIdx.x == 0) {
         u64 s = p.rngs[cj];
         int dropped = p.drop_p > 0.0 && u64_to_f64(rng_peek(p.drop_s0[g], j)) < p.drop_p;
         int action = ACT_NONE;
-        if (!dropped && rng_f64(&s) <= prob) {
-            int positive = (j & 1u) == 0;
+        int positive = (j & 1u) == 0;
+        int type_i = target == positive;
+        if (!dropped && rng_f64(&s) <= prob * (type_i ? p.type_i_p : p.type_ii_p)) {
             int fired = p.fire[(u64)g * p.cpg + j];
             int* w = &p.weights[cj];
-            if (target == positive) {
+            if (type_i) {
                 int fu = fired && (p.max_inc == NO_LIMIT || (u64)n_inc < p.max_inc);
-                if (fu) *w = imin(*w + 1, p.threshold);
+                if (fu && p.weighted) *w = imin(*w + 1, p.threshold);
                 action = fu ? ACT_IA : ACT_IB;
             } else if (fired) {
-                *w = imax(*w - 1, 1);
+                if (p.weighted) *w = imax(*w - 1, 1);
                 action = ACT_II;
             }
         }
@@ -435,7 +446,7 @@ extern "C" __global__ void tm_grouped_update(const GroupedUpdateParams p) {
     if (p.type_iii && !s_skip) {
         type_iii_block(ta, p.ind + cj * p.n_literals, p.cat + cj * p.words, inc, p.lit, p.valid,
                        p.act, ex_a, ex_b, p.words, p.n_literals, p.d, prob, target, &s_rng,
-                       p.half, p.max_state);
+                       p.half, p.max_state, p.half_ind, p.max_ind);
     }
     if (threadIdx.x == 0) p.rngs[cj] = s_rng;
 }
@@ -583,7 +594,7 @@ extern "C" __global__ void conv_update(const ConvUpdateParams p) {
     if (p.type_iii && !s_skip) {
         type_iii_block(ta, p.ind + cj * p.n_literals, p.cat + cj * p.words, inc, lit, p.valid,
                        p.act, -1, -1, p.words, p.n_literals, p.d, prob, target, &s_rng, p.half,
-                       p.max_state);
+                       p.max_state, p.half, p.max_state);
     }
     if (threadIdx.x == 0) p.rngs[cj] = s_rng;
 }
@@ -635,7 +646,8 @@ __device__ void coalesced_pass(u8* ta, u64* inc, int* w, u64* rng_sh, u8* ind, u
                                int ex_b, const u64* inv, const u64* keep, int words,
                                int n_literals, int target, double prob, int out_j, int active,
                                u64 max_inc, double d, u32 boost, u32 half, u32 max_state,
-                               u32 type_iii) {
+                               u32 type_iii, double pf_i, double pf_ii, int allow_inc,
+                               u32 half_ind, u32 max_ind) {
     __shared__ int s_action;
     if (!active) return;
     int n_inc = max_inc != NO_LIMIT ? block_included(inc, valid, words) : 0;
@@ -643,7 +655,7 @@ __device__ void coalesced_pass(u8* ta, u64* inc, int* w, u64* rng_sh, u8* ind, u
         int positive = *w >= 0;
         int give_i = target ? positive : !positive;
         int action = ACT_NONE;
-        if (rng_f64(rng_sh) <= prob) {
+        if (rng_f64(rng_sh) <= prob * (give_i ? pf_i : pf_ii)) {
             if (give_i) {
                 int fu = out_j && (max_inc == NO_LIMIT || (u64)n_inc < max_inc);
                 action = fu ? ACT_IA : ACT_IB;
@@ -653,7 +665,7 @@ __device__ void coalesced_pass(u8* ta, u64* inc, int* w, u64* rng_sh, u8* ind, u
         }
         if (out_j && rng_f64(rng_sh) <= prob) {
             if (target) {
-                if (*w != BIG_INT) *w += 1;
+                if (allow_inc && *w != BIG_INT) *w += 1;
             } else {
                 if (*w != -BIG_INT - 1) *w -= 1;
             }
@@ -665,7 +677,7 @@ __device__ void coalesced_pass(u8* ta, u64* inc, int* w, u64* rng_sh, u8* ind, u
                       boost, half, max_state);
     if (type_iii)
         type_iii_block(ta, ind, cat, inc, lit, valid, act, ex_a, ex_b, words, n_literals, d, prob,
-                       target, rng_sh, half, max_state);
+                       target, rng_sh, half, max_state, half_ind, max_ind);
 }
 
 // Per-sample planning for the coalesced classifier (single block): clause
@@ -748,11 +760,17 @@ extern "C" __global__ void co_plan(const CoPlanParams p) {
     int neg = s_neg;
     int sy = co_class_sum(p, p.y);
     int sn = co_class_sum(p, (u32)neg);
+    // TMU's max_positive_clauses: how many of y's weights are >= 0 (before the update).
+    int npos = 0;
+    for (u32 j = threadIdx.x; j < p.n_clauses; j += blockDim.x)
+        npos += p.weights[(u64)p.y * p.n_clauses + j] >= 0;
+    npos = block_sum(npos);
     if (threadIdx.x == 0) {
         p.plan[0] = (int)p.y;
         p.plan[1] = neg;
         p.plan[2] = sy;
         p.plan[3] = sn;
+        p.plan[4] = npos;
     }
 }
 
@@ -772,10 +790,13 @@ struct CoUpdateParams {
     const u64* inv;
     const u64* keep;
     double d;
+    double type_i_p, type_ii_p;  // TMU's type_i_ii_ratio factors
     u64 max_inc;
+    u64 max_pos;                 // TMU's max_positive_clauses (NO_LIMIT = none)
     u32 n_clauses, words, n_literals;
     int threshold;
     u32 boost, half, max_state, type_iii;
+    u32 half_ind, max_ind;  // Type III indicator states
 };
 
 extern "C" __global__ void co_update(const CoUpdateParams p) {
@@ -798,7 +819,8 @@ extern "C" __global__ void co_update(const CoUpdateParams p) {
         coalesced_pass(ta, inc, &s_w, &s_rng, ind, cat, p.valid, p.lit, p.act, -1, -1,
                        p.inv + (u64)pass * p.words, p.keep + (u64)pass * p.words, p.words,
                        p.n_literals, target, prob, out_j, active, p.max_inc, p.d, p.boost, p.half,
-                       p.max_state, p.type_iii);
+                       p.max_state, p.type_iii, p.type_i_p, p.type_ii_p,
+                       p.max_pos == NO_LIMIT || (u64)p.plan[4] < p.max_pos, p.half_ind, p.max_ind);
         __syncthreads();
         if (threadIdx.x == 0) p.weights[(u64)c * p.n_clauses + j] = s_w;
         __syncthreads();
@@ -874,7 +896,8 @@ extern "C" __global__ void cae_update(const CaeUpdateParams p) {
     coalesced_pass(ta, inc, &s_w, &s_rng, p.type_iii ? p.ind + (u64)j * p.n_literals : 0,
                    p.type_iii ? p.cat + (u64)j * p.words : 0, p.valid, p.lit, p.act, (int)p.o,
                    (int)p.o + p.nf, p.inv, p.keep, p.words, p.n_literals, target, prob, p.fire[j],
-                   active, p.max_inc, p.d, p.boost, p.half, p.max_state, p.type_iii);
+                   active, p.max_inc, p.d, p.boost, p.half, p.max_state, p.type_iii, 1.0, 1.0,
+                   1, p.half, p.max_state);
     __syncthreads();
     if (threadIdx.x == 0) {
         p.rngs[j] = s_rng;
@@ -1008,7 +1031,7 @@ extern "C" __global__ void rg_update(const RgUpdateParams p) {
     if (p.type_iii && !s_skip) {
         type_iii_block(ta, p.ind + (u64)j * p.n_literals, p.cat + (u64)j * p.words, inc, p.lit,
                        p.valid, p.act, -1, -1, p.words, p.n_literals, p.d, up, push_up, &s_rng,
-                       p.half, p.max_state);
+                       p.half, p.max_state, p.half, p.max_state);
     }
     if (threadIdx.x == 0) p.rngs[j] = s_rng;
 }
@@ -1028,6 +1051,7 @@ struct SparseBank {
     u32* n_inc;
     u32* n_exc;
     u32* n_una;
+    u32* n_abs;   // literals absorbed out, per clause
 };
 
 __device__ __forceinline__ bool bit_of(const u64* v, u32 l) { return (v[l >> 6] >> (l & 63)) & 1ULL; }
@@ -1108,8 +1132,32 @@ struct SpUpdateParams {
     u64 max_inc;
     u32 n_groups, cpg, n_literals;
     int threshold;
-    u32 boost, half, max_state, _pad;
+    u32 boost, half, max_state;
+    int absorbing;  // TMU's absorbing: remove excluded literals at or below; -1 = off
+    double type_i_p, type_ii_p;  // TMU's type_i_ii_ratio factors
+    int insertion;               // TMU's literal_insertion_state; -1 = off
+    u32 rate;                    // TMU's feedback_rate_excluded_literals (>= 1)
+    u32 confidence, weighted;    // TMU's confidence_driven_updating, weighted_clauses
 };
+
+// Lower candidate i to `ns`, absorbing at or below `absorbing` (TMU's
+// ClauseBankSparse). Returns 1 when slot i holds an unvisited literal now.
+__device__ int sp_lower(const SpUpdateParams& p, u32* exc_idx, u8* exc_st, u32* n_exc,
+                        const u32* una_idx, u32* n_una, u32* n_abs, u32 i, u32 ns) {
+    if ((int)ns > p.absorbing) {
+        exc_st[i] = (u8)ns;
+        return 0;
+    }
+    (*n_abs)++;
+    if (p.insertion >= 0 && *n_una > 0) {
+        (*n_una)--;
+        exc_idx[i] = una_idx[*n_una];
+        exc_st[i] = (u8)p.insertion;
+        return 0;
+    }
+    sp_swap_remove(exc_idx, exc_st, n_exc, i);
+    return 1;
+}
 
 extern "C" __global__ void sp_update(const SpUpdateParams p) {
     u32 t = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1119,10 +1167,19 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
     u64 cj = (u64)gid * p.cpg + j;
     int target = g == 0;
     int sum = iclamp(p.sums[g], -p.threshold, p.threshold);
-    double prob = feedback_p(target, sum, p.threshold, p.class_weights[gid]);
+    double prob;
+    if (p.confidence) {
+        double tt = (double)p.threshold, v = (double)(sum < 0 ? -sum : sum);
+        prob = (tt - v) / tt * p.class_weights[gid];
+        prob = prob < 1.0 ? prob : 1.0;
+    } else {
+        prob = feedback_p(target, sum, p.threshold, p.class_weights[gid]);
+    }
     if (p.drop_p > 0.0 && u64_to_f64(rng_peek(p.drop_s0[g], j)) < p.drop_p) return;
+    int positive = (j & 1u) == 0;
+    int type_i = target == positive;
     u64 s = p.rngs[cj];
-    if (rng_f64(&s) > prob) {
+    if (rng_f64(&s) > prob * (type_i ? p.type_i_p : p.type_ii_p)) {
         p.rngs[cj] = s;
         return;
     }
@@ -1133,53 +1190,81 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
     u32* exc_idx = b.exc_idx + cj * nl;
     u8* exc_st = b.exc_st + cj * nl;
     u32* una_idx = b.una_idx + cj * nl;
-    u32 n_inc = b.n_inc[cj], n_exc = b.n_exc[cj], n_una = b.n_una[cj];
+    u32 n_inc = b.n_inc[cj], n_exc = b.n_exc[cj], n_una = b.n_una[cj], n_abs = b.n_abs[cj];
     int fired = p.fire[t];
-    int positive = (j & 1u) == 0;
     int* w = &p.weights[cj];
-    if (target == positive) {
+    u32 rate = p.rate > 0 ? p.rate : 1;
+    double inv_rate = 1.0 / (double)rate;
+    if (type_i) {
         int fu = fired && (p.max_inc == NO_LIMIT || (u64)n_inc < p.max_inc);
-        if (fu) *w = imin(*w + 1, p.threshold);
-        // Type I — included literals.
-        u32 i = 0;
-        while (i < n_inc) {
-            u32 l = inc_idx[i];
-            if (!bit_of(p.act, l)) {
-                i++;
-                continue;
-            }
-            u32 st = inc_st[i];
-            if (bit_of(p.lit, l)) {
-                if (fu && st < p.max_state && (p.boost || rng_f64(&s) <= p.keep_p)) inc_st[i] = (u8)(st + 1);
-                i++;
-            } else {
-                if (st < p.max_state && rng_f64(&s) <= p.inv_p) {
-                    u32 ns = st - 1;
-                    if (ns < p.half) {
-                        sp_swap_remove(inc_idx, inc_st, &n_inc, i);
-                        exc_idx[n_exc] = l;
-                        exc_st[n_exc] = (u8)ns;
-                        n_exc++;
+        if (fu && p.weighted) *w = imin(*w + 1, p.threshold);
+        for (int phase = 0; phase < 2; phase++) {
+            // Type Ia: included, then candidates. Type Ib: candidates, then included.
+            int included_phase = fu ? phase == 0 : phase == 1;
+            if (included_phase) {
+                u32 i = 0;
+                while (i < n_inc) {
+                    u32 l = inc_idx[i];
+                    if (!bit_of(p.act, l)) {
+                        i++;
                         continue;
                     }
-                    inc_st[i] = (u8)ns;
+                    u32 st = inc_st[i];
+                    if (fu && bit_of(p.lit, l)) {
+                        if (st < p.max_state && (p.boost || rng_f64(&s) <= p.keep_p)) inc_st[i] = (u8)(st + 1);
+                    } else if (rng_f64(&s) <= p.inv_p) {
+                        u32 ns = st - 1;
+                        if (ns < p.half) {
+                            sp_swap_remove(inc_idx, inc_st, &n_inc, i);
+                            exc_idx[n_exc] = l;
+                            exc_st[n_exc] = (u8)ns;
+                            n_exc++;
+                            continue;
+                        }
+                        inc_st[i] = (u8)ns;
+                    }
+                    i++;
                 }
-                i++;
+            } else if (rate == 1 || rng_f64(&s) <= inv_rate) {
+                u32 i = 0;
+                while (i < n_exc) {
+                    u32 l = exc_idx[i];
+                    if (!bit_of(p.act, l)) {
+                        i++;
+                        continue;
+                    }
+                    u32 st = exc_st[i];
+                    if (fu && bit_of(p.lit, l)) {
+                        if ((p.max_inc == NO_LIMIT || (u64)n_inc < p.max_inc) &&
+                            (p.boost || rng_f64(&s) <= p.keep_p)) {
+                            u32 ns = st + rate < p.max_state ? st + rate : p.max_state;
+                            if (ns >= p.half) {
+                                sp_swap_remove(exc_idx, exc_st, &n_exc, i);
+                                inc_idx[n_inc] = l;
+                                inc_st[n_inc] = (u8)ns;
+                                n_inc++;
+                                continue;
+                            }
+                            exc_st[i] = (u8)ns;
+                        }
+                    } else if (st > rate && rng_f64(&s) <= p.inv_p) {
+                        if (sp_lower(p, exc_idx, exc_st, &n_exc, una_idx, &n_una, &n_abs, i, st - rate))
+                            continue;
+                    }
+                    i++;
+                }
             }
         }
-        // Type I — excluded literals.
-        i = 0;
-        while (i < n_exc) {
-            u32 l = exc_idx[i];
-            if (!bit_of(p.act, l)) {
-                i++;
-                continue;
-            }
-            u32 st = exc_st[i];
-            if (bit_of(p.lit, l)) {
-                if (fu && (p.max_inc == NO_LIMIT || (u64)n_inc < p.max_inc) &&
-                    (p.boost || rng_f64(&s) <= p.keep_p)) {
-                    u32 ns = st + 1 < p.max_state ? st + 1 : p.max_state;
+    } else if (fired) {
+        if (p.weighted) *w = imax(*w - 1, 1);
+        // Type II — candidates only, with probability 1/rate, by rate.
+        if (rate == 1 || rng_f64(&s) <= inv_rate) {
+            u32 i = 0;
+            while (i < n_exc) {
+                u32 l = exc_idx[i];
+                u32 st = exc_st[i];
+                if (bit_of(p.act, l) && !bit_of(p.lit, l)) {
+                    u32 ns = st + rate < p.max_state ? st + rate : p.max_state;
                     if (ns >= p.half) {
                         sp_swap_remove(exc_idx, exc_st, &n_exc, i);
                         inc_idx[n_inc] = l;
@@ -1190,42 +1275,13 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
                     exc_st[i] = (u8)ns;
                 }
                 i++;
-            } else {
-                if (rng_f64(&s) <= p.inv_p) {
-                    if (st <= 1) {
-                        sp_swap_remove(exc_idx, exc_st, &n_exc, i);
-                        una_idx[n_una++] = l;
-                        continue;
-                    }
-                    exc_st[i] = (u8)(st - 1);
-                }
-                i++;
             }
-        }
-    } else if (fired) {
-        *w = imax(*w - 1, 1);
-        // Type II — excluded literals only.
-        u32 i = 0;
-        while (i < n_exc) {
-            u32 l = exc_idx[i];
-            u32 st = exc_st[i];
-            if (bit_of(p.act, l) && !bit_of(p.lit, l) && st > 0) {
-                u32 ns = st + 1 < p.max_state ? st + 1 : p.max_state;
-                if (ns >= p.half) {
-                    sp_swap_remove(exc_idx, exc_st, &n_exc, i);
-                    inc_idx[n_inc] = l;
-                    inc_st[n_inc] = (u8)ns;
-                    n_inc++;
-                    continue;
-                }
-                exc_st[i] = (u8)ns;
-            }
-            i++;
         }
     }
     b.n_inc[cj] = n_inc;
     b.n_exc[cj] = n_exc;
     b.n_una[cj] = n_una;
+    b.n_abs[cj] = n_abs;
     p.rngs[cj] = s;
 }
 
