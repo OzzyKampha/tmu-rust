@@ -34,6 +34,7 @@ params! {
         threshold: i32, ae_nf: i32,
         boost: u32, half: u32, max_state: u32, type_iii: u32,
         confidence: u32, weighted: u32,
+        half_ind: u32, max_ind: u32,
     }
     ConvFireParams {
         include: u64, valid: u64, patches: u64, act: u64, weights: u64, sums: u64,
@@ -74,6 +75,7 @@ params! {
         n_clauses: u32, words: u32, n_literals: u32,
         threshold: i32,
         boost: u32, half: u32, max_state: u32, type_iii: u32,
+        half_ind: u32, max_ind: u32,
     }
     CaeGateParams {
         weights: u64, gate: u64,

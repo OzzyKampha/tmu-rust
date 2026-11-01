@@ -1,5 +1,6 @@
 //! GPU [`CoalescedTsetlinMachine`].
 
+use super::CudaError;
 use super::common::{
     DenseState, N_DIGITS, Result, STAGE_BYTES, TRAIN_CHUNK, argmax_first, blocks, check_smem_ints,
     dense_scores, dense_scores_resident, digits_mask, max_inc, restore_rngs, rng_states, shuffle,
@@ -45,6 +46,12 @@ pub struct CudaCoalescedTsetlinMachine {
 impl CoalescedTsetlinMachine {
     /// Copy this model to a CUDA device for GPU training / inference.
     pub fn to_cuda(&self, device: &CudaDevice) -> Result<CudaCoalescedTsetlinMachine> {
+        if !self.reuse_random_feedback {
+            return Err(CudaError::Invalid(
+                "reuse_random_feedback(false) is not available on the GPU; train it on the CPU"
+                    .into(),
+            ));
+        }
         CudaCoalescedTsetlinMachine::new(self.clone(), device)
     }
 }
@@ -123,7 +130,14 @@ impl CudaCoalescedTsetlinMachine {
         assert_eq!(batch.words, self.host.words);
         assert_eq!(batch.n, ys.len());
         self.host.rng.0 = self.master_rng.download()?[0];
-        let order = shuffle(&mut self.host.rng, batch.n);
+        let mut order = shuffle(&mut self.host.rng, batch.n);
+        if self.host.output_balancing {
+            order = crate::models::classification::coalesced_classifier::output_balanced(
+                &order,
+                ys,
+                self.host.n_classes,
+            );
+        }
         self.master_rng.upload(&[self.host.rng.0])?;
         self.train(Source::Host(batch), ys, &order)
     }
@@ -147,7 +161,14 @@ impl CudaCoalescedTsetlinMachine {
         );
         assert!(rows.iter().all(|&r| r < data.n), "row out of range");
         self.host.rng.0 = self.master_rng.download()?[0];
-        let order = shuffle(&mut self.host.rng, rows.len());
+        let mut order = shuffle(&mut self.host.rng, rows.len());
+        if self.host.output_balancing {
+            order = crate::models::classification::coalesced_classifier::output_balanced(
+                &order,
+                ys,
+                self.host.n_classes,
+            );
+        }
         self.master_rng.upload(&[self.host.rng.0])?;
         self.train(Source::Resident(data, rows), ys, &order)
     }
@@ -266,6 +287,8 @@ impl CudaCoalescedTsetlinMachine {
                     half: h.half as u32,
                     max_state: h.max_state as u32,
                     type_iii: h.type_iii as u32,
+                    half_ind: h.ind_range().0 as u32,
+                    max_ind: h.ind_range().1 as u32,
                 };
                 self.dev.inner.launch("co_update", nc as u32, cb, 0, &up)?;
             }

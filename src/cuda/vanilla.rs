@@ -1,5 +1,6 @@
 //! GPU [`TsetlinMachine`].
 
+use super::CudaError;
 use super::common::{
     DenseState, N_DIGITS, Result, STAGE_BYTES, TRAIN_CHUNK, argmax_first, blocks, dense_scores,
     digits_mask, max_inc, restore_rngs, rng_states, shuffle,
@@ -80,6 +81,12 @@ impl Scratch {
 impl TsetlinMachine {
     /// Copy this model to a CUDA device for GPU training / inference.
     pub fn to_cuda(&self, device: &CudaDevice) -> Result<CudaTsetlinMachine> {
+        if !self.reuse_random_feedback {
+            return Err(CudaError::Invalid(
+                "reuse_random_feedback(false) is not available on the GPU; train it on the CPU"
+                    .into(),
+            ));
+        }
         CudaTsetlinMachine::new(self.clone(), device)
     }
 }
@@ -265,6 +272,8 @@ impl CudaTsetlinMachine {
                     half: h.half as u32,
                     max_state: h.max_state as u32,
                     type_iii: h.type_iii as u32,
+                    half_ind: h.ind_range().0 as u32,
+                    max_ind: h.ind_range().1 as u32,
                     confidence: h.confidence_driven_updating as u32,
                     weighted: h.weighted_clauses as u32,
                 };

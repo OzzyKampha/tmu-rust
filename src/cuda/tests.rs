@@ -169,6 +169,8 @@ mod vanilla {
                         .confidence_driven_updating(true)
                         .type_i_ii_ratio(ratio)
                         .feature_negation(false)
+                        .type_iii_feedback(5.0)
+                        .number_of_state_bits_ind(4)
                 },
                 &device(),
                 3,
@@ -317,6 +319,9 @@ mod coalesced {
                         .type_i_ii_ratio(ratio)
                         .max_positive_clauses(3)
                         .feature_negation(false)
+                        .output_balancing(true)
+                        .type_iii_feedback(5.0)
+                        .number_of_state_bits_ind(4)
                 },
                 3,
                 &device(),
@@ -824,6 +829,24 @@ mod sparse {
                 .clause_drop_p(0.1)
         };
         check(make, 3, 6, &device_serial());
+    }
+}
+
+mod refusals {
+    use super::*;
+    use crate::{CoalescedTsetlinMachine, TsetlinMachine};
+
+    #[test]
+    fn per_clause_feedback_masks_are_refused_on_the_gpu() {
+        if skip() {
+            return;
+        }
+        let v =
+            TsetlinMachine::with_config(2, 12, 4, 8, 3.9, 8, true, 1).reuse_random_feedback(false);
+        assert!(v.to_cuda(&device()).is_err());
+        let c = CoalescedTsetlinMachine::with_config(2, 12, 4, 8, 3.9, 8, true, 1)
+            .reuse_random_feedback(false);
+        assert!(c.to_cuda(&device()).is_err());
     }
 }
 

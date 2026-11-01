@@ -18,6 +18,7 @@
 //! All bit-level primitives are reused verbatim from [`crate::clause_bank::dense`]
 //! (the clause/literal bit layout is identical to the vanilla machine).
 
+use crate::clause_bank::dense::fresh_masks;
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::{DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN, use_parallel};
 use crate::clause_bank::dense::{
@@ -67,6 +68,22 @@ pub struct CoalescedTsetlinMachine {
     /// (`usize::MAX` = no limit). Training setting, not saved.
     #[cfg_attr(feature = "serde", serde(skip, default = "no_limit"))]
     pub(crate) max_positive_clauses: usize,
+    /// TMU's `output_balancing`: train on one example of every class in turn.
+    /// Training setting, not saved.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) output_balancing: bool,
+    /// TMU's `number_of_state_bits_ind` as the Type III indicator's
+    /// (inclusion state, maximum state); (0, 0) = the TA's. Training setting.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) ind_states: (u8, u8),
+    /// TMU's `reuse_random_feedback`: one set of Type I feedback masks per
+    /// class pass, shared by all clauses (true, tmu-rs's way), or fresh masks
+    /// per clause (false, TMU's default). Training setting.
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip, default = "crate::clause_bank::dense::serde_true")
+    )]
+    pub(crate) reuse_random_feedback: bool,
 
     /// Dedicated RNG for the per-sample literal-active mask.
     pub(crate) literal_rng: Rng,
@@ -122,6 +139,33 @@ pub struct CoalescedTsetlinMachine {
     #[cfg_attr(feature = "serde", serde(skip))]
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) hint_shown: bool,
+}
+
+/// TMU's `output_balancing` order: walk `order` collecting one example of every
+/// class present in `ys`; each time all are collected, emit them in class
+/// order. Examples of an already-collected class are skipped; an incomplete
+/// last round is not trained (as TMU).
+pub(crate) fn output_balanced(order: &[usize], ys: &[usize], n_classes: usize) -> Vec<usize> {
+    let mut present = vec![false; n_classes];
+    for &y in ys {
+        present[y] = true;
+    }
+    let need = present.iter().filter(|&&p| p).count();
+    let mut slot: Vec<Option<usize>> = vec![None; n_classes];
+    let mut filled = 0;
+    let mut out = Vec::with_capacity(order.len());
+    for &i in order {
+        let y = ys[i];
+        if slot[y].is_none() {
+            slot[y] = Some(i);
+            filled += 1;
+            if filled == need {
+                out.extend(slot.iter_mut().filter_map(Option::take));
+                filled = 0;
+            }
+        }
+    }
+    out
 }
 
 #[cfg(feature = "serde")]
@@ -331,6 +375,9 @@ impl CoalescedTsetlinMachine {
             type_i_p: 1.0,
             type_ii_p: 1.0,
             max_positive_clauses: usize::MAX,
+            output_balancing: false,
+            ind_states: (0, 0),
+            reuse_random_feedback: true,
             literal_rng,
             dig_lit_active: digits_of(1.0, MASK_BITS),
             ta,
@@ -390,6 +437,38 @@ impl CoalescedTsetlinMachine {
         self
     }
 
+    /// TMU's `number_of_state_bits_ind` (default: the TA's state bits): the
+    /// precision of the Type III indicator automata, 2..=8 bits. Resets the
+    /// indicators: set it before training.
+    pub fn number_of_state_bits_ind(mut self, bits: u8) -> Self {
+        assert!(
+            (2..=8).contains(&bits),
+            "number_of_state_bits_ind must be in 2..=8"
+        );
+        let half = 1u8 << (bits - 1);
+        self.ind_states = (half, ((1u16 << bits) - 1) as u8);
+        self.ind.iter_mut().for_each(|v| *v = half);
+        self
+    }
+
+    /// TMU's `reuse_random_feedback` (default **true** here, as tmu-rs has
+    /// always trained; TMU's default is false): with `false` every clause draws
+    /// its own Type I feedback masks — slower, and closer to TMU's default.
+    /// CPU only: `to_cuda` refuses a model with it off.
+    pub fn reuse_random_feedback(mut self, on: bool) -> Self {
+        self.reuse_random_feedback = on;
+        self
+    }
+
+    /// The Type III indicator's (inclusion state, maximum state).
+    pub(crate) fn ind_range(&self) -> (u8, u8) {
+        if self.ind_states.0 == 0 {
+            (self.half, self.max_state)
+        } else {
+            self.ind_states
+        }
+    }
+
     /// Enable Type III feedback with indicator strength `d` (must be > 1.0).
     pub fn type_iii_feedback(mut self, d: f64) -> Self {
         assert!(d > 1.0, "d must be > 1.0");
@@ -423,6 +502,15 @@ impl CoalescedTsetlinMachine {
     pub fn type_i_ii_ratio(mut self, ratio: f64) -> Self {
         assert!(ratio > 0.0, "type_i_ii_ratio must be > 0");
         (self.type_i_p, self.type_ii_p) = crate::clause_bank::dense::type_i_ii_factors(ratio);
+        self
+    }
+
+    /// TMU's `output_balancing` (default false): each epoch walks the shuffled
+    /// samples collecting one example of every class, then trains on them in
+    /// class order, and repeats; examples of a class already collected in the
+    /// current round are skipped. Every class gets the same number of updates.
+    pub fn output_balancing(mut self, on: bool) -> Self {
+        self.output_balancing = on;
         self
     }
 
@@ -513,6 +601,7 @@ impl CoalescedTsetlinMachine {
             self.n_features,
             new_n_features,
             self.half,
+            self.ind_range().0,
             &mut self.ta,
             &mut self.include,
             &mut self.ind,
@@ -691,6 +780,8 @@ impl CoalescedTsetlinMachine {
         let words = self.words;
         let n_literals = self.n_literals;
         let boost = self.boost_true_positive;
+        let reuse = self.reuse_random_feedback;
+        let (half_ind, max_ind) = self.ind_range();
         let max_inc = self.max_included_literals;
         let half = self.half;
         let max_state = self.max_state;
@@ -753,6 +844,11 @@ impl CoalescedTsetlinMachine {
                     .zip(cat.par_chunks_mut(words))
                     .enumerate()
                     .for_each(|(j, (((((ta_j, inc_j), w), rng), ind_j), cat_j))| {
+                        let fresh = (!reuse)
+                            .then(|| fresh_masks(rng, dig_inv, dig_keep, words, n_literals));
+                        let (inv_r, keep_r) = fresh
+                            .as_ref()
+                            .map_or((&inv_b[..], &keep_b[..]), |(a, b)| (&a[..], &b[..]));
                         apply_one_clause_coalesced(
                             ta_j,
                             inc_j,
@@ -767,8 +863,8 @@ impl CoalescedTsetlinMachine {
                             val,
                             words,
                             lit_b,
-                            &inv_b,
-                            &keep_b,
+                            inv_r,
+                            keep_r,
                             active_b,
                             n_literals,
                             boost,
@@ -792,8 +888,8 @@ impl CoalescedTsetlinMachine {
                                 p,
                                 target_bool,
                                 rng,
-                                half,
-                                max_state,
+                                half_ind,
+                                max_ind,
                             )
                         {
                             rebuild_include(ta_j, inc_j, val, words, n_literals, half);
@@ -806,6 +902,11 @@ impl CoalescedTsetlinMachine {
                     .zip(rngs.par_iter_mut())
                     .enumerate()
                     .for_each(|(j, (((ta_j, inc_j), w), rng))| {
+                        let fresh = (!reuse)
+                            .then(|| fresh_masks(rng, dig_inv, dig_keep, words, n_literals));
+                        let (inv_r, keep_r) = fresh
+                            .as_ref()
+                            .map_or((&inv_b[..], &keep_b[..]), |(a, b)| (&a[..], &b[..]));
                         apply_one_clause_coalesced(
                             ta_j,
                             inc_j,
@@ -820,8 +921,8 @@ impl CoalescedTsetlinMachine {
                             val,
                             words,
                             lit_b,
-                            &inv_b,
-                            &keep_b,
+                            inv_r,
+                            keep_r,
                             active_b,
                             n_literals,
                             boost,
@@ -835,6 +936,11 @@ impl CoalescedTsetlinMachine {
         }
 
         for j in 0..nc {
+            let fresh =
+                (!reuse).then(|| fresh_masks(&mut rngs[j], dig_inv, dig_keep, words, n_literals));
+            let (inv_r, keep_r) = fresh
+                .as_ref()
+                .map_or((&inv_b[..], &keep_b[..]), |(a, b)| (&a[..], &b[..]));
             apply_one_clause_coalesced(
                 &mut ta[j * n_literals..(j + 1) * n_literals],
                 &mut include[j * words..(j + 1) * words],
@@ -849,8 +955,8 @@ impl CoalescedTsetlinMachine {
                 val,
                 words,
                 lit_b,
-                &inv_b,
-                &keep_b,
+                inv_r,
+                keep_r,
                 active_b,
                 n_literals,
                 boost,
@@ -875,8 +981,8 @@ impl CoalescedTsetlinMachine {
                     p,
                     target_bool,
                     &mut rngs[j],
-                    half,
-                    max_state,
+                    half_ind,
+                    max_ind,
                 )
             {
                 rebuild_include(
@@ -998,6 +1104,9 @@ impl CoalescedTsetlinMachine {
         for i in (1..n).rev() {
             let k = self.rng.below(i + 1);
             order.swap(i, k);
+        }
+        if self.output_balancing {
+            order = output_balanced(&order, ys, self.n_classes);
         }
         let w = self.words;
         let data = batch.data.as_slice();
@@ -1852,5 +1961,43 @@ mod tests {
                 .type_i_ii_ratio(4.0),
         );
         assert_ne!(base.ta, ratio.ta, "type_i_ii_ratio had no effect");
+    }
+
+    #[test]
+    fn output_balanced_order_takes_one_example_per_class_in_turn() {
+        let ys = [0, 0, 1, 0, 2, 1, 2, 2, 0, 1];
+        let order: Vec<usize> = (0..ys.len()).collect();
+        // Round 1: first 0 (i0), first 1 (i2), first 2 (i4) -> class order.
+        // Round 2: from i5 on: 1 (i5), 2 (i6), 0 (i8) -> 0, 1, 2. i9 is left over.
+        assert_eq!(output_balanced(&order, &ys, 3), vec![0, 2, 4, 8, 5, 6]);
+        // A class with no examples does not block the others.
+        assert_eq!(output_balanced(&[0, 1, 2], &[0, 2, 0], 3), vec![0, 1]);
+    }
+
+    #[test]
+    fn number_of_state_bits_ind_bounds_the_indicators_and_reuse_off_still_learns() {
+        let (xs, ys) = make_4class(1500, 41);
+        let e = enc(8);
+        let b = e.encode_batch(&as_slices(&xs));
+        let mut tm = CoalescedTsetlinMachine::with_config(4, 8, 24, 20, 3.9, 8, true, 7)
+            .type_iii_feedback(5.0)
+            .number_of_state_bits_ind(4);
+        for _ in 0..5 {
+            tm.fit_epoch(&b, &ys);
+        }
+        assert!(
+            tm.ind.iter().all(|&v| v <= 15),
+            "4-bit indicators stay <= 15"
+        );
+
+        let mut fresh = CoalescedTsetlinMachine::with_config(4, 8, 24, 20, 3.9, 8, true, 7)
+            .reuse_random_feedback(false);
+        let mut reused = CoalescedTsetlinMachine::with_config(4, 8, 24, 20, 3.9, 8, true, 7);
+        for _ in 0..10 {
+            fresh.fit_epoch(&b, &ys);
+            reused.fit_epoch(&b, &ys);
+        }
+        assert_ne!(fresh.ta, reused.ta, "per-clause masks change training");
+        assert!(fresh.accuracy(&b, &ys) > 0.6, "and still learns");
     }
 }

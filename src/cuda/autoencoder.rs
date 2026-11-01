@@ -193,6 +193,8 @@ impl CudaTMAutoEncoder {
                     half: h.half as u32,
                     max_state: h.max_state as u32,
                     type_iii: h.type_iii as u32,
+                    half_ind: h.half as u32,
+                    max_ind: h.max_state as u32,
                     confidence: 0,
                     weighted: 1,
                 };

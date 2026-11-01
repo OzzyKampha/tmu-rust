@@ -221,7 +221,7 @@ __device__ void rebuild_include_block(const u8* ta, u64* inc, const u64* valid, 
 __device__ void type_iii_block(u8* ta, u8* ind, u64* cat, u64* inc, const u64* lit,
                                const u64* valid, const u64* act, int ex_a, int ex_b, int words,
                                int n_literals, double d, double update_p, int target, u64* rng,
-                               u32 half, u32 max_state) {
+                               u32 half, u32 max_state, u32 half_ind, u32 max_ind) {
     __shared__ int s_fires, s_do_inc, s_upd;
     int viol = 0;
     int first = BIG_INT;
@@ -267,11 +267,11 @@ __device__ void type_iii_block(u8* ta, u8* ind, u64* cat, u64* inc, const u64* l
                 u32 dec = active & (1u - cb) & lb & vb;
                 u32 x = (u32)ind[base + b] + incv;
                 if (x > 255u) x = 255u;
-                if (x > max_state) x = max_state;
+                if (x > max_ind) x = max_ind;
                 x = x >= dec ? x - dec : 0;
                 ind[base + b] = (u8)x;
                 if (upd) {
-                    u32 tdec = active & (u32)(x < half);
+                    u32 tdec = active & (u32)(x < half_ind);
                     u32 tv = ta[base + b];
                     ta[base + b] = (u8)(tv >= tdec ? tv - tdec : 0);
                 }
@@ -284,7 +284,7 @@ __device__ void type_iii_block(u8* ta, u8* ind, u64* cat, u64* inc, const u64* l
             int base = k * 64;
             int lim = imin(64, n_literals - base);
             for (int b = 0; b < lim; b++) {
-                u32 tdec = ((u32)(a >> b) & 1u) & (u32)(ind[base + b] < half);
+                u32 tdec = ((u32)(a >> b) & 1u) & (u32)(ind[base + b] < half_ind);
                 u32 tv = ta[base + b];
                 ta[base + b] = (u8)(tv >= tdec ? tv - tdec : 0);
             }
@@ -392,6 +392,7 @@ struct GroupedUpdateParams {
     int ae_nf;
     u32 boost, half, max_state, type_iii;
     u32 confidence, weighted;     // TMU's confidence_driven_updating, weighted_clauses
+    u32 half_ind, max_ind;        // Type III indicator states (TMU's number_of_state_bits_ind)
 };
 
 extern "C" __global__ void tm_grouped_update(const GroupedUpdateParams p) {
@@ -445,7 +446,7 @@ extern "C" __global__ void tm_grouped_update(const GroupedUpdateParams p) {
     if (p.type_iii && !s_skip) {
         type_iii_block(ta, p.ind + cj * p.n_literals, p.cat + cj * p.words, inc, p.lit, p.valid,
                        p.act, ex_a, ex_b, p.words, p.n_literals, p.d, prob, target, &s_rng,
-                       p.half, p.max_state);
+                       p.half, p.max_state, p.half_ind, p.max_ind);
     }
     if (threadIdx.x == 0) p.rngs[cj] = s_rng;
 }
@@ -593,7 +594,7 @@ extern "C" __global__ void conv_update(const ConvUpdateParams p) {
     if (p.type_iii && !s_skip) {
         type_iii_block(ta, p.ind + cj * p.n_literals, p.cat + cj * p.words, inc, lit, p.valid,
                        p.act, -1, -1, p.words, p.n_literals, p.d, prob, target, &s_rng, p.half,
-                       p.max_state);
+                       p.max_state, p.half, p.max_state);
     }
     if (threadIdx.x == 0) p.rngs[cj] = s_rng;
 }
@@ -645,7 +646,8 @@ __device__ void coalesced_pass(u8* ta, u64* inc, int* w, u64* rng_sh, u8* ind, u
                                int ex_b, const u64* inv, const u64* keep, int words,
                                int n_literals, int target, double prob, int out_j, int active,
                                u64 max_inc, double d, u32 boost, u32 half, u32 max_state,
-                               u32 type_iii, double pf_i, double pf_ii, int allow_inc) {
+                               u32 type_iii, double pf_i, double pf_ii, int allow_inc,
+                               u32 half_ind, u32 max_ind) {
     __shared__ int s_action;
     if (!active) return;
     int n_inc = max_inc != NO_LIMIT ? block_included(inc, valid, words) : 0;
@@ -675,7 +677,7 @@ __device__ void coalesced_pass(u8* ta, u64* inc, int* w, u64* rng_sh, u8* ind, u
                       boost, half, max_state);
     if (type_iii)
         type_iii_block(ta, ind, cat, inc, lit, valid, act, ex_a, ex_b, words, n_literals, d, prob,
-                       target, rng_sh, half, max_state);
+                       target, rng_sh, half, max_state, half_ind, max_ind);
 }
 
 // Per-sample planning for the coalesced classifier (single block): clause
@@ -794,6 +796,7 @@ struct CoUpdateParams {
     u32 n_clauses, words, n_literals;
     int threshold;
     u32 boost, half, max_state, type_iii;
+    u32 half_ind, max_ind;  // Type III indicator states
 };
 
 extern "C" __global__ void co_update(const CoUpdateParams p) {
@@ -817,7 +820,7 @@ extern "C" __global__ void co_update(const CoUpdateParams p) {
                        p.inv + (u64)pass * p.words, p.keep + (u64)pass * p.words, p.words,
                        p.n_literals, target, prob, out_j, active, p.max_inc, p.d, p.boost, p.half,
                        p.max_state, p.type_iii, p.type_i_p, p.type_ii_p,
-                       p.max_pos == NO_LIMIT || (u64)p.plan[4] < p.max_pos);
+                       p.max_pos == NO_LIMIT || (u64)p.plan[4] < p.max_pos, p.half_ind, p.max_ind);
         __syncthreads();
         if (threadIdx.x == 0) p.weights[(u64)c * p.n_clauses + j] = s_w;
         __syncthreads();
@@ -894,7 +897,7 @@ extern "C" __global__ void cae_update(const CaeUpdateParams p) {
                    p.type_iii ? p.cat + (u64)j * p.words : 0, p.valid, p.lit, p.act, (int)p.o,
                    (int)p.o + p.nf, p.inv, p.keep, p.words, p.n_literals, target, prob, p.fire[j],
                    active, p.max_inc, p.d, p.boost, p.half, p.max_state, p.type_iii, 1.0, 1.0,
-                   1);
+                   1, p.half, p.max_state);
     __syncthreads();
     if (threadIdx.x == 0) {
         p.rngs[j] = s_rng;
@@ -1028,7 +1031,7 @@ extern "C" __global__ void rg_update(const RgUpdateParams p) {
     if (p.type_iii && !s_skip) {
         type_iii_block(ta, p.ind + (u64)j * p.n_literals, p.cat + (u64)j * p.words, inc, p.lit,
                        p.valid, p.act, -1, -1, p.words, p.n_literals, p.d, up, push_up, &s_rng,
-                       p.half, p.max_state);
+                       p.half, p.max_state, p.half, p.max_state);
     }
     if (threadIdx.x == 0) p.rngs[j] = s_rng;
 }

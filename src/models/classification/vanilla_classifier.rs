@@ -2,6 +2,7 @@
 //!
 //! Mirrors TMU's `vanilla_classifier.py` / `TMClassifier`.
 
+use crate::clause_bank::dense::fresh_masks;
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::{DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN, use_parallel};
 use crate::clause_bank::dense::{
@@ -88,6 +89,18 @@ pub struct TsetlinMachine {
         serde(skip, default = "crate::clause_bank::dense::serde_one")
     )]
     pub(crate) type_ii_p: f64,
+    /// TMU's `number_of_state_bits_ind` as the Type III indicator's
+    /// (inclusion state, maximum state); (0, 0) = the TA's. Training setting.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) ind_states: (u8, u8),
+    /// TMU's `reuse_random_feedback`: one set of Type I feedback masks per
+    /// class pass, shared by all clauses (true, tmu-rs's way), or fresh masks
+    /// per clause (false, TMU's default). Training setting.
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip, default = "crate::clause_bank::dense::serde_true")
+    )]
+    pub(crate) reuse_random_feedback: bool,
 
     /// Indicator TA states for Type III feedback (same layout as `ta`).
     /// Zero-initialised; only meaningful when `type_iii` is `true`.
@@ -329,6 +342,8 @@ impl TsetlinMachine {
             confidence_driven_updating: false,
             type_i_p: 1.0,
             type_ii_p: 1.0,
+            ind_states: (0, 0),
+            reuse_random_feedback: true,
             ind: vec![half; n_clauses * n_literals],
             cat: vec![0u64; n_clauses * words],
             d: 200.0,
@@ -451,6 +466,38 @@ impl TsetlinMachine {
         self
     }
 
+    /// TMU's `number_of_state_bits_ind` (default: the TA's state bits): the
+    /// precision of the Type III indicator automata, 2..=8 bits. Resets the
+    /// indicators: set it before training.
+    pub fn number_of_state_bits_ind(mut self, bits: u8) -> Self {
+        assert!(
+            (2..=8).contains(&bits),
+            "number_of_state_bits_ind must be in 2..=8"
+        );
+        let half = 1u8 << (bits - 1);
+        self.ind_states = (half, ((1u16 << bits) - 1) as u8);
+        self.ind.iter_mut().for_each(|v| *v = half);
+        self
+    }
+
+    /// TMU's `reuse_random_feedback` (default **true** here, as tmu-rs has
+    /// always trained; TMU's default is false): with `false` every clause draws
+    /// its own Type I feedback masks — slower, and closer to TMU's default.
+    /// CPU only: `to_cuda` refuses a model with it off.
+    pub fn reuse_random_feedback(mut self, on: bool) -> Self {
+        self.reuse_random_feedback = on;
+        self
+    }
+
+    /// The Type III indicator's (inclusion state, maximum state).
+    pub(crate) fn ind_range(&self) -> (u8, u8) {
+        if self.ind_states.0 == 0 {
+            (self.half, self.max_state)
+        } else {
+            self.ind_states
+        }
+    }
+
     /// Enable Type III feedback with strength parameter `d` (default: disabled).
     ///
     /// Type III feedback maintains a per-literal *indicator state* alongside the primary TA state.
@@ -535,6 +582,7 @@ impl TsetlinMachine {
             self.n_features,
             new_n_features,
             self.half,
+            self.ind_range().0,
             &mut self.ta,
             &mut self.include,
             &mut self.ind,
@@ -712,6 +760,8 @@ impl TsetlinMachine {
         let drop_p = self.clause_drop_p;
         let half = self.half;
         let max_state = self.max_state;
+        let reuse = self.reuse_random_feedback;
+        let (half_ind, max_ind) = self.ind_range();
         let cw = self.class_weights[c];
         let weighted = self.weighted_clauses;
         let confidence = self.confidence_driven_updating;
@@ -784,9 +834,14 @@ impl TsetlinMachine {
                     .zip(class_cat.par_chunks_mut(words))
                     .enumerate()
                     .for_each(|(j, (((((ta_c, inc_c), w), rng), ind_c), cat_c))| {
+                        let fresh = (!reuse)
+                            .then(|| fresh_masks(rng, dig_inv, dig_keep, words, n_literals));
+                        let (inv_r, keep_r) = fresh
+                            .as_ref()
+                            .map_or((&inv_b[..], &keep_b[..]), |(a, b)| (&a[..], &b[..]));
                         apply_one_clause(
                             j, ta_c, inc_c, w, rng, target, p_i, p_ii, weighted, &drop_mask, lit,
-                            val, lit_active, words, lit_b, &inv_b, &keep_b, active_b, n_literals,
+                            val, lit_active, words, lit_b, inv_r, keep_r, active_b, n_literals,
                             boost, wmax, max_inc, half, max_state,
                         );
                         if (drop_mask.is_empty() || !drop_mask[j])
@@ -805,8 +860,8 @@ impl TsetlinMachine {
                                 p,
                                 target_bool,
                                 rng,
-                                half,
-                                max_state,
+                                half_ind,
+                                max_ind,
                             )
                         {
                             rebuild_include(ta_c, inc_c, val, words, n_literals, half);
@@ -820,9 +875,14 @@ impl TsetlinMachine {
                     .zip(class_rng.par_iter_mut())
                     .enumerate()
                     .for_each(|(j, (((ta_c, inc_c), w), rng))| {
+                        let fresh = (!reuse)
+                            .then(|| fresh_masks(rng, dig_inv, dig_keep, words, n_literals));
+                        let (inv_r, keep_r) = fresh
+                            .as_ref()
+                            .map_or((&inv_b[..], &keep_b[..]), |(a, b)| (&a[..], &b[..]));
                         apply_one_clause(
                             j, ta_c, inc_c, w, rng, target, p_i, p_ii, weighted, &drop_mask, lit,
-                            val, lit_active, words, lit_b, &inv_b, &keep_b, active_b, n_literals,
+                            val, lit_active, words, lit_b, inv_r, keep_r, active_b, n_literals,
                             boost, wmax, max_inc, half, max_state,
                         );
                     });
@@ -831,6 +891,11 @@ impl TsetlinMachine {
         }
 
         for j in 0..cps {
+            let fresh = (!reuse)
+                .then(|| fresh_masks(&mut class_rng[j], dig_inv, dig_keep, words, n_literals));
+            let (inv_r, keep_r) = fresh
+                .as_ref()
+                .map_or((&inv_b[..], &keep_b[..]), |(a, b)| (&a[..], &b[..]));
             apply_one_clause(
                 j,
                 &mut class_ta[j * n_literals..(j + 1) * n_literals],
@@ -847,8 +912,8 @@ impl TsetlinMachine {
                 lit_active,
                 words,
                 lit_b,
-                &inv_b,
-                &keep_b,
+                inv_r,
+                keep_r,
                 active_b,
                 n_literals,
                 boost,
@@ -874,8 +939,8 @@ impl TsetlinMachine {
                     p,
                     target_bool,
                     &mut class_rng[j],
-                    half,
-                    max_state,
+                    half_ind,
+                    max_ind,
                 )
             {
                 rebuild_include(
