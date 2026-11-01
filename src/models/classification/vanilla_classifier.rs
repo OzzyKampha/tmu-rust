@@ -66,6 +66,28 @@ pub struct TsetlinMachine {
     /// `class_weights[c]` multiplies the feedback probability for class `c`.
     /// Defaults to `1.0` for all classes (no reweighting).
     pub(crate) class_weights: Vec<f64>,
+    /// TMU's `weighted_clauses`: learn clause weights (true, as tmu-rs always
+    /// has) or keep every clause's vote at 1 (TMU's default). Training setting.
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip, default = "crate::clause_bank::dense::serde_true")
+    )]
+    pub(crate) weighted_clauses: bool,
+    /// TMU's `confidence_driven_updating`: feedback probability `(T - |sum|) / T`
+    /// for both classes. Training setting.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) confidence_driven_updating: bool,
+    /// TMU's `type_i_ii_ratio` as the two probability factors. Training setting.
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip, default = "crate::clause_bank::dense::serde_one")
+    )]
+    pub(crate) type_i_p: f64,
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip, default = "crate::clause_bank::dense::serde_one")
+    )]
+    pub(crate) type_ii_p: f64,
 
     /// Indicator TA states for Type III feedback (same layout as `ta`).
     /// Zero-initialised; only meaningful when `type_iii` is `true`.
@@ -118,7 +140,9 @@ fn apply_one_clause(
     w: &mut i32,
     rng: &mut Rng,
     target: u8,
-    p: f64,
+    p_i: f64,
+    p_ii: f64,
+    weighted: bool,
     drop_mask: &[bool],
     // Packed bit arrays (for O(words) fire check):
     lit: &[u64],
@@ -140,11 +164,12 @@ fn apply_one_clause(
     if !drop_mask.is_empty() && drop_mask[j] {
         return;
     }
-    if rng.next_f64() > p {
+    let positive = j & 1 == 0;
+    let type_i = (target == 1) == positive;
+    if rng.next_f64() > if type_i { p_i } else { p_ii } {
         return;
     }
-    let positive = j & 1 == 0;
-    if (target == 1) == positive {
+    if type_i {
         // Type I: fire check (O(words)), then SIMD TA update (O(n_literals)).
         let fired = clause_fire(inc, lit, val, words, lit_active);
         let under_limit = max_inc == usize::MAX || {
@@ -152,7 +177,7 @@ fn apply_one_clause(
             (n as usize) < max_inc
         };
         let fired_under = fired && under_limit;
-        if fired_under {
+        if fired_under && weighted {
             *w = (*w + 1).min(wmax);
         }
         type_i_update_bytes(
@@ -171,7 +196,9 @@ fn apply_one_clause(
         if !clause_fire(inc, lit, val, words, lit_active) {
             return;
         }
-        *w = (*w - 1).max(1);
+        if weighted {
+            *w = (*w - 1).max(1);
+        }
         type_ii_update_bytes(ta, n_literals, lit_b, active_b, half, max_state);
     }
     rebuild_include(ta, inc, val, words, n_literals, half);
@@ -298,6 +325,10 @@ impl TsetlinMachine {
             literals: vec![0u64; words],
             rng,
             class_weights: vec![1.0f64; n_classes],
+            weighted_clauses: true,
+            confidence_driven_updating: false,
+            type_i_p: 1.0,
+            type_ii_p: 1.0,
             ind: vec![half; n_clauses * n_literals],
             cat: vec![0u64; n_clauses * words],
             d: 200.0,
@@ -374,6 +405,49 @@ impl TsetlinMachine {
             "all class weights must be positive"
         );
         self.class_weights = weights;
+        self
+    }
+
+    /// TMU's `weighted_clauses` (default **true** here, as tmu-rs has always
+    /// trained; TMU's default is false). With `false` every clause keeps a vote
+    /// of 1: the machine is TMU's default, unweighted TsetlinMachine.
+    pub fn weighted_clauses(mut self, on: bool) -> Self {
+        self.weighted_clauses = on;
+        self
+    }
+
+    /// TMU's `feature_negation` (default true). With `false` no clause may use a
+    /// negated literal ("feature absent"): every literal in a learned rule is
+    /// something the input has. Kept across `grow_features` and save/load.
+    pub fn feature_negation(mut self, on: bool) -> Self {
+        if on {
+            for l in self.n_features..2 * self.n_features {
+                self.valid[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
+            }
+        } else {
+            crate::clause_bank::dense::clear_negated(&mut self.valid, self.n_features);
+        }
+        let half = self.half;
+        let (nl, w) = (self.n_literals, self.words);
+        for (ta, inc) in self.ta.chunks(nl).zip(self.include.chunks_mut(w)) {
+            rebuild_include(ta, inc, &self.valid, w, nl, half);
+        }
+        self
+    }
+
+    /// TMU's `confidence_driven_updating` (default false): the feedback
+    /// probability is `(T - |class sum|) / T` for the true and the negative
+    /// class alike, instead of `(T ∓ sum) / 2T`.
+    pub fn confidence_driven_updating(mut self, on: bool) -> Self {
+        self.confidence_driven_updating = on;
+        self
+    }
+
+    /// TMU's `type_i_ii_ratio` (default 1.0): a ratio above 1 makes Type II
+    /// feedback rarer by `1/ratio`, below 1 makes Type I rarer by `ratio`.
+    pub fn type_i_ii_ratio(mut self, ratio: f64) -> Self {
+        assert!(ratio > 0.0, "type_i_ii_ratio must be > 0");
+        (self.type_i_p, self.type_ii_p) = crate::clause_bank::dense::type_i_ii_factors(ratio);
         self
     }
 
@@ -455,6 +529,7 @@ impl TsetlinMachine {
             return;
         }
         let n_clauses = self.n_classes * self.clauses_per_class;
+        let negation = crate::clause_bank::dense::has_negated(&self.valid, self.n_features);
         let (n_literals, words) = grow_dense_state(
             n_clauses,
             self.n_features,
@@ -470,6 +545,9 @@ impl TsetlinMachine {
         self.n_literals = n_literals;
         self.words = words;
         self.literals = vec![0u64; words];
+        if !negation {
+            crate::clause_bank::dense::clear_negated(&mut self.valid, new_n_features);
+        }
     }
 
     // ---- inference -------------------------------------------------------
@@ -635,6 +713,9 @@ impl TsetlinMachine {
         let half = self.half;
         let max_state = self.max_state;
         let cw = self.class_weights[c];
+        let weighted = self.weighted_clauses;
+        let confidence = self.confidence_driven_updating;
+        let (type_i_p, type_ii_p) = (self.type_i_p, self.type_ii_p);
         // Capture Type III config before the struct destructure.
         let type_iii_en = self.type_iii;
         let d_val = self.d;
@@ -662,11 +743,14 @@ impl TsetlinMachine {
 
         let t = wmax as f64;
         let v = sum as f64;
-        let p = if target == 1 {
+        let p = if confidence {
+            ((t - v.abs()) / t * cw).min(1.0)
+        } else if target == 1 {
             ((t - v) / (2.0 * t) * cw).min(1.0)
         } else {
             ((t + v) / (2.0 * t) * cw).min(1.0)
         };
+        let (p_i, p_ii) = (p * type_i_p, p * type_ii_p);
 
         let drop_mask: Vec<bool> = if drop_p > 0.0 {
             (0..cps).map(|_| crng.next_f64() < drop_p).collect()
@@ -701,9 +785,9 @@ impl TsetlinMachine {
                     .enumerate()
                     .for_each(|(j, (((((ta_c, inc_c), w), rng), ind_c), cat_c))| {
                         apply_one_clause(
-                            j, ta_c, inc_c, w, rng, target, p, &drop_mask, lit, val, lit_active,
-                            words, lit_b, &inv_b, &keep_b, active_b, n_literals, boost, wmax,
-                            max_inc, half, max_state,
+                            j, ta_c, inc_c, w, rng, target, p_i, p_ii, weighted, &drop_mask, lit,
+                            val, lit_active, words, lit_b, &inv_b, &keep_b, active_b, n_literals,
+                            boost, wmax, max_inc, half, max_state,
                         );
                         if (drop_mask.is_empty() || !drop_mask[j])
                             && type_iii_update(
@@ -737,9 +821,9 @@ impl TsetlinMachine {
                     .enumerate()
                     .for_each(|(j, (((ta_c, inc_c), w), rng))| {
                         apply_one_clause(
-                            j, ta_c, inc_c, w, rng, target, p, &drop_mask, lit, val, lit_active,
-                            words, lit_b, &inv_b, &keep_b, active_b, n_literals, boost, wmax,
-                            max_inc, half, max_state,
+                            j, ta_c, inc_c, w, rng, target, p_i, p_ii, weighted, &drop_mask, lit,
+                            val, lit_active, words, lit_b, &inv_b, &keep_b, active_b, n_literals,
+                            boost, wmax, max_inc, half, max_state,
                         );
                     });
             }
@@ -754,7 +838,9 @@ impl TsetlinMachine {
                 &mut class_w[j],
                 &mut class_rng[j],
                 target,
-                p,
+                p_i,
+                p_ii,
+                weighted,
                 &drop_mask,
                 lit,
                 val,
@@ -2591,5 +2677,84 @@ mod tests {
             ClauseInspect::clause_weight(&tm, 0, 1) < 0,
             "odd clauses vote against"
         );
+    }
+
+    #[test]
+    fn unweighted_clauses_keep_a_vote_of_one() {
+        let (xs, ys) = make_xor(2000, 0.1, 21);
+        let e = enc(12);
+        let b = e.encode_batch(&as_slices(&xs));
+        let mut tm =
+            TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 8, true, 6).weighted_clauses(false);
+        for _ in 0..10 {
+            tm.fit_epoch(&b, &ys);
+        }
+        assert!(tm.weights.iter().all(|&w| w == 1), "{:?}", tm.weights);
+        assert!(tm.accuracy(&b, &ys) > 0.8, "still learns XOR");
+    }
+
+    #[test]
+    fn without_feature_negation_rules_use_present_literals_only() {
+        let (xs, ys) = make_xor(2000, 0.0, 22);
+        let e = enc(12);
+        let b = e.encode_batch(&as_slices(&xs));
+        let mut tm =
+            TsetlinMachine::with_config(2, 12, 20, 15, 3.9, 8, true, 7).feature_negation(false);
+        for _ in 0..10 {
+            tm.fit_epoch(&b, &ys);
+        }
+        let rules = |tm: &TsetlinMachine| {
+            (0..2)
+                .flat_map(|c| (0..20).map(move |j| (c, j)))
+                .flat_map(|(c, j)| tm.clause_rule(c, j))
+                .collect::<Vec<_>>()
+        };
+        assert!(!rules(&tm).is_empty(), "something was learned");
+        assert!(
+            rules(&tm).iter().all(|&(_, neg)| !neg),
+            "a negated literal was used"
+        );
+        // Still off after growing the input.
+        tm.grow_features(16);
+        let e16 = enc(16);
+        let xs16: Vec<Vec<u8>> = xs
+            .iter()
+            .map(|x| {
+                let mut v = x.clone();
+                v.extend([1, 0, 1, 0]);
+                v
+            })
+            .collect();
+        let b16 = e16.encode_batch(&as_slices(&xs16));
+        for _ in 0..5 {
+            tm.fit_epoch(&b16, &ys);
+        }
+        let r: Vec<(usize, bool)> = (0..2)
+            .flat_map(|c| (0..20).map(move |j| (c, j)))
+            .flat_map(|(c, j)| tm.clause_rule(c, j))
+            .collect();
+        assert!(
+            r.iter().all(|&(_, neg)| !neg),
+            "negation came back after grow"
+        );
+    }
+
+    #[test]
+    fn type_i_ii_ratio_one_and_defaults_change_nothing() {
+        let (xs, ys) = make_xor(1000, 0.1, 23);
+        let e = enc(12);
+        let b = e.encode_batch(&as_slices(&xs));
+        let mut a = TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 8, true, 8);
+        let mut c = TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 8, true, 8)
+            .type_i_ii_ratio(1.0)
+            .weighted_clauses(true)
+            .confidence_driven_updating(false)
+            .feature_negation(true);
+        for _ in 0..5 {
+            a.fit_epoch(&b, &ys);
+            c.fit_epoch(&b, &ys);
+        }
+        assert_eq!(a.ta, c.ta);
+        assert_eq!(a.weights, c.weights);
     }
 }

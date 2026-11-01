@@ -154,6 +154,27 @@ mod vanilla {
             2,
         );
     }
+
+    #[test]
+    fn matches_cpu_with_tmu_options() {
+        if skip() {
+            return;
+        }
+        // Unweighted, confidence-driven, Type I/II ratio, no negated literals.
+        for ratio in [0.5, 2.0] {
+            check(
+                || {
+                    TsetlinMachine::with_config(2, 12, 10, 8, 3.9, 8, true, 1)
+                        .weighted_clauses(false)
+                        .confidence_driven_updating(true)
+                        .type_i_ii_ratio(ratio)
+                        .feature_negation(false)
+                },
+                &device(),
+                3,
+            );
+        }
+    }
 }
 
 macro_rules! assert_dense_eq {

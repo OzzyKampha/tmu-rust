@@ -383,6 +383,40 @@ pub(crate) fn bmask_word(rng: &mut Rng, digits: &[u8]) -> u64 {
     word
 }
 
+/// Clear the negated literals (`n_features..2*n_features`) from a `valid` mask,
+/// TMU's `feature_negation = False`: a clause can then never include a negated
+/// literal, and they play no part in firing.
+pub(crate) fn clear_negated(valid: &mut [u64], n_features: usize) {
+    for l in n_features..2 * n_features {
+        valid[l / WORD_BITS] &= !(1u64 << (l % WORD_BITS));
+    }
+}
+
+/// Whether any negated literal is valid (feature negation on).
+pub(crate) fn has_negated(valid: &[u64], n_features: usize) -> bool {
+    (n_features..2 * n_features).any(|l| valid[l / WORD_BITS] >> (l % WORD_BITS) & 1 == 1)
+}
+
+/// TMU's `type_i_ii_ratio`: the factors on the Type I and Type II feedback
+/// probabilities. A ratio >= 1 slows Type II by 1/ratio; < 1 slows Type I.
+pub(crate) fn type_i_ii_factors(ratio: f64) -> (f64, f64) {
+    if ratio >= 1.0 {
+        (1.0, 1.0 / ratio)
+    } else {
+        (ratio, 1.0)
+    }
+}
+
+#[cfg(feature = "serde")]
+pub(crate) fn serde_true() -> bool {
+    true
+}
+
+#[cfg(feature = "serde")]
+pub(crate) fn serde_one() -> f64 {
+    1.0
+}
+
 /// Apply Type I TA feedback to one clause (byte-array inputs).
 ///
 /// All four input byte arrays have one element per literal (`n_literals` elements each),

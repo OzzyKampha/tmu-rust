@@ -385,11 +385,13 @@ struct GroupedUpdateParams {
     const double* class_weights;  // per gid; null => 1.0
     double drop_p;
     double d;
+    double type_i_p, type_ii_p;   // TMU's type_i_ii_ratio factors
     u64 max_inc;
     u32 n_groups, cpg, words, n_literals;
     int threshold;
     int ae_nf;
     u32 boost, half, max_state, type_iii;
+    u32 confidence, weighted;     // TMU's confidence_driven_updating, weighted_clauses
 };
 
 extern "C" __global__ void tm_grouped_update(const GroupedUpdateParams p) {
@@ -404,23 +406,31 @@ extern "C" __global__ void tm_grouped_update(const GroupedUpdateParams p) {
     int target = p.ae_nf > 0 ? (int)((p.lit[gid >> 6] >> (gid & 63)) & 1ULL) : (g == 0);
     int sum = iclamp(p.sums[g], -p.threshold, p.threshold);
     double cw = p.class_weights ? p.class_weights[gid] : 1.0;
-    double prob = feedback_p(target, sum, p.threshold, cw);
+    double prob;
+    if (p.confidence) {
+        double t = (double)p.threshold, v = (double)(sum < 0 ? -sum : sum);
+        prob = (t - v) / t * cw;
+        prob = prob < 1.0 ? prob : 1.0;
+    } else {
+        prob = feedback_p(target, sum, p.threshold, cw);
+    }
     int n_inc = p.max_inc != NO_LIMIT ? block_included(inc, p.valid, p.words) : 0;
 
     if (threadIdx.x == 0) {
         u64 s = p.rngs[cj];
         int dropped = p.drop_p > 0.0 && u64_to_f64(rng_peek(p.drop_s0[g], j)) < p.drop_p;
         int action = ACT_NONE;
-        if (!dropped && rng_f64(&s) <= prob) {
-            int positive = (j & 1u) == 0;
+        int positive = (j & 1u) == 0;
+        int type_i = target == positive;
+        if (!dropped && rng_f64(&s) <= prob * (type_i ? p.type_i_p : p.type_ii_p)) {
             int fired = p.fire[(u64)g * p.cpg + j];
             int* w = &p.weights[cj];
-            if (target == positive) {
+            if (type_i) {
                 int fu = fired && (p.max_inc == NO_LIMIT || (u64)n_inc < p.max_inc);
-                if (fu) *w = imin(*w + 1, p.threshold);
+                if (fu && p.weighted) *w = imin(*w + 1, p.threshold);
                 action = fu ? ACT_IA : ACT_IB;
             } else if (fired) {
-                *w = imax(*w - 1, 1);
+                if (p.weighted) *w = imax(*w - 1, 1);
                 action = ACT_II;
             }
         }

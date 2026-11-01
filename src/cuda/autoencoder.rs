@@ -180,6 +180,8 @@ impl CudaTMAutoEncoder {
                     class_weights: 0,
                     drop_p: h.clause_drop_p,
                     d: h.d,
+                    type_i_p: 1.0,
+                    type_ii_p: 1.0,
                     max_inc: max_inc(h.max_included_literals),
                     n_groups: nf as u32,
                     cpg: cpo as u32,
@@ -191,6 +193,8 @@ impl CudaTMAutoEncoder {
                     half: h.half as u32,
                     max_state: h.max_state as u32,
                     type_iii: h.type_iii as u32,
+                    confidence: 0,
+                    weighted: 1,
                 };
                 self.dev
                     .inner

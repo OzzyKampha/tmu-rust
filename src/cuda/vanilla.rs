@@ -252,6 +252,8 @@ impl CudaTsetlinMachine {
                     class_weights: self.class_weights.ptr(),
                     drop_p: h.clause_drop_p,
                     d: h.d,
+                    type_i_p: h.type_i_p,
+                    type_ii_p: h.type_ii_p,
                     max_inc: max_inc(h.max_included_literals),
                     n_groups: 2,
                     cpg: cps as u32,
@@ -263,6 +265,8 @@ impl CudaTsetlinMachine {
                     half: h.half as u32,
                     max_state: h.max_state as u32,
                     type_iii: h.type_iii as u32,
+                    confidence: h.confidence_driven_updating as u32,
+                    weighted: h.weighted_clauses as u32,
                 };
                 self.dev
                     .inner
