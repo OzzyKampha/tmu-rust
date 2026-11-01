@@ -55,8 +55,15 @@ impl ClauseInspect for TsetlinMachine {
     fn n_outputs(&self) -> usize {
         self.n_classes()
     }
+    // Weights are stored unsigned with polarity by index (even clauses vote for
+    // the class, odd ones against); report the signed vote, as the trait says.
     fn clause_weight(&self, output: usize, clause: usize) -> i32 {
-        self.clause_weight(output, clause)
+        let w = self.clause_weight(output, clause);
+        if self.clause_is_positive(clause) {
+            w
+        } else {
+            -w
+        }
     }
     fn clause_rule(&self, output: usize, clause: usize) -> Vec<(usize, bool)> {
         self.clause_rule(output, clause)

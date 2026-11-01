@@ -2565,4 +2565,31 @@ mod tests {
         let bte20 = e20.encode_batch(&as_slices(&pad_to(&xte, 20)));
         assert_eq!(tm.predict_batch(&bte20), loaded.predict_batch(&bte20));
     }
+
+    #[test]
+    fn clause_inspect_reports_signed_votes() {
+        use crate::ClauseInspect;
+        let (xs, ys) = make_xor(1000, 0.1, 12);
+        let e = enc(12);
+        let b = e.encode_batch(&as_slices(&xs));
+        let mut tm = TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 8, true, 6);
+        for _ in 0..10 {
+            tm.fit_epoch(&b, &ys);
+        }
+        let x = e.encode_one(&xs[0]);
+        for c in 0..2 {
+            // The fired clauses' signed weights add up to the class score.
+            let sum: i32 = ClauseInspect::fired_clauses(&tm, &x, c)
+                .iter()
+                .map(|&j| ClauseInspect::clause_weight(&tm, c, j))
+                .sum();
+            let mut out = [0i32; 2];
+            tm.scores(&x, &mut out);
+            assert_eq!(sum.clamp(-15, 15), out[c]);
+        }
+        assert!(
+            ClauseInspect::clause_weight(&tm, 0, 1) < 0,
+            "odd clauses vote against"
+        );
+    }
 }
