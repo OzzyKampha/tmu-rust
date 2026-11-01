@@ -111,7 +111,7 @@ params! {
     }
     SparseBank {
         inc_idx: u64, exc_idx: u64, una_idx: u64, inc_st: u64, exc_st: u64,
-        n_inc: u64, n_exc: u64, n_una: u64,
+        n_inc: u64, n_exc: u64, n_una: u64, n_abs: u64,
     }
     SpFireParams {
         bank: SparseBank,
@@ -128,6 +128,8 @@ params! {
         n_groups: u32, cpg: u32, n_literals: u32,
         threshold: i32,
         boost: u32, half: u32, max_state: u32, absorbing: i32,
+        type_i_p: f64, type_ii_p: f64,
+        insertion: i32, rate: u32, confidence: u32, weighted: u32,
     }
     ScoresParams {
         include: u64, valid: u64, lits: u64, weights: u64, out: u64,

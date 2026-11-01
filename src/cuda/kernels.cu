@@ -1048,6 +1048,7 @@ struct SparseBank {
     u32* n_inc;
     u32* n_exc;
     u32* n_una;
+    u32* n_abs;   // literals absorbed out, per clause
 };
 
 __device__ __forceinline__ bool bit_of(const u64* v, u32 l) { return (v[l >> 6] >> (l & 63)) & 1ULL; }
@@ -1130,7 +1131,30 @@ struct SpUpdateParams {
     int threshold;
     u32 boost, half, max_state;
     int absorbing;  // TMU's absorbing: remove excluded literals at or below; -1 = off
+    double type_i_p, type_ii_p;  // TMU's type_i_ii_ratio factors
+    int insertion;               // TMU's literal_insertion_state; -1 = off
+    u32 rate;                    // TMU's feedback_rate_excluded_literals (>= 1)
+    u32 confidence, weighted;    // TMU's confidence_driven_updating, weighted_clauses
 };
+
+// Lower candidate i to `ns`, absorbing at or below `absorbing` (TMU's
+// ClauseBankSparse). Returns 1 when slot i holds an unvisited literal now.
+__device__ int sp_lower(const SpUpdateParams& p, u32* exc_idx, u8* exc_st, u32* n_exc,
+                        const u32* una_idx, u32* n_una, u32* n_abs, u32 i, u32 ns) {
+    if ((int)ns > p.absorbing) {
+        exc_st[i] = (u8)ns;
+        return 0;
+    }
+    (*n_abs)++;
+    if (p.insertion >= 0 && *n_una > 0) {
+        (*n_una)--;
+        exc_idx[i] = una_idx[*n_una];
+        exc_st[i] = (u8)p.insertion;
+        return 0;
+    }
+    sp_swap_remove(exc_idx, exc_st, n_exc, i);
+    return 1;
+}
 
 extern "C" __global__ void sp_update(const SpUpdateParams p) {
     u32 t = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1140,10 +1164,19 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
     u64 cj = (u64)gid * p.cpg + j;
     int target = g == 0;
     int sum = iclamp(p.sums[g], -p.threshold, p.threshold);
-    double prob = feedback_p(target, sum, p.threshold, p.class_weights[gid]);
+    double prob;
+    if (p.confidence) {
+        double tt = (double)p.threshold, v = (double)(sum < 0 ? -sum : sum);
+        prob = (tt - v) / tt * p.class_weights[gid];
+        prob = prob < 1.0 ? prob : 1.0;
+    } else {
+        prob = feedback_p(target, sum, p.threshold, p.class_weights[gid]);
+    }
     if (p.drop_p > 0.0 && u64_to_f64(rng_peek(p.drop_s0[g], j)) < p.drop_p) return;
+    int positive = (j & 1u) == 0;
+    int type_i = target == positive;
     u64 s = p.rngs[cj];
-    if (rng_f64(&s) > prob) {
+    if (rng_f64(&s) > prob * (type_i ? p.type_i_p : p.type_ii_p)) {
         p.rngs[cj] = s;
         return;
     }
@@ -1154,53 +1187,81 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
     u32* exc_idx = b.exc_idx + cj * nl;
     u8* exc_st = b.exc_st + cj * nl;
     u32* una_idx = b.una_idx + cj * nl;
-    u32 n_inc = b.n_inc[cj], n_exc = b.n_exc[cj], n_una = b.n_una[cj];
+    u32 n_inc = b.n_inc[cj], n_exc = b.n_exc[cj], n_una = b.n_una[cj], n_abs = b.n_abs[cj];
     int fired = p.fire[t];
-    int positive = (j & 1u) == 0;
     int* w = &p.weights[cj];
-    if (target == positive) {
+    u32 rate = p.rate > 0 ? p.rate : 1;
+    double inv_rate = 1.0 / (double)rate;
+    if (type_i) {
         int fu = fired && (p.max_inc == NO_LIMIT || (u64)n_inc < p.max_inc);
-        if (fu) *w = imin(*w + 1, p.threshold);
-        // Type I — included literals.
-        u32 i = 0;
-        while (i < n_inc) {
-            u32 l = inc_idx[i];
-            if (!bit_of(p.act, l)) {
-                i++;
-                continue;
-            }
-            u32 st = inc_st[i];
-            if (bit_of(p.lit, l)) {
-                if (fu && st < p.max_state && (p.boost || rng_f64(&s) <= p.keep_p)) inc_st[i] = (u8)(st + 1);
-                i++;
-            } else {
-                if (st < p.max_state && rng_f64(&s) <= p.inv_p) {
-                    u32 ns = st - 1;
-                    if (ns < p.half) {
-                        sp_swap_remove(inc_idx, inc_st, &n_inc, i);
-                        exc_idx[n_exc] = l;
-                        exc_st[n_exc] = (u8)ns;
-                        n_exc++;
+        if (fu && p.weighted) *w = imin(*w + 1, p.threshold);
+        for (int phase = 0; phase < 2; phase++) {
+            // Type Ia: included, then candidates. Type Ib: candidates, then included.
+            int included_phase = fu ? phase == 0 : phase == 1;
+            if (included_phase) {
+                u32 i = 0;
+                while (i < n_inc) {
+                    u32 l = inc_idx[i];
+                    if (!bit_of(p.act, l)) {
+                        i++;
                         continue;
                     }
-                    inc_st[i] = (u8)ns;
+                    u32 st = inc_st[i];
+                    if (fu && bit_of(p.lit, l)) {
+                        if (st < p.max_state && (p.boost || rng_f64(&s) <= p.keep_p)) inc_st[i] = (u8)(st + 1);
+                    } else if (rng_f64(&s) <= p.inv_p) {
+                        u32 ns = st - 1;
+                        if (ns < p.half) {
+                            sp_swap_remove(inc_idx, inc_st, &n_inc, i);
+                            exc_idx[n_exc] = l;
+                            exc_st[n_exc] = (u8)ns;
+                            n_exc++;
+                            continue;
+                        }
+                        inc_st[i] = (u8)ns;
+                    }
+                    i++;
                 }
-                i++;
+            } else if (rate == 1 || rng_f64(&s) <= inv_rate) {
+                u32 i = 0;
+                while (i < n_exc) {
+                    u32 l = exc_idx[i];
+                    if (!bit_of(p.act, l)) {
+                        i++;
+                        continue;
+                    }
+                    u32 st = exc_st[i];
+                    if (fu && bit_of(p.lit, l)) {
+                        if ((p.max_inc == NO_LIMIT || (u64)n_inc < p.max_inc) &&
+                            (p.boost || rng_f64(&s) <= p.keep_p)) {
+                            u32 ns = st + rate < p.max_state ? st + rate : p.max_state;
+                            if (ns >= p.half) {
+                                sp_swap_remove(exc_idx, exc_st, &n_exc, i);
+                                inc_idx[n_inc] = l;
+                                inc_st[n_inc] = (u8)ns;
+                                n_inc++;
+                                continue;
+                            }
+                            exc_st[i] = (u8)ns;
+                        }
+                    } else if (st > rate && rng_f64(&s) <= p.inv_p) {
+                        if (sp_lower(p, exc_idx, exc_st, &n_exc, una_idx, &n_una, &n_abs, i, st - rate))
+                            continue;
+                    }
+                    i++;
+                }
             }
         }
-        // Type I — excluded literals.
-        i = 0;
-        while (i < n_exc) {
-            u32 l = exc_idx[i];
-            if (!bit_of(p.act, l)) {
-                i++;
-                continue;
-            }
-            u32 st = exc_st[i];
-            if (bit_of(p.lit, l)) {
-                if (fu && (p.max_inc == NO_LIMIT || (u64)n_inc < p.max_inc) &&
-                    (p.boost || rng_f64(&s) <= p.keep_p)) {
-                    u32 ns = st + 1 < p.max_state ? st + 1 : p.max_state;
+    } else if (fired) {
+        if (p.weighted) *w = imax(*w - 1, 1);
+        // Type II — candidates only, with probability 1/rate, by rate.
+        if (rate == 1 || rng_f64(&s) <= inv_rate) {
+            u32 i = 0;
+            while (i < n_exc) {
+                u32 l = exc_idx[i];
+                u32 st = exc_st[i];
+                if (bit_of(p.act, l) && !bit_of(p.lit, l)) {
+                    u32 ns = st + rate < p.max_state ? st + rate : p.max_state;
                     if (ns >= p.half) {
                         sp_swap_remove(exc_idx, exc_st, &n_exc, i);
                         inc_idx[n_inc] = l;
@@ -1211,43 +1272,13 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
                     exc_st[i] = (u8)ns;
                 }
                 i++;
-            } else {
-                if (st > 1 && rng_f64(&s) <= p.inv_p) {
-                    u32 ns = st - 1;
-                    if ((int)ns <= p.absorbing) {
-                        sp_swap_remove(exc_idx, exc_st, &n_exc, i);
-                        una_idx[n_una++] = l;
-                        continue;
-                    }
-                    exc_st[i] = (u8)ns;
-                }
-                i++;
             }
-        }
-    } else if (fired) {
-        *w = imax(*w - 1, 1);
-        // Type II — excluded literals only.
-        u32 i = 0;
-        while (i < n_exc) {
-            u32 l = exc_idx[i];
-            u32 st = exc_st[i];
-            if (bit_of(p.act, l) && !bit_of(p.lit, l)) {
-                u32 ns = st + 1 < p.max_state ? st + 1 : p.max_state;
-                if (ns >= p.half) {
-                    sp_swap_remove(exc_idx, exc_st, &n_exc, i);
-                    inc_idx[n_inc] = l;
-                    inc_st[n_inc] = (u8)ns;
-                    n_inc++;
-                    continue;
-                }
-                exc_st[i] = (u8)ns;
-            }
-            i++;
         }
     }
     b.n_inc[cj] = n_inc;
     b.n_exc[cj] = n_exc;
     b.n_una[cj] = n_una;
+    b.n_abs[cj] = n_abs;
     p.rngs[cj] = s;
 }
 

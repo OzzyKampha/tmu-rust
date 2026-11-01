@@ -749,6 +749,7 @@ mod sparse {
             assert_eq!(a.excluded, b.excluded);
             assert_eq!(a.excluded_state, b.excluded_state);
             assert_eq!(a.unallocated, b.unallocated);
+            assert_eq!(a.absorbed, b.absorbed);
         }
         assert_eq!(back.weights, cpu.weights);
         assert_eq!(states(&back.rngs), states(&cpu.rngs));
@@ -801,6 +802,27 @@ mod sparse {
             probe.bank.count_absorbed_exclude() > 0,
             "test should absorb literals"
         );
+        check(make, 3, 6, &device_serial());
+    }
+
+    #[test]
+    fn matches_cpu_with_tmu_options() {
+        if skip() {
+            return;
+        }
+        // Every TMU option of the sparse bank and the classifier at once.
+        let make = || {
+            TMSparseClassifier::with_config(3, 12, 8, 6, 3.0, 4, false, 11)
+                .feature_negation(false)
+                .literal_sampling(0.5)
+                .absorbing(3)
+                .literal_insertion_state(5)
+                .feedback_rate_excluded_literals(2)
+                .weighted_clauses(false)
+                .confidence_driven_updating(true)
+                .type_i_ii_ratio(2.0)
+                .clause_drop_p(0.1)
+        };
         check(make, 3, 6, &device_serial());
     }
 }

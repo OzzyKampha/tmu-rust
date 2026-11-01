@@ -44,6 +44,7 @@ struct DevBank {
     n_inc: DevBuf<u32>,
     n_exc: DevBuf<u32>,
     n_una: DevBuf<u32>,
+    n_abs: DevBuf<u32>,
 }
 
 impl DevBank {
@@ -57,6 +58,7 @@ impl DevBank {
             n_inc: self.n_inc.ptr(),
             n_exc: self.n_exc.ptr(),
             n_una: self.n_una.ptr(),
+            n_abs: self.n_abs.ptr(),
         }
     }
 }
@@ -80,6 +82,7 @@ impl CudaTMSparseClassifier {
         let mut inc_st = vec![0u8; n * nl];
         let mut exc_st = vec![0u8; n * nl];
         let (mut n_inc, mut n_exc, mut n_una) = (vec![0u32; n], vec![0u32; n], vec![0u32; n]);
+        let n_abs: Vec<u32> = clauses.iter().map(|c| c.absorbed).collect();
         for (c, cl) in clauses.iter().enumerate() {
             let b = c * nl;
             inc_idx[b..b + cl.included.len()].copy_from_slice(&cl.included);
@@ -100,6 +103,7 @@ impl CudaTMSparseClassifier {
             n_inc: DevBuf::from_slice(dev, &n_inc)?,
             n_exc: DevBuf::from_slice(dev, &n_exc)?,
             n_una: DevBuf::from_slice(dev, &n_una)?,
+            n_abs: DevBuf::from_slice(dev, &n_abs)?,
         };
         let w = host.words;
         let chunk = (STAGE_BYTES / (w * 8)).clamp(1, TRAIN_CHUNK);
@@ -152,6 +156,7 @@ impl CudaTMSparseClassifier {
             b.n_exc.download()?,
             b.n_una.download()?,
         );
+        let n_abs = b.n_abs.download()?;
         for (c, cl) in m.bank.clauses.iter_mut().enumerate() {
             let base = c * nl;
             let (ni, ne, nu) = (n_inc[c] as usize, n_exc[c] as usize, n_una[c] as usize);
@@ -161,6 +166,7 @@ impl CudaTMSparseClassifier {
                 excluded: exc_idx[base..base + ne].to_vec(),
                 excluded_state: exc_st[base..base + ne].to_vec(),
                 unallocated: una_idx[base..base + nu].to_vec(),
+                absorbed: n_abs[c],
             };
         }
         self.weights.download_into(&mut m.weights)?;
@@ -273,6 +279,12 @@ impl CudaTMSparseClassifier {
                     half: h.bank.half as u32,
                     max_state: h.bank.max_state as u32,
                     absorbing: h.bank.absorbing,
+                    type_i_p: h.type_i_p,
+                    type_ii_p: h.type_ii_p,
+                    insertion: h.bank.insertion_state,
+                    rate: u32::from(h.bank.feedback_rate),
+                    confidence: h.confidence_driven_updating as u32,
+                    weighted: h.weighted_clauses as u32,
                 };
                 self.dev
                     .inner

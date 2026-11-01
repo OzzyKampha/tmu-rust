@@ -70,6 +70,26 @@ pub struct TMSparseClassifier {
 
     /// Per-class feedback scaling factors for imbalanced datasets (default 1.0).
     pub(crate) class_weights: Vec<f64>,
+    /// TMU's `weighted_clauses` (default true here). Training setting.
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip, default = "crate::clause_bank::dense::serde_true")
+    )]
+    pub(crate) weighted_clauses: bool,
+    /// TMU's `confidence_driven_updating`. Training setting.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) confidence_driven_updating: bool,
+    /// TMU's `type_i_ii_ratio` factors. Training settings.
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip, default = "crate::clause_bank::dense::serde_one")
+    )]
+    pub(crate) type_i_p: f64,
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip, default = "crate::clause_bank::dense::serde_one")
+    )]
+    pub(crate) type_ii_p: f64,
 }
 
 #[cfg(feature = "serde")]
@@ -153,6 +173,10 @@ impl TMSparseClassifier {
             literal_rng,
             rng: Rng::new(seed),
             class_weights: vec![1.0f64; n_classes],
+            weighted_clauses: true,
+            confidence_driven_updating: false,
+            type_i_p: 1.0,
+            type_ii_p: 1.0,
         }
     }
 
@@ -175,6 +199,75 @@ impl TMSparseClassifier {
     pub fn absorbing(mut self, k: i32) -> Self {
         assert!(k >= -1, "absorbing must be >= -1 (-1 = off)");
         self.bank.absorbing = k;
+        self
+    }
+
+    /// TMU's `weighted_clauses` (default **true** here; TMU's default is
+    /// false). With `false` every clause keeps a vote of 1.
+    pub fn weighted_clauses(mut self, on: bool) -> Self {
+        self.weighted_clauses = on;
+        self
+    }
+
+    /// TMU's `confidence_driven_updating` (default false): feedback probability
+    /// `(T - |class sum|) / T` for the true and the negative class alike.
+    pub fn confidence_driven_updating(mut self, on: bool) -> Self {
+        self.confidence_driven_updating = on;
+        self
+    }
+
+    /// TMU's `type_i_ii_ratio` (default 1.0): above 1 makes Type II feedback
+    /// rarer by `1/ratio`, below 1 makes Type I rarer by `ratio`.
+    pub fn type_i_ii_ratio(mut self, ratio: f64) -> Self {
+        assert!(ratio > 0.0, "type_i_ii_ratio must be > 0");
+        (self.type_i_p, self.type_ii_p) = crate::clause_bank::dense::type_i_ii_factors(ratio);
+        self
+    }
+
+    /// TMU's `feature_negation` (default true). With `false` no clause may use a
+    /// negated literal. Re-initialises the clauses: set it before training.
+    pub fn feature_negation(mut self, on: bool) -> Self {
+        self.bank.feature_negation = on;
+        self.bank.reinit();
+        self
+    }
+
+    /// TMU's `literal_sampling` (default 1.0): each clause starts with a random
+    /// `fraction` of the literals as candidates; the rest wait unallocated (see
+    /// [`literal_insertion_state`](Self::literal_insertion_state)). Fewer
+    /// candidates per clause is what keeps a sparse machine fast on a large
+    /// vocabulary. Re-initialises the clauses: set it before training.
+    pub fn literal_sampling(mut self, fraction: f64) -> Self {
+        assert!(
+            fraction > 0.0 && fraction <= 1.0,
+            "literal_sampling must be in (0, 1]"
+        );
+        self.bank.literal_sampling = fraction;
+        self.bank.reinit();
+        self
+    }
+
+    /// TMU's `literal_insertion_state` (default -1 = off): when a candidate is
+    /// absorbed, an unallocated literal takes its place at this state.
+    pub fn literal_insertion_state(mut self, state: i32) -> Self {
+        assert!(
+            state >= -1,
+            "literal_insertion_state must be >= -1 (-1 = off)"
+        );
+        assert!(
+            state < i32::from(self.bank.half),
+            "literal_insertion_state must be below the inclusion state {}",
+            self.bank.half
+        );
+        self.bank.insertion_state = state;
+        self
+    }
+
+    /// TMU's `feedback_rate_excluded_literals` (default 1): candidate literals
+    /// get feedback with probability `1/rate`, moving `rate` states at a time.
+    pub fn feedback_rate_excluded_literals(mut self, rate: u8) -> Self {
+        assert!(rate >= 1, "feedback_rate_excluded_literals must be >= 1");
+        self.bank.feedback_rate = rate;
         self
     }
 
@@ -409,7 +502,10 @@ impl TMSparseClassifier {
         let words = self.words;
         let boost = self.boost_true_positive;
         let wmax = self.threshold;
-        let absorbing = self.bank.absorbing;
+        let opts = self.bank.opts();
+        let rate = self.bank.feedback_rate;
+        let weighted = self.weighted_clauses;
+        let (type_i_p, type_ii_p) = (self.type_i_p, self.type_ii_p);
         let max_inc = self.max_included_literals;
         let drop_p = self.clause_drop_p;
         let cw = self.class_weights[c];
@@ -418,7 +514,9 @@ impl TMSparseClassifier {
 
         let t = wmax as f64;
         let v = sum as f64;
-        let p = if target == 1 {
+        let p = if self.confidence_driven_updating {
+            ((t - v.abs()) / t * cw).min(1.0)
+        } else if target == 1 {
             ((t - v) / (2.0 * t) * cw).min(1.0)
         } else {
             ((t + v) / (2.0 * t) * cw).min(1.0)
@@ -452,15 +550,16 @@ impl TMSparseClassifier {
             if !drop_mask.is_empty() && drop_mask[j] {
                 return;
             }
-            if rng.next_f64() > p {
+            let positive = j & 1 == 0;
+            let type_i = (target == 1) == positive;
+            if rng.next_f64() > p * if type_i { type_i_p } else { type_ii_p } {
                 return;
             }
-            let positive = j & 1 == 0;
-            if (target == 1) == positive {
+            if type_i {
                 // Type I.
                 let fired = clause.fire_train(lit, lit_active);
                 let fired_under = fired && clause.n_included() < max_inc;
-                if fired_under {
+                if fired_under && weighted {
                     *w = (*w + 1).min(wmax);
                 }
                 clause.type_i(
@@ -474,15 +573,17 @@ impl TMSparseClassifier {
                     max_inc,
                     half,
                     max_state,
-                    absorbing,
+                    opts,
                 );
             } else {
                 // Type II.
                 if !clause.fire_train(lit, lit_active) {
                     return;
                 }
-                *w = (*w - 1).max(1);
-                clause.type_ii(lit, lit_active, half, max_state);
+                if weighted {
+                    *w = (*w - 1).max(1);
+                }
+                clause.type_ii(lit, lit_active, half, max_state, rng, rate);
             }
         };
 

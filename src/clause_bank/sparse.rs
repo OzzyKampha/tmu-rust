@@ -14,12 +14,14 @@
 //! A clause fires iff every literal in its (usually tiny) `included` list is
 //! present in the input, so per-clause work scales with the number of *active*
 //! literals rather than the literal count.  **Absorbing actions** are what make
-//! the lists shrink: with TMU's `absorbing = k` (`k >= 0`), once an excluded
-//! literal's TA state falls to `k` or below it is removed from `excluded` and
-//! pushed to `unallocated`, never to be revisited. `k = -1` (the default, as in
-//! TMU) turns this off: excluded states then stop at 1. An included literal that
-//! reaches `max_state` is always locked (immune to decrement), the absorbing
-//! include state.
+//! the lists shrink: with TMU's `absorbing = k` (`k >= 0`), once a candidate
+//! literal's TA state falls to `k` or below it is dropped from the clause for
+//! good (counted in `absorbed`). `k = -1` (the default, as in TMU) turns this
+//! off: candidate states then stop at 1. With `literal_sampling < 1` each
+//! clause starts with only a random share of the literals as candidates (the
+//! rest wait in `unallocated`), and `literal_insertion_state` refills an
+//! absorbed slot from there. As in TMU, included literals are not locked at
+//! the maximum state.
 //!
 //! ## Initialisation policy
 //!
@@ -50,6 +52,21 @@ fn no_absorbing() -> i32 {
     NO_ABSORBING
 }
 
+#[cfg(feature = "serde")]
+fn one_u8() -> u8 {
+    1
+}
+
+#[cfg(feature = "serde")]
+fn one_f64() -> f64 {
+    1.0
+}
+
+#[cfg(feature = "serde")]
+fn yes() -> bool {
+    true
+}
+
 /// One sparse clause: literal indices partitioned into included / excluded, each
 /// carrying its TA automaton state; everything else lives in `unallocated`.
 ///
@@ -68,8 +85,26 @@ pub(crate) struct SparseClause {
     pub(crate) excluded: Vec<u32>,
     /// TA state for each excluded literal (parallel to `excluded`).
     pub(crate) excluded_state: Vec<u8>,
-    /// Literal indices absorbed out of candidacy (or otherwise untracked).
+    /// Literals not (yet) candidates of this clause: those left out by TMU's
+    /// `literal_sampling`, handed out by `literal_insertion_state` when a
+    /// candidate is absorbed. Popped from the end.
     pub(crate) unallocated: Vec<u32>,
+    /// Literals absorbed out of this clause (dropped for good, as TMU).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) absorbed: u32,
+}
+
+/// TMU's sparse-bank training options (see the classifier's builders).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SparseOpts {
+    /// `absorbing`: absorb candidates whose state falls to this or below; -1 off.
+    pub(crate) absorbing: i32,
+    /// `feedback_rate_excluded_literals`: candidates are updated with
+    /// probability 1/rate per feedback, by `rate` states at a time.
+    pub(crate) feedback_rate: u8,
+    /// `literal_insertion_state`: an absorbed candidate is replaced by an
+    /// unallocated literal at this state; -1 = not replaced.
+    pub(crate) insertion_state: i32,
 }
 
 /// A bank of [`SparseClause`]s sharing the same literal geometry and TA bounds.
@@ -87,6 +122,20 @@ pub(crate) struct SparseClauseBank {
     /// candidates for good. -1 (default) = off. A training setting, not saved.
     #[cfg_attr(feature = "serde", serde(skip, default = "no_absorbing"))]
     pub(crate) absorbing: i32,
+    /// TMU's `feedback_rate_excluded_literals` (>= 1). Training setting.
+    #[cfg_attr(feature = "serde", serde(skip, default = "one_u8"))]
+    pub(crate) feedback_rate: u8,
+    /// TMU's `literal_insertion_state` (-1 = off). Training setting.
+    #[cfg_attr(feature = "serde", serde(skip, default = "no_absorbing"))]
+    pub(crate) insertion_state: i32,
+    /// TMU's `literal_sampling`: the fraction of literals each clause starts
+    /// with as candidates. Applied when set (re-initialising the clauses).
+    #[cfg_attr(feature = "serde", serde(skip, default = "one_f64"))]
+    pub(crate) literal_sampling: f64,
+    /// TMU's `feature_negation`: whether negated literals may be used. Saved
+    /// with the model, so `grow` keeps it.
+    #[cfg_attr(feature = "serde", serde(default = "yes"))]
+    pub(crate) feature_negation: bool,
     pub(crate) clauses: Vec<SparseClause>,
 }
 
@@ -131,7 +180,17 @@ impl SparseClause {
         self.included.len()
     }
 
-    /// Apply Type I feedback to this clause. See [`SparseClauseBank::type_i`].
+    /// Apply Type I feedback to this clause, as TMU's `cbs_type_i_feedback`.
+    /// See [`SparseClauseBank::type_i`].
+    ///
+    /// Type Ia (`fired_under_limit`): included literals present in the input
+    /// are rewarded, absent ones decremented with probability 1/s; then (with
+    /// probability 1/rate) candidates present are rewarded by `rate` and
+    /// promoted at `half`, absent ones above `rate` decremented by `rate` with
+    /// probability 1/s and absorbed at or below `absorbing`.
+    /// Type Ib: (with probability 1/rate) every active candidate above `rate` is
+    /// decremented by `rate` with probability 1/s (and absorbed as above), then
+    /// every active included literal is decremented with probability 1/s.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn type_i(
         &mut self,
@@ -145,82 +204,147 @@ impl SparseClause {
         max_included: usize,
         half: u8,
         max_state: u8,
-        absorbing: i32,
+        opts: SparseOpts,
     ) {
-        // --- included literals -------------------------------------------
+        let rate = opts.feedback_rate.max(1);
+        let inv_rate = 1.0 / f64::from(rate);
+        // TMU draws this gate every time; with rate 1 it always passes, so the
+        // draw is skipped (keeping rate-1 training identical to before).
+        let candidates_gate = |rng: &mut Rng| rate == 1 || rng.next_f64() <= inv_rate;
+        if fired_under_limit {
+            self.decrement_or_reward_included(
+                lit,
+                lit_active_mask,
+                true,
+                boost,
+                rng,
+                inv_p,
+                keep_p,
+                half,
+                max_state,
+            );
+            if candidates_gate(rng) {
+                let mut i = 0;
+                while i < self.excluded.len() {
+                    let l = self.excluded[i];
+                    if !lit_active(lit_active_mask, l) {
+                        i += 1;
+                        continue;
+                    }
+                    let state = self.excluded_state[i];
+                    if lit_present(lit, l) {
+                        if self.included.len() < max_included && (boost || rng.next_f64() <= keep_p)
+                        {
+                            let new_state = state.saturating_add(rate).min(max_state);
+                            if new_state >= half {
+                                promote_to_included(self, i, new_state);
+                                continue;
+                            }
+                            self.excluded_state[i] = new_state;
+                        }
+                    } else if state > rate
+                        && rng.next_f64() <= inv_p
+                        && self.lower_candidate(i, state - rate, opts)
+                    {
+                        continue;
+                    }
+                    i += 1;
+                }
+            }
+        } else {
+            if candidates_gate(rng) {
+                let mut i = 0;
+                while i < self.excluded.len() {
+                    let l = self.excluded[i];
+                    let state = self.excluded_state[i];
+                    if lit_active(lit_active_mask, l)
+                        && state > rate
+                        && rng.next_f64() <= inv_p
+                        && self.lower_candidate(i, state - rate, opts)
+                    {
+                        continue;
+                    }
+                    i += 1;
+                }
+            }
+            self.decrement_or_reward_included(
+                lit,
+                lit_active_mask,
+                false,
+                boost,
+                rng,
+                inv_p,
+                keep_p,
+                half,
+                max_state,
+            );
+        }
+    }
+
+    /// Included literals under Type Ia (`reward`: present ones move up, absent
+    /// ones down with probability 1/s) or Type Ib (every active one down with
+    /// probability 1/s). A literal falling below `half` becomes a candidate.
+    #[allow(clippy::too_many_arguments)]
+    fn decrement_or_reward_included(
+        &mut self,
+        lit: &[u64],
+        lit_active_mask: &[u64],
+        reward: bool,
+        boost: bool,
+        rng: &mut Rng,
+        inv_p: f64,
+        keep_p: f64,
+        half: u8,
+        max_state: u8,
+    ) {
         // Scan by index; demotions swap-remove, so do NOT advance `i` after one.
         let mut i = 0;
         while i < self.included.len() {
             let l = self.included[i];
-            let active = lit_active(lit_active_mask, l);
-            if !active {
+            if !lit_active(lit_active_mask, l) {
                 i += 1;
                 continue;
             }
-            let present = lit_present(lit, l);
             let state = self.included_state[i];
-            if present {
-                if fired_under_limit && state < max_state && (boost || rng.next_f64() <= keep_p) {
-                    // Increment toward the absorbing include state.
+            if reward && lit_present(lit, l) {
+                if state < max_state && (boost || rng.next_f64() <= keep_p) {
                     self.included_state[i] = state + 1;
                 }
-                i += 1;
-            } else {
-                // Absent: decrement with probability 1/s, unless absorbing-include.
-                if state < max_state && rng.next_f64() <= inv_p {
-                    let new_state = state - 1;
-                    if new_state < half {
-                        // Falls below the inclusion threshold → demote to excluded.
-                        demote_to_excluded(self, i, new_state);
-                        // `swap_remove` moved a new element into slot `i`; revisit it.
-                        continue;
-                    } else {
-                        self.included_state[i] = new_state;
-                    }
+            } else if rng.next_f64() <= inv_p {
+                let new_state = state - 1;
+                if new_state < half {
+                    demote_to_excluded(self, i, new_state);
+                    continue;
                 }
-                i += 1;
+                self.included_state[i] = new_state;
             }
+            i += 1;
         }
+    }
 
-        // --- excluded literals -------------------------------------------
-        let mut i = 0;
-        while i < self.excluded.len() {
-            let l = self.excluded[i];
-            let active = lit_active(lit_active_mask, l);
-            if !active {
-                i += 1;
-                continue;
+    /// Set candidate `i` to `new_state`, absorbing it if at or below the
+    /// threshold. Returns `true` when slot `i` now holds a literal that has not
+    /// been visited this pass (it was swap-removed), so the caller re-visits it.
+    fn lower_candidate(&mut self, i: usize, new_state: u8, opts: SparseOpts) -> bool {
+        if i32::from(new_state) > opts.absorbing {
+            self.excluded_state[i] = new_state;
+            return false;
+        }
+        self.absorbed += 1;
+        match (opts.insertion_state >= 0, self.unallocated.pop()) {
+            // TMU's literal insertion: an unallocated literal takes the slot.
+            (true, Some(l)) => {
+                self.excluded[i] = l;
+                self.excluded_state[i] = opts.insertion_state as u8;
+                false
             }
-            let present = lit_present(lit, l);
-            let state = self.excluded_state[i];
-            if present {
-                // Only Type Ia promotes, and only while under the include limit.
-                if fired_under_limit
-                    && self.included.len() < max_included
-                    && (boost || rng.next_f64() <= keep_p)
-                {
-                    let new_state = (state + 1).min(max_state);
-                    if new_state >= half {
-                        promote_to_included(self, i, new_state);
-                        continue;
-                    } else {
-                        self.excluded_state[i] = new_state;
-                    }
+            (_, popped) => {
+                if let Some(l) = popped {
+                    self.unallocated.push(l);
                 }
-                i += 1;
-            } else {
-                // Absent: decrement with probability 1/s (never below 1), and
-                // absorb out once at or below the `absorbing` threshold — as
-                // TMU's ClauseBankSparse (`absorbing` = -1 never absorbs).
-                if state > 1 && rng.next_f64() <= inv_p {
-                    let new_state = state - 1;
-                    if i32::from(new_state) <= absorbing {
-                        absorb_remove_excluded(self, i);
-                        continue;
-                    }
-                    self.excluded_state[i] = new_state;
-                }
-                i += 1;
+                self.excluded.swap_remove(i);
+                self.excluded_state.swap_remove(i);
+                true
             }
         }
     }
@@ -232,7 +356,14 @@ impl SparseClause {
         lit_active_mask: &[u64],
         half: u8,
         max_state: u8,
+        rng: &mut Rng,
+        feedback_rate: u8,
     ) {
+        // TMU: candidates take Type II with probability 1/rate, by `rate`.
+        let rate = feedback_rate.max(1);
+        if rate > 1 && rng.next_f64() > 1.0 / f64::from(rate) {
+            return;
+        }
         let mut i = 0;
         while i < self.excluded.len() {
             let l = self.excluded[i];
@@ -241,7 +372,7 @@ impl SparseClause {
             // Absent and active (as TMU: no state guard — excluded states
             // never fall below 1, and absorbed literals have left the pool).
             if active && !lit_present(lit, l) {
-                let new_state = (state + 1).min(max_state);
+                let new_state = state.saturating_add(rate).min(max_state);
                 if new_state >= half {
                     promote_to_included(self, i, new_state);
                     continue;
@@ -274,16 +405,68 @@ impl SparseClauseBank {
             excluded: (0..n_literals as u32).collect(),
             excluded_state: vec![least_forgotten; n_literals],
             unallocated: Vec::new(),
+            absorbed: 0,
         };
         let clauses = vec![proto; n_clauses];
 
         SparseClauseBank {
             absorbing: NO_ABSORBING,
+            feedback_rate: 1,
+            insertion_state: NO_ABSORBING,
+            literal_sampling: 1.0,
+            feature_negation: true,
             n_clauses,
             n_literals,
             half,
             max_state,
             clauses,
+        }
+    }
+
+    /// The training options as one value for the per-clause updates.
+    pub(crate) fn opts(&self) -> SparseOpts {
+        SparseOpts {
+            absorbing: self.absorbing,
+            feedback_rate: self.feedback_rate,
+            insertion_state: self.insertion_state,
+        }
+    }
+
+    /// Re-initialise every clause from `literal_sampling` and
+    /// `feature_negation`, as TMU's ClauseBankSparse does at construction: each
+    /// clause gets a random `literal_sampling` share of the usable literals as
+    /// candidates at the least-forgotten state; the rest wait in `unallocated`.
+    /// Discards anything learned, so it is for configuring a fresh model.
+    pub(crate) fn reinit(&mut self) {
+        let n_features = self.n_literals / 2;
+        let usable: Vec<u32> = if self.feature_negation {
+            (0..self.n_literals as u32).collect()
+        } else {
+            (0..n_features as u32).collect()
+        };
+        let least_forgotten = self.half - 1;
+        let k = ((usable.len() as f64) * self.literal_sampling) as usize;
+        for (j, c) in self.clauses.iter_mut().enumerate() {
+            let mut order = usable.clone();
+            if k < order.len() {
+                // Per-clause shuffle, deterministic per clause index.
+                let mut rng = Rng::new(
+                    0x5350_4152_5345_u64 ^ (j as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                );
+                for i in (1..order.len()).rev() {
+                    let r = (rng.next_u64() % (i as u64 + 1)) as usize;
+                    order.swap(i, r);
+                }
+            }
+            let rest: Vec<u32> = order[k.min(order.len())..].iter().rev().copied().collect();
+            order.truncate(k);
+            c.included.clear();
+            c.included_state.clear();
+            c.excluded_state = vec![least_forgotten; order.len()];
+            c.excluded = order;
+            // Popped from the end, so the next sampled-out literal comes first.
+            c.unallocated = rest;
+            c.absorbed = 0;
         }
     }
 
@@ -332,9 +515,11 @@ impl SparseClauseBank {
                 c.excluded.push(f);
                 c.excluded_state.push(least_forgotten);
             }
-            for l in (new_nf + old_nf)..(new_n_literals as u32) {
-                c.excluded.push(l);
-                c.excluded_state.push(least_forgotten);
+            if self.feature_negation {
+                for l in (new_nf + old_nf)..(new_n_literals as u32) {
+                    c.excluded.push(l);
+                    c.excluded_state.push(least_forgotten);
+                }
             }
         }
 
@@ -348,7 +533,7 @@ impl SparseClauseBank {
         &mut self.clauses
     }
 
-    /// `(half, max_state)` — the inclusion threshold and absorbing include state,
+    /// `(half, max_state)` — the inclusion threshold and the maximum state,
     /// needed by per-clause feedback when operating on a bare [`SparseClause`].
     pub(crate) fn dims(&self) -> (u8, u8) {
         (self.half, self.max_state)
@@ -399,7 +584,7 @@ impl SparseClauseBank {
         keep_p: f64,
         max_included: usize,
     ) {
-        let (half, max_state, absorbing) = (self.half, self.max_state, self.absorbing);
+        let (half, max_state, opts) = (self.half, self.max_state, self.opts());
         self.clauses[cj].type_i(
             lit,
             lit_active_mask,
@@ -411,7 +596,7 @@ impl SparseClauseBank {
             max_included,
             half,
             max_state,
-            absorbing,
+            opts,
         );
     }
 
@@ -426,8 +611,9 @@ impl SparseClauseBank {
     /// Test-only convenience wrapper; see [`SparseClauseBank::type_i`].
     #[cfg(test)]
     pub(crate) fn type_ii(&mut self, cj: usize, lit: &[u64], lit_active_mask: &[u64]) {
-        let (half, max_state) = (self.half, self.max_state);
-        self.clauses[cj].type_ii(lit, lit_active_mask, half, max_state);
+        let (half, max_state, rate) = (self.half, self.max_state, self.feedback_rate);
+        let mut rng = Rng::new(0);
+        self.clauses[cj].type_ii(lit, lit_active_mask, half, max_state, &mut rng, rate);
     }
 
     // ---- introspection ---------------------------------------------------
@@ -466,25 +652,13 @@ impl SparseClauseBank {
     /// clause's `unallocated` pool, which under the v1 init policy only grows via
     /// absorbing removal).
     pub(crate) fn count_absorbed_exclude(&self) -> u64 {
-        self.clauses
-            .iter()
-            .map(|c| c.unallocated.len() as u64)
-            .sum()
+        self.clauses.iter().map(|c| u64::from(c.absorbed)).sum()
     }
 
     /// Total number of (clause, literal) slots, for fraction denominators.
     pub(crate) fn total_literals(&self) -> u64 {
         (self.n_clauses * self.n_literals) as u64
     }
-}
-
-/// Remove excluded literal at `idx` and push it to `unallocated` (absorbing
-/// removal).  O(1) `swap_remove` keeps the index/state vectors in sync.
-#[inline]
-fn absorb_remove_excluded(c: &mut SparseClause, idx: usize) {
-    let l = c.excluded.swap_remove(idx);
-    c.excluded_state.swap_remove(idx);
-    c.unallocated.push(l);
 }
 
 /// Move included literal at `idx` to the excluded pool with state `state`.
@@ -632,14 +806,16 @@ mod tests {
         b.type_i(0, &lit, &act, false, false, &mut rng, 1.0, 1.0, usize::MAX);
         let after = b.clauses[0].excluded.len();
         assert_eq!(after, before - 1, "literal should leave the excluded pool");
-        assert!(b.clauses[0].unallocated.contains(&0));
+        assert_eq!(b.clauses[0].absorbed, 1, "counted as absorbed");
 
-        // Repeated feedback must never resurrect it: unallocated length monotonic.
+        // Dropped for good, as TMU: never in any pool again.
         for _ in 0..1000 {
             b.type_i(0, &lit, &act, false, false, &mut rng, 1.0, 1.0, usize::MAX);
         }
-        assert!(b.clauses[0].unallocated.contains(&0));
-        assert!(!b.clauses[0].excluded.contains(&0));
+        let c = &b.clauses[0];
+        assert!(
+            !c.excluded.contains(&0) && !c.included.contains(&0) && !c.unallocated.contains(&0)
+        );
     }
 
     #[test]
@@ -665,21 +841,91 @@ mod tests {
     }
 
     #[test]
-    fn absorbing_include_locks() {
+    fn a_literal_at_the_top_state_can_still_be_forgotten_as_tmu() {
+        // TMU's sparse bank has no include lock (its absorbing_include is unused):
+        // Type Ib keeps lowering an included literal until it leaves.
         let mut b = bank(1, 4);
-        // Include literal 0 at max_state (absorbing include).
         let max_state = b.max_state;
         force_include(&mut b, 0, 0, max_state);
-        let lit = pack_feats(&[0, 0, 0, 0]); // literal 0 absent → would normally decrement
+        let lit = pack_feats(&[1, 0, 0, 0]); // literal 0 present
         let act = all_active(lit.len());
         let mut rng = Rng::new(5);
         for _ in 0..1000 {
             b.type_i(0, &lit, &act, false, false, &mut rng, 1.0, 1.0, usize::MAX);
         }
         assert!(
-            b.included_literals(0).contains(&0),
-            "max_state literal must survive 1000 Ib decrement rounds"
+            !b.included_literals(0).contains(&0),
+            "Type Ib lowers present literals too"
         );
+    }
+
+    #[test]
+    fn literal_sampling_and_insertion_as_tmu() {
+        let mut b = SparseClauseBank::new(3, 2 * 10, 8, 1);
+        b.literal_sampling = 0.25;
+        b.reinit();
+        for c in &b.clauses {
+            assert_eq!(c.excluded.len(), 5, "int(20 * 0.25) candidates");
+            assert_eq!(c.unallocated.len(), 15);
+            let mut all: Vec<u32> = c.excluded.iter().chain(&c.unallocated).copied().collect();
+            all.sort_unstable();
+            assert_eq!(
+                all,
+                (0..20).collect::<Vec<u32>>(),
+                "a partition of the literals"
+            );
+        }
+        assert_ne!(
+            b.clauses[0].excluded, b.clauses[1].excluded,
+            "sampled per clause"
+        );
+
+        // Insertion: an absorbed candidate is replaced by the next unallocated one.
+        b.absorbing = 50;
+        b.insertion_state = 40;
+        let next = *b.clauses[0].unallocated.last().unwrap();
+        let victim = b.clauses[0].excluded[0];
+        b.clauses[0].excluded_state[0] = 51;
+        let mut feats = [0u8; 10];
+        // make every candidate except the victim present, so only it is lowered
+        for &l in &b.clauses[0].excluded[1..] {
+            if (l as usize) < 10 {
+                feats[l as usize] = 1
+            }
+        }
+        let lit = pack_feats(&feats);
+        let act = all_active(lit.len());
+        let mut rng = Rng::new(1);
+        let c = &mut b.clauses[0];
+        c.excluded_state.iter_mut().skip(1).for_each(|s| *s = 100);
+        b.type_i(0, &lit, &act, false, false, &mut rng, 1.0, 1.0, usize::MAX);
+        let c = &b.clauses[0];
+        assert!(
+            !c.excluded.contains(&victim) || (victim as usize) < 10 && feats[victim as usize] == 1
+        );
+        assert!(
+            c.excluded.contains(&next),
+            "the next unallocated literal was inserted"
+        );
+        assert_eq!(c.absorbed, 1);
+        assert_eq!(
+            c.excluded_state[c.excluded.iter().position(|&x| x == next).unwrap()],
+            40
+        );
+    }
+
+    #[test]
+    fn without_feature_negation_no_negated_literal_is_a_candidate_even_after_grow() {
+        let mut b = SparseClauseBank::new(2, 2 * 6, 8, 1);
+        b.feature_negation = false;
+        b.reinit();
+        assert!(b.clauses.iter().all(|c| c.excluded.iter().all(|&l| l < 6)));
+        b.grow(2 * 9);
+        assert!(
+            b.clauses.iter().all(|c| c.excluded.iter().all(|&l| l < 9)),
+            "no negated after grow"
+        );
+        assert_eq!(b.clauses[0].excluded.len(), 9);
     }
 
     #[test]
