@@ -745,6 +745,7 @@ mod sparse {
         // 3-bit states absorb literals out of the excluded pool within a few epochs.
         let make = || {
             TMSparseClassifier::with_config(3, 12, 8, 6, 3.0, 3, false, 7)
+                .absorbing(2)
                 .clause_drop_p(0.2)
                 .literal_drop_p(0.1)
                 .max_included_literals(4)

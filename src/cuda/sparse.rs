@@ -272,7 +272,7 @@ impl CudaTMSparseClassifier {
                     boost: h.boost_true_positive as u32,
                     half: h.bank.half as u32,
                     max_state: h.bank.max_state as u32,
-                    _pad: 0,
+                    absorbing: h.bank.absorbing,
                 };
                 self.dev
                     .inner

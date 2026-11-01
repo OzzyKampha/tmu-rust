@@ -14,10 +14,12 @@
 //! A clause fires iff every literal in its (usually tiny) `included` list is
 //! present in the input, so per-clause work scales with the number of *active*
 //! literals rather than the literal count.  **Absorbing actions** are what make
-//! the lists shrink: once an excluded literal's TA state reaches the absorbing
-//! exclude floor (`0`) it is removed from `excluded` and pushed to `unallocated`,
-//! never to be revisited; once an included literal reaches `max_state` it is
-//! locked (immune to decrement), the absorbing include state.
+//! the lists shrink: with TMU's `absorbing = k` (`k >= 0`), once an excluded
+//! literal's TA state falls to `k` or below it is removed from `excluded` and
+//! pushed to `unallocated`, never to be revisited. `k = -1` (the default, as in
+//! TMU) turns this off: excluded states then stop at 1. An included literal that
+//! reaches `max_state` is always locked (immune to decrement), the absorbing
+//! include state.
 //!
 //! ## Initialisation policy
 //!
@@ -40,9 +42,13 @@
 use crate::clause_bank::dense::WORD_BITS;
 use crate::rng::Rng;
 
-/// Absorbing exclude floor: an excluded literal whose TA state reaches this value
-/// is removed from the candidate pool (mirrors the dense bank's `ta == 0` guard).
-pub(crate) const ABSORB_EXCLUDE: u8 = 0;
+/// `absorbing` value that turns absorbing off (TMU's default).
+pub(crate) const NO_ABSORBING: i32 = -1;
+
+#[cfg(feature = "serde")]
+fn no_absorbing() -> i32 {
+    NO_ABSORBING
+}
 
 /// One sparse clause: literal indices partitioned into included / excluded, each
 /// carrying its TA automaton state; everything else lives in `unallocated`.
@@ -76,6 +82,11 @@ pub(crate) struct SparseClauseBank {
     pub(crate) half: u8,
     /// Absorbing include state (maximum TA counter value).
     pub(crate) max_state: u8,
+    /// Absorbing exclude threshold, as TMU's `absorbing`: an excluded literal
+    /// whose state falls to this value or below is removed from the clause's
+    /// candidates for good. -1 (default) = off. A training setting, not saved.
+    #[cfg_attr(feature = "serde", serde(skip, default = "no_absorbing"))]
+    pub(crate) absorbing: i32,
     pub(crate) clauses: Vec<SparseClause>,
 }
 
@@ -134,6 +145,7 @@ impl SparseClause {
         max_included: usize,
         half: u8,
         max_state: u8,
+        absorbing: i32,
     ) {
         // --- included literals -------------------------------------------
         // Scan by index; demotions swap-remove, so do NOT advance `i` after one.
@@ -197,14 +209,16 @@ impl SparseClause {
                 }
                 i += 1;
             } else {
-                // Absent: decrement with probability 1/s; absorb out at the floor.
-                if rng.next_f64() <= inv_p {
-                    if state <= ABSORB_EXCLUDE + 1 {
+                // Absent: decrement with probability 1/s (never below 1), and
+                // absorb out once at or below the `absorbing` threshold — as
+                // TMU's ClauseBankSparse (`absorbing` = -1 never absorbs).
+                if state > 1 && rng.next_f64() <= inv_p {
+                    let new_state = state - 1;
+                    if i32::from(new_state) <= absorbing {
                         absorb_remove_excluded(self, i);
                         continue;
-                    } else {
-                        self.excluded_state[i] = state - 1;
                     }
+                    self.excluded_state[i] = new_state;
                 }
                 i += 1;
             }
@@ -224,8 +238,9 @@ impl SparseClause {
             let l = self.excluded[i];
             let active = lit_active(lit_active_mask, l);
             let state = self.excluded_state[i];
-            // Absent, active, and not at the absorbing exclude floor.
-            if active && !lit_present(lit, l) && state > ABSORB_EXCLUDE {
+            // Absent and active (as TMU: no state guard — excluded states
+            // never fall below 1, and absorbed literals have left the pool).
+            if active && !lit_present(lit, l) {
                 let new_state = (state + 1).min(max_state);
                 if new_state >= half {
                     promote_to_included(self, i, new_state);
@@ -263,6 +278,7 @@ impl SparseClauseBank {
         let clauses = vec![proto; n_clauses];
 
         SparseClauseBank {
+            absorbing: NO_ABSORBING,
             n_clauses,
             n_literals,
             half,
@@ -383,7 +399,7 @@ impl SparseClauseBank {
         keep_p: f64,
         max_included: usize,
     ) {
-        let (half, max_state) = (self.half, self.max_state);
+        let (half, max_state, absorbing) = (self.half, self.max_state, self.absorbing);
         self.clauses[cj].type_i(
             lit,
             lit_active_mask,
@@ -395,6 +411,7 @@ impl SparseClauseBank {
             max_included,
             half,
             max_state,
+            absorbing,
         );
     }
 
@@ -600,11 +617,12 @@ mod tests {
     #[test]
     fn absorbing_exclude_removes_from_pool_permanently() {
         let mut b = bank(1, 4);
-        // Drive excluded literal 0 down to the floor: set state to 1, then one
-        // decrement absorbs it out.
+        b.absorbing = 1;
+        // Drive excluded literal 0 to the threshold: from state 2, one
+        // decrement reaches 1 = `absorbing` and absorbs it out.
         let c = &mut b.clauses[0];
         let pos = c.excluded.iter().position(|&x| x == 0).unwrap();
-        c.excluded_state[pos] = 1;
+        c.excluded_state[pos] = 2;
 
         let lit = pack_feats(&[0, 0, 0, 0]); // literal 0 absent
         let act = all_active(lit.len());
@@ -622,6 +640,28 @@ mod tests {
         }
         assert!(b.clauses[0].unallocated.contains(&0));
         assert!(!b.clauses[0].excluded.contains(&0));
+    }
+
+    #[test]
+    fn absorbing_off_never_removes_and_floors_at_one() {
+        let mut b = bank(1, 4);
+        assert_eq!(b.absorbing, NO_ABSORBING, "off by default, as TMU");
+        let lit = pack_feats(&[0, 0, 0, 0]);
+        let act = all_active(lit.len());
+        let mut rng = Rng::new(3);
+        let n = b.clauses[0].excluded.len();
+        for _ in 0..1000 {
+            b.type_i(0, &lit, &act, false, false, &mut rng, 1.0, 1.0, usize::MAX);
+        }
+        assert_eq!(b.clauses[0].excluded.len(), n, "nothing absorbed");
+        assert!(b.clauses[0].unallocated.is_empty());
+        // The absent (positive) literals were decremented to the floor of 1.
+        let c = &b.clauses[0];
+        for (&l, &s) in c.excluded.iter().zip(&c.excluded_state) {
+            if l < 4 {
+                assert_eq!(s, 1, "literal {l} floors at 1");
+            }
+        }
     }
 
     #[test]

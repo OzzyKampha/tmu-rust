@@ -3,7 +3,8 @@
 //! Mirrors TMU's sparse clause-bank classifier: the same weighted-clause vanilla
 //! algorithm as [`TsetlinMachine`](crate::TsetlinMachine), but backed by the
 //! [`SparseClauseBank`] — per-clause index lists with **absorbing actions** that
-//! permanently drop literals from candidacy as training converges.  See the
+//! permanently drop literals from candidacy as training converges, when
+//! enabled with [`TMSparseClassifier::absorbing`] (off by default, as TMU).  See the
 //! [`sparse`](crate::clause_bank::sparse) module docs for the data layout.
 //!
 //! ## Differences from the dense [`TsetlinMachine`]
@@ -161,6 +162,19 @@ impl TMSparseClassifier {
     /// Sparse models especially benefit from this — it bounds clause size directly.
     pub fn max_included_literals(mut self, max: usize) -> Self {
         self.max_included_literals = max;
+        self
+    }
+
+    /// Absorbing exclude threshold, as TMU's `absorbing` (default -1 = off).
+    ///
+    /// With `k >= 0`, an excluded literal whose state falls to `k` or below is
+    /// absorbed: removed from the clause's candidates for good, so training and
+    /// firing stop visiting it ("sparse computation with absorbing actions").
+    /// Larger `k` absorbs sooner. The include side is always absorbing: a literal
+    /// at the maximum state is never decremented.
+    pub fn absorbing(mut self, k: i32) -> Self {
+        assert!(k >= -1, "absorbing must be >= -1 (-1 = off)");
+        self.bank.absorbing = k;
         self
     }
 
@@ -395,6 +409,7 @@ impl TMSparseClassifier {
         let words = self.words;
         let boost = self.boost_true_positive;
         let wmax = self.threshold;
+        let absorbing = self.bank.absorbing;
         let max_inc = self.max_included_literals;
         let drop_p = self.clause_drop_p;
         let cw = self.class_weights[c];
@@ -459,6 +474,7 @@ impl TMSparseClassifier {
                     max_inc,
                     half,
                     max_state,
+                    absorbing,
                 );
             } else {
                 // Type II.

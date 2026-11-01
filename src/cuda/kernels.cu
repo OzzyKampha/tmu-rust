@@ -1108,7 +1108,8 @@ struct SpUpdateParams {
     u64 max_inc;
     u32 n_groups, cpg, n_literals;
     int threshold;
-    u32 boost, half, max_state, _pad;
+    u32 boost, half, max_state;
+    int absorbing;  // TMU's absorbing: remove excluded literals at or below; -1 = off
 };
 
 extern "C" __global__ void sp_update(const SpUpdateParams p) {
@@ -1191,13 +1192,14 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
                 }
                 i++;
             } else {
-                if (rng_f64(&s) <= p.inv_p) {
-                    if (st <= 1) {
+                if (st > 1 && rng_f64(&s) <= p.inv_p) {
+                    u32 ns = st - 1;
+                    if ((int)ns <= p.absorbing) {
                         sp_swap_remove(exc_idx, exc_st, &n_exc, i);
                         una_idx[n_una++] = l;
                         continue;
                     }
-                    exc_st[i] = (u8)(st - 1);
+                    exc_st[i] = (u8)ns;
                 }
                 i++;
             }
@@ -1209,7 +1211,7 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
         while (i < n_exc) {
             u32 l = exc_idx[i];
             u32 st = exc_st[i];
-            if (bit_of(p.act, l) && !bit_of(p.lit, l) && st > 0) {
+            if (bit_of(p.act, l) && !bit_of(p.lit, l)) {
                 u32 ns = st + 1 < p.max_state ? st + 1 : p.max_state;
                 if (ns >= p.half) {
                     sp_swap_remove(exc_idx, exc_st, &n_exc, i);
