@@ -762,6 +762,16 @@ mod sparse {
         );
         check(make, 3, 6, &device_serial());
     }
+
+    #[test]
+    fn matches_cpu_with_a_weight_cap() {
+        if skip() {
+            return;
+        }
+        let make =
+            || TMSparseClassifier::with_config(2, 12, 10, 16, 3.9, 8, true, 3).max_clause_weight(3);
+        check(make, 2, 4, &device());
+    }
 }
 
 mod composite {

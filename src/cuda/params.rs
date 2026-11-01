@@ -126,7 +126,7 @@ params! {
         drop_p: f64, inv_p: f64, keep_p: f64, max_inc: u64,
         n_groups: u32, cpg: u32, n_literals: u32,
         threshold: i32,
-        boost: u32, half: u32, max_state: u32, _pad: u32,
+        boost: u32, half: u32, max_state: u32, wmax: i32,
     }
     ScoresParams {
         include: u64, valid: u64, lits: u64, weights: u64, out: u64,
