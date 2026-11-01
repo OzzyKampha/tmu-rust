@@ -52,10 +52,6 @@ pub struct TMSparseClassifier {
     pub(crate) max_included_literals: usize,
     pub(crate) clause_drop_p: f64,
     pub(crate) literal_drop_p: f64,
-    /// Largest weight a clause may reach (0 = the threshold `T`, as TMU). A
-    /// training setting, not saved with the model: set it again to resume.
-    #[cfg_attr(feature = "serde", serde(skip))]
-    pub(crate) max_clause_weight: i32,
 
     /// Sparse clause storage; `n_classes * clauses_per_class` clauses total.
     pub(crate) bank: SparseClauseBank,
@@ -149,7 +145,6 @@ impl TMSparseClassifier {
             max_included_literals: usize::MAX,
             clause_drop_p: 0.0,
             literal_drop_p: 0.0,
-            max_clause_weight: 0,
             bank,
             weights: vec![1i32; n_clauses],
             rngs,
@@ -181,27 +176,6 @@ impl TMSparseClassifier {
         assert!((0.0..1.0).contains(&p), "literal_drop_p must be in [0, 1)");
         self.literal_drop_p = p;
         self
-    }
-
-    /// Cap every clause's weight at `max` (default 0 = the threshold `T`).
-    ///
-    /// Weights otherwise grow up to `T`, so one clause can carry a whole class
-    /// sum alone. With a cap of e.g. `T / 8`, reaching `T` takes at least eight
-    /// clauses agreeing: decisions rest on more evidence, and no single clause
-    /// dominates an explanation. Applied on the CPU and the GPU.
-    pub fn max_clause_weight(mut self, max: i32) -> Self {
-        assert!(max >= 0, "max_clause_weight must be >= 0 (0 = threshold)");
-        self.max_clause_weight = max;
-        self
-    }
-
-    /// The effective weight ceiling: the cap, or `T` when none (or a larger one) is set.
-    pub(crate) fn wmax(&self) -> i32 {
-        if self.max_clause_weight > 0 {
-            self.max_clause_weight.min(self.threshold)
-        } else {
-            self.threshold
-        }
     }
 
     /// Per-class feedback scaling weights to compensate for label imbalance
@@ -420,14 +394,14 @@ impl TMSparseClassifier {
         #[cfg(feature = "parallel")]
         let words = self.words;
         let boost = self.boost_true_positive;
-        let wmax = self.wmax();
+        let wmax = self.threshold;
         let max_inc = self.max_included_literals;
         let drop_p = self.clause_drop_p;
         let cw = self.class_weights[c];
         let inv_p = 1.0 / self.s;
         let keep_p = (self.s - 1.0) / self.s;
 
-        let t = self.threshold as f64;
+        let t = wmax as f64;
         let v = sum as f64;
         let p = if target == 1 {
             ((t - v) / (2.0 * t) * cw).min(1.0)
@@ -1034,36 +1008,6 @@ mod tests {
         let mut bad = buf.clone();
         bad[8] = 0xFE; // corrupt the type tag byte (after 4 magic + 4 version).
         assert!(TMSparseClassifier::read_from(&mut bad.as_slice()).is_err());
-    }
-
-    #[test]
-    fn max_clause_weight_caps_every_weight() {
-        let (xs, ys) = make_xor(2000, 0.1, 11);
-        let e = Encoder::for_binary(N_FEATURES);
-        let b = encode(&xs, &e);
-        let mut uncapped = TMSparseClassifier::with_config(2, N_FEATURES, 20, 40, 3.9, 8, true, 5);
-        let mut capped = TMSparseClassifier::with_config(2, N_FEATURES, 20, 40, 3.9, 8, true, 5)
-            .max_clause_weight(4);
-        for _ in 0..15 {
-            uncapped.fit_epoch(&b, &ys);
-            capped.fit_epoch(&b, &ys);
-        }
-        assert!(
-            uncapped.weights.iter().any(|&w| w > 4),
-            "test should grow weights past the cap"
-        );
-        assert!(
-            capped.weights.iter().all(|&w| (1..=4).contains(&w)),
-            "{:?}",
-            capped.weights
-        );
-        // A cap above T changes nothing: T stays the ceiling.
-        let mut big = TMSparseClassifier::with_config(2, N_FEATURES, 20, 40, 3.9, 8, true, 5)
-            .max_clause_weight(1000);
-        for _ in 0..15 {
-            big.fit_epoch(&b, &ys);
-        }
-        assert_eq!(big.weights, uncapped.weights);
     }
 
     #[test]

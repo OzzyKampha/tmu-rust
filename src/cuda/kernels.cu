@@ -1108,8 +1108,7 @@ struct SpUpdateParams {
     u64 max_inc;
     u32 n_groups, cpg, n_literals;
     int threshold;
-    u32 boost, half, max_state;
-    int wmax;  // weight ceiling: the cap, or the threshold
+    u32 boost, half, max_state, _pad;
 };
 
 extern "C" __global__ void sp_update(const SpUpdateParams p) {
@@ -1140,7 +1139,7 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
     int* w = &p.weights[cj];
     if (target == positive) {
         int fu = fired && (p.max_inc == NO_LIMIT || (u64)n_inc < p.max_inc);
-        if (fu) *w = imin(*w + 1, p.wmax);
+        if (fu) *w = imin(*w + 1, p.threshold);
         // Type I — included literals.
         u32 i = 0;
         while (i < n_inc) {
