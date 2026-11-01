@@ -50,6 +50,23 @@ pub struct CoalescedTsetlinMachine {
     /// `true` to select the negative class proportionally to its update probability
     /// (focused negative sampling); `false` for uniform random selection.
     pub(crate) focused_negative_sampling: bool,
+    /// TMU's `type_i_ii_ratio` as the two factors on the literal-feedback
+    /// probability. Training setting, not saved.
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip, default = "crate::clause_bank::dense::serde_one")
+    )]
+    pub(crate) type_i_p: f64,
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip, default = "crate::clause_bank::dense::serde_one")
+    )]
+    pub(crate) type_ii_p: f64,
+    /// TMU's `max_positive_clauses`: the true class's weights are only
+    /// incremented while fewer than this many of its weights are >= 0
+    /// (`usize::MAX` = no limit). Training setting, not saved.
+    #[cfg_attr(feature = "serde", serde(skip, default = "no_limit"))]
+    pub(crate) max_positive_clauses: usize,
 
     /// Dedicated RNG for the per-sample literal-active mask.
     pub(crate) literal_rng: Rng,
@@ -108,6 +125,11 @@ pub struct CoalescedTsetlinMachine {
 }
 
 #[cfg(feature = "serde")]
+fn no_limit() -> usize {
+    usize::MAX
+}
+
+#[cfg(feature = "serde")]
 impl crate::serial::SaveLoad for CoalescedTsetlinMachine {
     const TAG: u8 = crate::serial::TAG_COALESCED;
 }
@@ -133,6 +155,8 @@ fn apply_one_clause_coalesced(
     rng: &mut Rng,
     target: u8,
     p: f64,
+    pf: (f64, f64),
+    allow_inc: bool,
     out_j: bool,
     active_j: bool,
     // Packed arrays:
@@ -155,8 +179,8 @@ fn apply_one_clause_coalesced(
     let positive = *w >= 0;
     let give_type_i = if target == 1 { positive } else { !positive };
 
-    // Literal (TA) feedback.
-    if rng.next_f64() <= p {
+    // Literal (TA) feedback, scaled by TMU's Type I / II ratio factors.
+    if rng.next_f64() <= p * if give_type_i { pf.0 } else { pf.1 } {
         if give_type_i {
             let under_limit = max_inc == usize::MAX || {
                 let n: u32 = (0..words).map(|k| (inc[k] & val[k]).count_ones()).sum();
@@ -185,11 +209,15 @@ fn apply_one_clause_coalesced(
     // Weight step: increment (true class) / decrement (negative class) every fired,
     // active clause regardless of sign — matches TMU's positive_weights / negative_weights.
     if out_j && rng.next_f64() <= p {
-        *w = if target == 1 {
-            w.saturating_add(1)
+        if target == 1 {
+            // TMU's max_positive_clauses: no increment once the class has
+            // enough non-negative weights (the draw is still taken).
+            if allow_inc {
+                *w = w.saturating_add(1);
+            }
         } else {
-            w.saturating_sub(1)
-        };
+            *w = w.saturating_sub(1);
+        }
     }
 }
 
@@ -300,6 +328,9 @@ impl CoalescedTsetlinMachine {
             clause_drop_p: 0.0,
             literal_drop_p: 0.0,
             focused_negative_sampling: false,
+            type_i_p: 1.0,
+            type_ii_p: 1.0,
+            max_positive_clauses: usize::MAX,
             literal_rng,
             dig_lit_active: digits_of(1.0, MASK_BITS),
             ta,
@@ -367,6 +398,43 @@ impl CoalescedTsetlinMachine {
         self
     }
 
+    /// TMU's `feature_negation` (default true). With `false` no clause may use a
+    /// negated literal ("feature absent"): every literal in a learned rule is
+    /// something the input has. Kept across `grow_features` and save/load.
+    pub fn feature_negation(mut self, on: bool) -> Self {
+        if on {
+            for l in self.n_features..2 * self.n_features {
+                self.valid[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
+            }
+        } else {
+            crate::clause_bank::dense::clear_negated(&mut self.valid, self.n_features);
+        }
+        let half = self.half;
+        let (nl, w) = (self.n_literals, self.words);
+        for (ta, inc) in self.ta.chunks(nl).zip(self.include.chunks_mut(w)) {
+            rebuild_include(ta, inc, &self.valid, w, nl, half);
+        }
+        self
+    }
+
+    /// TMU's `type_i_ii_ratio` (default 1.0): a ratio above 1 makes Type II
+    /// literal feedback rarer by `1/ratio`, below 1 makes Type I rarer by
+    /// `ratio`. Weight steps are not scaled, as in TMU.
+    pub fn type_i_ii_ratio(mut self, ratio: f64) -> Self {
+        assert!(ratio > 0.0, "type_i_ii_ratio must be > 0");
+        (self.type_i_p, self.type_ii_p) = crate::clause_bank::dense::type_i_ii_factors(ratio);
+        self
+    }
+
+    /// TMU's `max_positive_clauses` (default: no limit): the true class's clause
+    /// weights are only incremented while fewer than `max` of them are >= 0, so
+    /// at most about `max` clauses come to vote for a class.
+    pub fn max_positive_clauses(mut self, max: usize) -> Self {
+        assert!(max >= 1, "max_positive_clauses must be >= 1");
+        self.max_positive_clauses = max;
+        self
+    }
+
     /// Enable focused negative sampling (default: `false` = uniform random).
     ///
     /// When enabled the negative class for each sample is drawn with probability
@@ -430,6 +498,7 @@ impl CoalescedTsetlinMachine {
     /// Panics if `new_n_features < self.n_features()` (shrinking is not supported).
     /// A call with the current feature count is a no-op.
     pub fn grow_features(&mut self, new_n_features: usize) {
+        let negation = crate::clause_bank::dense::has_negated(&self.valid, self.n_features);
         assert!(
             new_n_features >= self.n_features,
             "grow_features cannot shrink: {} -> {new_n_features}",
@@ -454,6 +523,9 @@ impl CoalescedTsetlinMachine {
         self.n_literals = n_literals;
         self.words = words;
         self.literals = vec![0u64; words];
+        if !negation {
+            crate::clause_bank::dense::clear_negated(&mut self.valid, new_n_features);
+        }
     }
 
     // ---- inference -------------------------------------------------------
@@ -636,6 +708,14 @@ impl CoalescedTsetlinMachine {
         } else {
             (t + v) / (2.0 * t)
         };
+        let pf = (self.type_i_p, self.type_ii_p);
+        let allow_inc = target != 1
+            || self.max_positive_clauses == usize::MAX
+            || self.weights[c * nc..(c + 1) * nc]
+                .iter()
+                .filter(|&&w| w >= 0)
+                .count()
+                < self.max_positive_clauses;
 
         let Self {
             ta,
@@ -680,6 +760,8 @@ impl CoalescedTsetlinMachine {
                             rng,
                             target,
                             p,
+                            pf,
+                            allow_inc,
                             clause_outputs[j],
                             clause_active[j],
                             val,
@@ -731,6 +813,8 @@ impl CoalescedTsetlinMachine {
                             rng,
                             target,
                             p,
+                            pf,
+                            allow_inc,
                             clause_outputs[j],
                             clause_active[j],
                             val,
@@ -758,6 +842,8 @@ impl CoalescedTsetlinMachine {
                 &mut rngs[j],
                 target,
                 p,
+                pf,
+                allow_inc,
                 clause_outputs[j],
                 clause_active[j],
                 val,
@@ -1711,5 +1797,60 @@ mod tests {
 
         let bte20 = e20.encode_batch(&as_slices(&pad_to(&xte, 20)));
         assert_eq!(tm.predict_batch(&bte20), loaded.predict_batch(&bte20));
+    }
+
+    #[test]
+    fn coalesced_without_feature_negation_uses_present_literals_only() {
+        let (xs, ys) = make_4class(2000, 31);
+        let e = enc(8);
+        let b = e.encode_batch(&as_slices(&xs));
+        let mut tm = CoalescedTsetlinMachine::with_config(4, 8, 24, 20, 3.9, 8, true, 7)
+            .feature_negation(false);
+        for _ in 0..10 {
+            tm.fit_epoch(&b, &ys);
+        }
+        let rules: Vec<(usize, bool)> = (0..24).flat_map(|j| tm.clause_rule(j)).collect();
+        assert!(!rules.is_empty());
+        assert!(
+            rules.iter().all(|&(_, neg)| !neg),
+            "a negated literal was used"
+        );
+    }
+
+    #[test]
+    fn max_positive_clauses_and_ratio_change_training_and_defaults_do_not() {
+        let (xs, ys) = make_4class(1500, 32);
+        let e = enc(8);
+        let b = e.encode_batch(&as_slices(&xs));
+        let run = |tm: CoalescedTsetlinMachine| {
+            let mut tm = tm;
+            for _ in 0..5 {
+                tm.fit_epoch(&b, &ys);
+            }
+            tm
+        };
+        let base = run(CoalescedTsetlinMachine::with_config(
+            4, 8, 24, 20, 3.9, 8, true, 7,
+        ));
+        let same = run(
+            CoalescedTsetlinMachine::with_config(4, 8, 24, 20, 3.9, 8, true, 7)
+                .type_i_ii_ratio(1.0)
+                .feature_negation(true),
+        );
+        assert_eq!(base.weights, same.weights);
+        assert_eq!(base.ta, same.ta);
+        let capped = run(
+            CoalescedTsetlinMachine::with_config(4, 8, 24, 20, 3.9, 8, true, 7)
+                .max_positive_clauses(2),
+        );
+        assert_ne!(
+            base.weights, capped.weights,
+            "max_positive_clauses had no effect"
+        );
+        let ratio = run(
+            CoalescedTsetlinMachine::with_config(4, 8, 24, 20, 3.9, 8, true, 7)
+                .type_i_ii_ratio(4.0),
+        );
+        assert_ne!(base.ta, ratio.ta, "type_i_ii_ratio had no effect");
     }
 }

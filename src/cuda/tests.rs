@@ -306,6 +306,25 @@ mod coalesced {
     }
 
     #[test]
+    fn matches_cpu_with_tmu_options() {
+        if skip() {
+            return;
+        }
+        for ratio in [0.5, 2.0] {
+            check(
+                || {
+                    CoalescedTsetlinMachine::with_config(3, 12, 12, 10, 3.9, 8, true, 4)
+                        .type_i_ii_ratio(ratio)
+                        .max_positive_clauses(3)
+                        .feature_negation(false)
+                },
+                3,
+                &device(),
+            );
+        }
+    }
+
+    #[test]
     fn matches_cpu_default() {
         if skip() {
             return;

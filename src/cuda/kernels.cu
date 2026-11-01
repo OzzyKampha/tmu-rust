@@ -645,7 +645,7 @@ __device__ void coalesced_pass(u8* ta, u64* inc, int* w, u64* rng_sh, u8* ind, u
                                int ex_b, const u64* inv, const u64* keep, int words,
                                int n_literals, int target, double prob, int out_j, int active,
                                u64 max_inc, double d, u32 boost, u32 half, u32 max_state,
-                               u32 type_iii) {
+                               u32 type_iii, double pf_i, double pf_ii, int allow_inc) {
     __shared__ int s_action;
     if (!active) return;
     int n_inc = max_inc != NO_LIMIT ? block_included(inc, valid, words) : 0;
@@ -653,7 +653,7 @@ __device__ void coalesced_pass(u8* ta, u64* inc, int* w, u64* rng_sh, u8* ind, u
         int positive = *w >= 0;
         int give_i = target ? positive : !positive;
         int action = ACT_NONE;
-        if (rng_f64(rng_sh) <= prob) {
+        if (rng_f64(rng_sh) <= prob * (give_i ? pf_i : pf_ii)) {
             if (give_i) {
                 int fu = out_j && (max_inc == NO_LIMIT || (u64)n_inc < max_inc);
                 action = fu ? ACT_IA : ACT_IB;
@@ -663,7 +663,7 @@ __device__ void coalesced_pass(u8* ta, u64* inc, int* w, u64* rng_sh, u8* ind, u
         }
         if (out_j && rng_f64(rng_sh) <= prob) {
             if (target) {
-                if (*w != BIG_INT) *w += 1;
+                if (allow_inc && *w != BIG_INT) *w += 1;
             } else {
                 if (*w != -BIG_INT - 1) *w -= 1;
             }
@@ -758,11 +758,17 @@ extern "C" __global__ void co_plan(const CoPlanParams p) {
     int neg = s_neg;
     int sy = co_class_sum(p, p.y);
     int sn = co_class_sum(p, (u32)neg);
+    // TMU's max_positive_clauses: how many of y's weights are >= 0 (before the update).
+    int npos = 0;
+    for (u32 j = threadIdx.x; j < p.n_clauses; j += blockDim.x)
+        npos += p.weights[(u64)p.y * p.n_clauses + j] >= 0;
+    npos = block_sum(npos);
     if (threadIdx.x == 0) {
         p.plan[0] = (int)p.y;
         p.plan[1] = neg;
         p.plan[2] = sy;
         p.plan[3] = sn;
+        p.plan[4] = npos;
     }
 }
 
@@ -782,7 +788,9 @@ struct CoUpdateParams {
     const u64* inv;
     const u64* keep;
     double d;
+    double type_i_p, type_ii_p;  // TMU's type_i_ii_ratio factors
     u64 max_inc;
+    u64 max_pos;                 // TMU's max_positive_clauses (NO_LIMIT = none)
     u32 n_clauses, words, n_literals;
     int threshold;
     u32 boost, half, max_state, type_iii;
@@ -808,7 +816,8 @@ extern "C" __global__ void co_update(const CoUpdateParams p) {
         coalesced_pass(ta, inc, &s_w, &s_rng, ind, cat, p.valid, p.lit, p.act, -1, -1,
                        p.inv + (u64)pass * p.words, p.keep + (u64)pass * p.words, p.words,
                        p.n_literals, target, prob, out_j, active, p.max_inc, p.d, p.boost, p.half,
-                       p.max_state, p.type_iii);
+                       p.max_state, p.type_iii, p.type_i_p, p.type_ii_p,
+                       p.max_pos == NO_LIMIT || (u64)p.plan[4] < p.max_pos);
         __syncthreads();
         if (threadIdx.x == 0) p.weights[(u64)c * p.n_clauses + j] = s_w;
         __syncthreads();
@@ -884,7 +893,8 @@ extern "C" __global__ void cae_update(const CaeUpdateParams p) {
     coalesced_pass(ta, inc, &s_w, &s_rng, p.type_iii ? p.ind + (u64)j * p.n_literals : 0,
                    p.type_iii ? p.cat + (u64)j * p.words : 0, p.valid, p.lit, p.act, (int)p.o,
                    (int)p.o + p.nf, p.inv, p.keep, p.words, p.n_literals, target, prob, p.fire[j],
-                   active, p.max_inc, p.d, p.boost, p.half, p.max_state, p.type_iii);
+                   active, p.max_inc, p.d, p.boost, p.half, p.max_state, p.type_iii, 1.0, 1.0,
+                   1);
     __syncthreads();
     if (threadIdx.x == 0) {
         p.rngs[j] = s_rng;

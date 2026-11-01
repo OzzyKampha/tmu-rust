@@ -70,7 +70,7 @@ params! {
     CoUpdateParams {
         ta: u64, include: u64, weights: u64, rngs: u64, ind: u64, cat: u64, valid: u64,
         lit: u64, act: u64, fire: u64, active: u64, plan: u64, inv: u64, keep: u64,
-        d: f64, max_inc: u64,
+        d: f64, type_i_p: f64, type_ii_p: f64, max_inc: u64, max_pos: u64,
         n_clauses: u32, words: u32, n_literals: u32,
         threshold: i32,
         boost: u32, half: u32, max_state: u32, type_iii: u32,
