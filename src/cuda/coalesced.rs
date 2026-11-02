@@ -122,6 +122,7 @@ impl CudaCoalescedTsetlinMachine {
             .download(ta, include, weights, rngs, ind, cat, *type_iii)?;
         restore_rngs(class_rngs, &self.class_rngs.download()?);
         m.rng.0 = self.master_rng.download()?[0];
+        m.literal_index = Default::default();
         Ok(m)
     }
 

@@ -7,9 +7,9 @@ use crate::clause_bank::dense::rule_from_include;
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::{DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN, use_parallel};
 use crate::clause_bank::dense::{
-    GOLDEN, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of, expand_bits_to_bytes,
-    fire_predict, grow_dense_state, rebuild_include, type_i_update_bytes, type_ii_update_bytes,
-    type_iii_update, words_for,
+    GOLDEN, LiteralIndex, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of,
+    expand_bits_to_bytes, grow_dense_state, rebuild_include, type_i_update_bytes,
+    type_ii_update_bytes, type_iii_update, words_for,
 };
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
@@ -45,6 +45,11 @@ pub struct TsetlinMachine {
     /// Include bitset.  Clause `cj` occupies `include[cj * words .. (cj+1) * words]`.
     /// Rebuilt after every clause update; kept in sync with `ta`.
     pub(crate) include: Vec<u64>,
+    /// Inference map from literals to the clauses (all classes) that include
+    /// them, built on first prediction and dropped by every `&mut self`/`mut
+    /// self` method, so it never outlives the include bitsets it was built from.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) literal_index: std::sync::OnceLock<LiteralIndex>,
     /// TA threshold for inclusion: `ta[l] >= half` → literal l is included.
     pub(crate) half: u8,
     /// Maximum TA counter value: `(1 << state_bits) - 1`.
@@ -313,6 +318,7 @@ impl TsetlinMachine {
         let literal_rng = Rng::new(seed ^ 0x4C49_5445_5241_4C21u64);
 
         TsetlinMachine {
+            literal_index: Default::default(),
             n_classes,
             n_features,
             n_literals,
@@ -367,6 +373,7 @@ impl TsetlinMachine {
     /// reproducible training. No effect without `--features parallel` or on models
     /// too small to benefit. Unsupported with Type III feedback.
     pub fn data_parallel(mut self, on: bool) -> Self {
+        self.reset_literal_index();
         self.data_parallel = on;
         self
     }
@@ -374,6 +381,7 @@ impl TsetlinMachine {
     /// Limit how many literals each clause may include (Type Ia guard).
     /// Mirrors TMU's `max_included_literals` (default: no limit).
     pub fn max_included_literals(mut self, max: usize) -> Self {
+        self.reset_literal_index();
         self.max_included_literals = max;
         self
     }
@@ -381,6 +389,7 @@ impl TsetlinMachine {
     /// Per-clause dropout probability during training (default: 0.0 = no drop).
     /// Mirrors TMU's `clause_drop_p`. Typical value for large models: 0.75.
     pub fn clause_drop_p(mut self, p: f64) -> Self {
+        self.reset_literal_index();
         assert!((0.0..1.0).contains(&p), "clause_drop_p must be in [0, 1)");
         self.clause_drop_p = p;
         self
@@ -392,6 +401,7 @@ impl TsetlinMachine {
     /// training sample — both its feedback and its contribution to the firing
     /// check are masked out.  Mirrors TMU's `literal_drop_p`.
     pub fn literal_drop_p(mut self, p: f64) -> Self {
+        self.reset_literal_index();
         assert!((0.0..1.0).contains(&p), "literal_drop_p must be in [0, 1)");
         self.literal_drop_p = p;
         self.dig_lit_active = digits_of(1.0 - p, MASK_BITS);
@@ -411,6 +421,7 @@ impl TsetlinMachine {
     /// where `count[c]` is the number of training samples labelled `c`.
     /// Probability is clamped to `[0, 1]`, so very large weights saturate at p = 1.
     pub fn class_weights(mut self, weights: Vec<f64>) -> Self {
+        self.reset_literal_index();
         assert_eq!(
             weights.len(),
             self.n_classes,
@@ -428,6 +439,7 @@ impl TsetlinMachine {
     /// trained; TMU's default is false). With `false` every clause keeps a vote
     /// of 1: the machine is TMU's default, unweighted TsetlinMachine.
     pub fn weighted_clauses(mut self, on: bool) -> Self {
+        self.reset_literal_index();
         self.weighted_clauses = on;
         self
     }
@@ -436,6 +448,7 @@ impl TsetlinMachine {
     /// negated literal ("feature absent"): every literal in a learned rule is
     /// something the input has. Kept across `grow_features` and save/load.
     pub fn feature_negation(mut self, on: bool) -> Self {
+        self.reset_literal_index();
         if on {
             for l in self.n_features..2 * self.n_features {
                 self.valid[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
@@ -455,6 +468,7 @@ impl TsetlinMachine {
     /// probability is `(T - |class sum|) / T` for the true and the negative
     /// class alike, instead of `(T ∓ sum) / 2T`.
     pub fn confidence_driven_updating(mut self, on: bool) -> Self {
+        self.reset_literal_index();
         self.confidence_driven_updating = on;
         self
     }
@@ -462,6 +476,7 @@ impl TsetlinMachine {
     /// TMU's `type_i_ii_ratio` (default 1.0): a ratio above 1 makes Type II
     /// feedback rarer by `1/ratio`, below 1 makes Type I rarer by `ratio`.
     pub fn type_i_ii_ratio(mut self, ratio: f64) -> Self {
+        self.reset_literal_index();
         assert!(ratio > 0.0, "type_i_ii_ratio must be > 0");
         (self.type_i_p, self.type_ii_p) = crate::clause_bank::dense::type_i_ii_factors(ratio);
         self
@@ -471,6 +486,7 @@ impl TsetlinMachine {
     /// precision of the Type III indicator automata, 2..=8 bits. Resets the
     /// indicators: set it before training.
     pub fn number_of_state_bits_ind(mut self, bits: u8) -> Self {
+        self.reset_literal_index();
         assert!(
             (2..=8).contains(&bits),
             "number_of_state_bits_ind must be in 2..=8"
@@ -486,6 +502,7 @@ impl TsetlinMachine {
     /// its own Type I feedback masks — slower, and closer to TMU's default.
     /// CPU only: `to_cuda` refuses a model with it off.
     pub fn reuse_random_feedback(mut self, on: bool) -> Self {
+        self.reset_literal_index();
         self.reuse_random_feedback = on;
         self
     }
@@ -509,6 +526,7 @@ impl TsetlinMachine {
     /// Mirrors Python TMU's `type_iii_feedback=True` with the `d` parameter.
     /// `d` must be `> 1.0`; typical range is 100–500.
     pub fn type_iii_feedback(mut self, d: f64) -> Self {
+        self.reset_literal_index();
         assert!(d > 1.0, "d must be > 1.0");
         self.d = d;
         self.type_iii = true;
@@ -568,6 +586,7 @@ impl TsetlinMachine {
     /// Panics if `new_n_features < self.n_features()` (shrinking is not supported).
     /// A call with the current feature count is a no-op.
     pub fn grow_features(&mut self, new_n_features: usize) {
+        self.reset_literal_index();
         assert!(
             new_n_features >= self.n_features,
             "grow_features cannot shrink: {} -> {new_n_features}",
@@ -603,12 +622,31 @@ impl TsetlinMachine {
 
     /// Internal: predict from a raw literal slice without allocation.
     #[inline]
+    /// Every clause's output (`class * clauses_per_class + clause`) for packed
+    /// literals, from the literal → clause map.
+    fn clause_outputs_predict(&self, lit: &[u64]) -> Vec<bool> {
+        self.literal_index
+            .get_or_init(|| {
+                LiteralIndex::build(
+                    &self.include,
+                    &self.valid,
+                    self.n_classes * self.clauses_per_class,
+                    self.words,
+                )
+            })
+            .clause_outputs(lit)
+    }
+
+    /// Drop the inference map; called by every method that can change the
+    /// include bitsets or the valid mask.
+    fn reset_literal_index(&mut self) {
+        self.literal_index = std::sync::OnceLock::new();
+    }
+
     fn predict_lit(&self, lit: &[u64]) -> usize {
         debug_assert_eq!(lit.len(), self.words);
         let cps = self.clauses_per_class;
-        let words = self.words;
-        let include = self.include.as_slice();
-        let valid = self.valid.as_slice();
+        let fires = self.clause_outputs_predict(lit);
         let mut best = 0usize;
         let mut best_score = i32::MIN;
         for c in 0..self.n_classes {
@@ -616,7 +654,7 @@ impl TsetlinMachine {
             let mut sum = 0i32;
             for (j, &w) in cw.iter().enumerate() {
                 let cj = c * cps + j;
-                if fire_predict(&include[cj * words..(cj + 1) * words], lit, valid, words) {
+                if fires[cj] {
                     if j & 1 == 0 {
                         sum += w;
                     } else {
@@ -644,15 +682,13 @@ impl TsetlinMachine {
         let lit = &sample.0;
         debug_assert_eq!(out.len(), self.n_classes);
         let cps = self.clauses_per_class;
-        let words = self.words;
-        let include = self.include.as_slice();
-        let valid = self.valid.as_slice();
+        let fires = self.clause_outputs_predict(lit);
         for (c, out_c) in out.iter_mut().enumerate() {
             let cw = &self.weights[c * cps..(c + 1) * cps];
             let mut sum = 0i32;
             for (j, &w) in cw.iter().enumerate() {
                 let cj = c * cps + j;
-                if fire_predict(&include[cj * words..(cj + 1) * words], lit, valid, words) {
+                if fires[cj] {
                     if j & 1 == 0 {
                         sum += w;
                     } else {
@@ -668,19 +704,8 @@ impl TsetlinMachine {
     pub fn fired_clauses(&self, sample: &EncodedSample, class: usize) -> Vec<usize> {
         let lit = &sample.0;
         let cps = self.clauses_per_class;
-        let words = self.words;
-        let include = self.include.as_slice();
-        let valid = self.valid.as_slice();
-        (0..cps)
-            .filter(|&j| {
-                fire_predict(
-                    &include[(class * cps + j) * words..(class * cps + j + 1) * words],
-                    lit,
-                    valid,
-                    words,
-                )
-            })
-            .collect()
+        let fires = self.clause_outputs_predict(lit);
+        (0..cps).filter(|&j| fires[class * cps + j]).collect()
     }
 
     /// Predict classes for all samples in an encoded batch, returning one class index per sample.
@@ -994,6 +1019,7 @@ impl TsetlinMachine {
 
     /// Train on a single encoded sample with true label `y`.
     pub fn fit_one(&mut self, sample: &EncodedSample, y: usize) {
+        self.reset_literal_index();
         self.fit_one_lit(&sample.0, y);
     }
 
@@ -1008,6 +1034,7 @@ impl TsetlinMachine {
     /// When training a large model on the exact path without the flag, a one-time
     /// hint is printed to stderr suggesting `data_parallel(true)`.
     pub fn fit_epoch(&mut self, batch: &EncodedBatch, ys: &[usize]) {
+        self.reset_literal_index();
         debug_assert_eq!(batch.words, self.words);
         let n = batch.n;
         assert_eq!(n, ys.len());
@@ -1674,6 +1701,59 @@ mod tests {
             1,
             "x[3]=0: negated bit should be set"
         );
+    }
+
+    /// The literal → clause map gives every clause's `fire_predict` output,
+    /// and is rebuilt after anything that changes the clauses: more training,
+    /// a grown vocabulary, a saved and loaded model.
+    #[test]
+    fn literal_index_tracks_the_clauses() {
+        let full_scan = |tm: &TsetlinMachine, lit: &[u64]| -> Vec<bool> {
+            let w = tm.words;
+            (0..tm.n_classes * tm.clauses_per_class)
+                .map(|cj| fire_predict(&tm.include[cj * w..(cj + 1) * w], lit, &tm.valid, w))
+                .collect()
+        };
+        let check = |tm: &TsetlinMachine, b: &EncodedBatch| {
+            for i in 0..b.n {
+                let lit = &b.data[i * b.words..(i + 1) * b.words];
+                assert_eq!(tm.clause_outputs_predict(lit), full_scan(tm, lit));
+            }
+        };
+        let (xtr, ytr) = make_xor(400, 0.0, 7);
+        let b = enc(12).encode_batch(&as_slices(&xtr));
+        let mut tm = TsetlinMachine::with_config(2, 12, 20, 10, 3.0, 8, true, 3);
+        check(&tm, &b);
+        for _ in 0..3 {
+            tm.fit_epoch(&b, &ytr);
+            check(&tm, &b);
+        }
+        tm.grow_features(20);
+        let wide: Vec<Vec<u8>> = xtr
+            .iter()
+            .map(|x| {
+                let mut v = x.clone();
+                v.resize(20, 1);
+                v
+            })
+            .collect();
+        let b20 = enc(20).encode_batch(&as_slices(&wide));
+        check(&tm, &b20);
+        tm.fit_epoch(&b20, &ytr);
+        check(&tm, &b20);
+
+        #[cfg(feature = "serde")]
+        {
+            let dir = std::env::temp_dir()
+                .join(format!("tmu-vanilla-literal-index-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("m.bin");
+            crate::serial::SaveLoad::save(&tm, &path).unwrap();
+            let back: TsetlinMachine = crate::serial::SaveLoad::load(&path).unwrap();
+            check(&back, &b20);
+            assert_eq!(back.predict_batch(&b20), tm.predict_batch(&b20));
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     // ---- fire_predict semantics ----------------------------------------------

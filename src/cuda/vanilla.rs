@@ -152,6 +152,7 @@ impl CudaTsetlinMachine {
         self.st
             .download(ta, include, weights, rngs, ind, cat, *type_iii)?;
         restore_rngs(class_rngs, &self.class_rngs.download()?);
+        m.literal_index = Default::default();
         Ok(m)
     }
 
