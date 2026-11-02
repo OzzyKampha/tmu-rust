@@ -3,6 +3,7 @@
 //! Mirrors TMU's `vanilla_classifier.py` / `TMClassifier`.
 
 use crate::clause_bank::dense::fresh_masks;
+use crate::clause_bank::dense::rule_from_include;
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::{DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN, use_parallel};
 use crate::clause_bank::dense::{
@@ -1249,20 +1250,9 @@ impl TsetlinMachine {
 
     /// Return the included literals for clause `clause` of `class` as `(feature_index, is_negated)` pairs.
     pub fn clause_rule(&self, class: usize, clause: usize) -> Vec<(usize, bool)> {
-        let mut rule = Vec::new();
         let cj = class * self.clauses_per_class + clause;
         let inc = &self.include[cj * self.words..(cj + 1) * self.words];
-        for l in 0..self.n_literals {
-            let included = (inc[l / WORD_BITS] >> (l % WORD_BITS)) & 1 != 0;
-            if included {
-                if l < self.n_features {
-                    rule.push((l, false));
-                } else {
-                    rule.push((l - self.n_features, true));
-                }
-            }
-        }
-        rule
+        rule_from_include(inc, self.n_literals, self.n_features)
     }
 
     /// Return `true` if `clause` is a positive clause (even index → votes for the class).

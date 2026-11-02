@@ -14,6 +14,7 @@
 
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::DENSE_TRAIN_PARALLEL_MIN;
+use crate::clause_bank::dense::rule_from_include;
 use crate::clause_bank::dense::{
     GOLDEN, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of, expand_bits_to_bytes,
     fire_predict, pack, rebuild_include, type_i_update_bytes, type_ii_update_bytes,
@@ -1041,17 +1042,7 @@ impl ConvolutionalTsetlinMachine {
         let patch_features = self.patch_rows * self.patch_cols;
         let cj = class * self.clauses_per_class + clause;
         let inc = &self.include[cj * self.words..(cj + 1) * self.words];
-        let mut rule = Vec::new();
-        for l in 0..self.n_literals {
-            if (inc[l / WORD_BITS] >> (l % WORD_BITS)) & 1 != 0 {
-                if l < patch_features {
-                    rule.push((l, false));
-                } else {
-                    rule.push((l - patch_features, true));
-                }
-            }
-        }
-        rule
+        rule_from_include(inc, self.n_literals, patch_features)
     }
 
     /// Return `true` if `clause` is a positive clause (even index within class).

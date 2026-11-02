@@ -4,6 +4,7 @@
 
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::DENSE_TRAIN_PARALLEL_MIN;
+use crate::clause_bank::dense::rule_from_include;
 use crate::clause_bank::dense::{
     GOLDEN, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of, expand_bits_to_bytes,
     fire_predict, rebuild_include, type_i_update_bytes, type_ii_update_bytes, type_iii_update,
@@ -619,17 +620,7 @@ impl TMRegressor {
     /// Return the included literals for clause `j` as `(feature_index, is_negated)` pairs.
     pub fn clause_rule(&self, clause: usize) -> Vec<(usize, bool)> {
         let inc = &self.include[clause * self.words..(clause + 1) * self.words];
-        let mut rule = Vec::new();
-        for l in 0..self.n_literals {
-            if (inc[l / WORD_BITS] >> (l % WORD_BITS)) & 1 != 0 {
-                if l < self.n_features {
-                    rule.push((l, false));
-                } else {
-                    rule.push((l - self.n_features, true));
-                }
-            }
-        }
-        rule
+        rule_from_include(inc, self.n_literals, self.n_features)
     }
 
     /// Return `true` if clause `j` is a positive clause (even index).

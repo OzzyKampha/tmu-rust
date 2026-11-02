@@ -137,6 +137,34 @@ pub(crate) fn expand_bits_to_bytes(bits: &[u64], n: usize) -> Vec<u8> {
 /// Empty clauses (no included literals) return `false`, matching TMU predict semantics.
 /// Use [`clause_fire`] during training where empty clauses must return `true`.
 #[inline(always)]
+/// A clause's included literals from its include bitset, in literal order:
+/// `(feature, false)` for a literal on a feature, `(feature, true)` for one on
+/// its negation (literals `n_features..n_literals`). Jumps from set bit to set
+/// bit, so the cost is the words plus the included literals, not every literal.
+pub(crate) fn rule_from_include(
+    inc: &[u64],
+    n_literals: usize,
+    n_features: usize,
+) -> Vec<(usize, bool)> {
+    let mut rule = Vec::new();
+    for (w, &word) in inc.iter().enumerate() {
+        let mut bits = word;
+        while bits != 0 {
+            let l = w * WORD_BITS + bits.trailing_zeros() as usize;
+            if l >= n_literals {
+                break;
+            }
+            rule.push(if l < n_features {
+                (l, false)
+            } else {
+                (l - n_features, true)
+            });
+            bits &= bits - 1;
+        }
+    }
+    rule
+}
+
 pub(crate) fn fire_predict(inc: &[u64], lit: &[u64], valid: &[u64], words: usize) -> bool {
     let mut violation = 0u64;
     let mut included = 0u64;
@@ -1562,6 +1590,36 @@ pub(crate) fn type_iii_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rule_from_include_matches_a_literal_by_literal_scan() {
+        let mut rng = Rng::new(7);
+        for n_features in [1, 5, 31, 32, 33, 64, 100, 1000] {
+            let n_literals = 2 * n_features;
+            let words = words_for(n_literals);
+            for density in [0u64, 3, 60] {
+                // Random words, stray bits past n_literals included.
+                let inc: Vec<u64> = (0..words)
+                    .map(|_| {
+                        (0..64).fold(0u64, |w, b| {
+                            w | (u64::from(rng.next_u64() % 64 < density) << b)
+                        })
+                    })
+                    .collect();
+                let mut want = Vec::new();
+                for l in 0..n_literals {
+                    if (inc[l / WORD_BITS] >> (l % WORD_BITS)) & 1 != 0 {
+                        want.push(if l < n_features {
+                            (l, false)
+                        } else {
+                            (l - n_features, true)
+                        });
+                    }
+                }
+                assert_eq!(rule_from_include(&inc, n_literals, n_features), want);
+            }
+        }
+    }
 
     // ---- parallel_by_work -----------------------------------------------------
 

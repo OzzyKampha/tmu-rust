@@ -2,6 +2,7 @@
 //!
 //! Mirrors TMU's `vanilla_autoencoder.py` / `TMAutoEncoder`.
 
+use crate::clause_bank::dense::rule_from_include;
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::{DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN, use_parallel};
 use crate::clause_bank::dense::{
@@ -775,19 +776,9 @@ impl TMAutoEncoder {
 
     /// Included literals for clause `clause` of output `output` as `(feature_index, is_negated)`.
     pub fn clause_rule(&self, output: usize, clause: usize) -> Vec<(usize, bool)> {
-        let mut rule = Vec::new();
         let cj = output * self.clauses_per_output + clause;
         let inc = &self.include[cj * self.words..(cj + 1) * self.words];
-        for l in 0..self.n_literals {
-            if (inc[l / WORD_BITS] >> (l % WORD_BITS)) & 1 != 0 {
-                if l < self.n_features {
-                    rule.push((l, false));
-                } else {
-                    rule.push((l - self.n_features, true));
-                }
-            }
-        }
-        rule
+        rule_from_include(inc, self.n_literals, self.n_features)
     }
 
     /// Returns `true` if `clause` is a positive clause (even index — votes for output bit = 1).

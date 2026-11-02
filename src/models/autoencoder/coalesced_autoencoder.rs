@@ -4,6 +4,7 @@
 //! bit position via signed per-output weights, mirroring the coalesced architecture
 //! from [`crate::CoalescedTsetlinMachine`].
 
+use crate::clause_bank::dense::rule_from_include;
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::{DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN, use_parallel};
 use crate::clause_bank::dense::{
@@ -837,18 +838,8 @@ impl TMCoalescedAutoEncoder {
 
     /// Included literals for shared clause `clause` as `(feature_index, is_negated)`.
     pub fn clause_rule(&self, clause: usize) -> Vec<(usize, bool)> {
-        let mut rule = Vec::new();
         let inc = &self.include[clause * self.words..(clause + 1) * self.words];
-        for l in 0..self.n_literals {
-            if (inc[l / WORD_BITS] >> (l % WORD_BITS)) & 1 != 0 {
-                if l < self.n_features {
-                    rule.push((l, false));
-                } else {
-                    rule.push((l - self.n_features, true));
-                }
-            }
-        }
-        rule
+        rule_from_include(inc, self.n_literals, self.n_features)
     }
 }
 
