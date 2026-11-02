@@ -131,12 +131,6 @@ pub(crate) fn expand_bits_to_bytes(bits: &[u64], n: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Returns `true` if a clause fires for inference (no included literal is violated).
-///
-/// `inc` is the clause include bitset (`words` u64s, 1 bit per literal).
-/// Empty clauses (no included literals) return `false`, matching TMU predict semantics.
-/// Use [`clause_fire`] during training where empty clauses must return `true`.
-#[inline(always)]
 /// A clause's included literals from its include bitset, in literal order:
 /// `(feature, false)` for a literal on a feature, `(feature, true)` for one on
 /// its negation (literals `n_features..n_literals`). Jumps from set bit to set
@@ -165,6 +159,12 @@ pub(crate) fn rule_from_include(
     rule
 }
 
+/// Returns `true` if a clause fires for inference (no included literal is violated).
+///
+/// `inc` is the clause include bitset (`words` u64s, 1 bit per literal).
+/// Empty clauses (no included literals) return `false`, matching TMU predict semantics.
+/// Use [`clause_fire`] during training where empty clauses must return `true`.
+#[inline(always)]
 pub(crate) fn fire_predict(inc: &[u64], lit: &[u64], valid: &[u64], words: usize) -> bool {
     let mut violation = 0u64;
     let mut included = 0u64;
@@ -1590,6 +1590,32 @@ pub(crate) fn type_iii_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fire_predict_matches_a_full_scan() {
+        let mut rng = Rng::new(11);
+        let mut bits = |density: u64| -> u64 {
+            (0..64).fold(0u64, |w, b| {
+                w | (u64::from(rng.next_u64() % 64 < density) << b)
+            })
+        };
+        for words in [1usize, 7, 8, 9, 16, 17, 375] {
+            for _ in 0..200 {
+                let inc: Vec<u64> = (0..words).map(|_| bits(1)).collect();
+                // Mostly-set literals and validity, so some clauses fire.
+                let lit: Vec<u64> = (0..words).map(|_| !bits(1)).collect();
+                let valid: Vec<u64> = (0..words).map(|_| !bits(2)).collect();
+                let mut violation = 0u64;
+                let mut included = 0u64;
+                for k in 0..words {
+                    violation |= inc[k] & valid[k] & !lit[k];
+                    included |= inc[k] & valid[k];
+                }
+                let want = violation == 0 && included != 0;
+                assert_eq!(fire_predict(&inc, &lit, &valid, words), want);
+            }
+        }
+    }
 
     #[test]
     fn rule_from_include_matches_a_literal_by_literal_scan() {
