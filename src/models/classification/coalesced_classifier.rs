@@ -23,9 +23,9 @@ use crate::clause_bank::dense::rule_from_include;
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::{DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN, use_parallel};
 use crate::clause_bank::dense::{
-    GOLDEN, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of, expand_bits_to_bytes,
-    fire_predict, grow_dense_state, rebuild_include, type_i_update_bytes, type_ii_update_bytes,
-    type_iii_update, words_for,
+    GOLDEN, LiteralIndex, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of,
+    expand_bits_to_bytes, grow_dense_state, rebuild_include, type_i_update_bytes,
+    type_ii_update_bytes, type_iii_update, words_for,
 };
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
@@ -97,6 +97,11 @@ pub struct CoalescedTsetlinMachine {
     /// Include bitset for the shared bank.  Clause `j` occupies
     /// `include[j * words .. (j+1) * words]`.  Kept in sync with `ta`.
     pub(crate) include: Vec<u64>,
+    /// Inference map from literals to the clauses that include them, built on
+    /// first prediction and dropped by every `&mut self`/`mut self` method, so
+    /// it never outlives the include bitsets it was built from.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) literal_index: std::sync::OnceLock<LiteralIndex>,
     /// Inclusion threshold: `ta[l] >= half` → literal l is included.
     pub(crate) half: u8,
     /// Maximum TA counter value: `(1 << state_bits) - 1`.
@@ -361,6 +366,7 @@ impl CoalescedTsetlinMachine {
         let literal_rng = Rng::new(seed ^ 0x4C49_5445_5241_4C21u64);
 
         CoalescedTsetlinMachine {
+            literal_index: Default::default(),
             n_classes,
             n_features,
             n_literals,
@@ -410,6 +416,7 @@ impl CoalescedTsetlinMachine {
     /// leave it off (default) for exact, reproducible training. No effect without
     /// `--features parallel` or on small models. Unsupported with Type III.
     pub fn data_parallel(mut self, on: bool) -> Self {
+        self.reset_literal_index();
         self.data_parallel = on;
         self
     }
@@ -419,12 +426,14 @@ impl CoalescedTsetlinMachine {
     /// Limit how many literals each clause may include (Type Ia guard).
     /// Mirrors TMU's `max_included_literals` (default: no limit).
     pub fn max_included_literals(mut self, max: usize) -> Self {
+        self.reset_literal_index();
         self.max_included_literals = max;
         self
     }
 
     /// Per-clause dropout probability during training (default: 0.0 = no drop).
     pub fn clause_drop_p(mut self, p: f64) -> Self {
+        self.reset_literal_index();
         assert!((0.0..1.0).contains(&p), "clause_drop_p must be in [0, 1)");
         self.clause_drop_p = p;
         self
@@ -432,6 +441,7 @@ impl CoalescedTsetlinMachine {
 
     /// Per-literal dropout probability during training (default: 0.0 = no drop).
     pub fn literal_drop_p(mut self, p: f64) -> Self {
+        self.reset_literal_index();
         assert!((0.0..1.0).contains(&p), "literal_drop_p must be in [0, 1)");
         self.literal_drop_p = p;
         self.dig_lit_active = digits_of(1.0 - p, MASK_BITS);
@@ -442,6 +452,7 @@ impl CoalescedTsetlinMachine {
     /// precision of the Type III indicator automata, 2..=8 bits. Resets the
     /// indicators: set it before training.
     pub fn number_of_state_bits_ind(mut self, bits: u8) -> Self {
+        self.reset_literal_index();
         assert!(
             (2..=8).contains(&bits),
             "number_of_state_bits_ind must be in 2..=8"
@@ -457,6 +468,7 @@ impl CoalescedTsetlinMachine {
     /// its own Type I feedback masks — slower, and closer to TMU's default.
     /// CPU only: `to_cuda` refuses a model with it off.
     pub fn reuse_random_feedback(mut self, on: bool) -> Self {
+        self.reset_literal_index();
         self.reuse_random_feedback = on;
         self
     }
@@ -472,6 +484,7 @@ impl CoalescedTsetlinMachine {
 
     /// Enable Type III feedback with indicator strength `d` (must be > 1.0).
     pub fn type_iii_feedback(mut self, d: f64) -> Self {
+        self.reset_literal_index();
         assert!(d > 1.0, "d must be > 1.0");
         self.d = d;
         self.type_iii = true;
@@ -482,6 +495,7 @@ impl CoalescedTsetlinMachine {
     /// negated literal ("feature absent"): every literal in a learned rule is
     /// something the input has. Kept across `grow_features` and save/load.
     pub fn feature_negation(mut self, on: bool) -> Self {
+        self.reset_literal_index();
         if on {
             for l in self.n_features..2 * self.n_features {
                 self.valid[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
@@ -501,6 +515,7 @@ impl CoalescedTsetlinMachine {
     /// literal feedback rarer by `1/ratio`, below 1 makes Type I rarer by
     /// `ratio`. Weight steps are not scaled, as in TMU.
     pub fn type_i_ii_ratio(mut self, ratio: f64) -> Self {
+        self.reset_literal_index();
         assert!(ratio > 0.0, "type_i_ii_ratio must be > 0");
         (self.type_i_p, self.type_ii_p) = crate::clause_bank::dense::type_i_ii_factors(ratio);
         self
@@ -511,6 +526,7 @@ impl CoalescedTsetlinMachine {
     /// class order, and repeats; examples of a class already collected in the
     /// current round are skipped. Every class gets the same number of updates.
     pub fn output_balancing(mut self, on: bool) -> Self {
+        self.reset_literal_index();
         self.output_balancing = on;
         self
     }
@@ -519,6 +535,7 @@ impl CoalescedTsetlinMachine {
     /// weights are only incremented while fewer than `max` of them are >= 0, so
     /// at most about `max` clauses come to vote for a class.
     pub fn max_positive_clauses(mut self, max: usize) -> Self {
+        self.reset_literal_index();
         assert!(max >= 1, "max_positive_clauses must be >= 1");
         self.max_positive_clauses = max;
         self
@@ -531,6 +548,7 @@ impl CoalescedTsetlinMachine {
     /// focusing learning on the most confusable wrong classes.  Mirrors TMU's
     /// `focused_negative_sampling`.
     pub fn focused_negative_sampling(mut self, enabled: bool) -> Self {
+        self.reset_literal_index();
         self.focused_negative_sampling = enabled;
         self
     }
@@ -587,6 +605,7 @@ impl CoalescedTsetlinMachine {
     /// Panics if `new_n_features < self.n_features()` (shrinking is not supported).
     /// A call with the current feature count is a no-op.
     pub fn grow_features(&mut self, new_n_features: usize) {
+        self.reset_literal_index();
         let negation = crate::clause_bank::dense::has_negated(&self.valid, self.n_features);
         assert!(
             new_n_features >= self.n_features,
@@ -623,12 +642,17 @@ impl CoalescedTsetlinMachine {
     /// Compute the firing state of every shared clause for `lit` (inference semantics).
     #[inline]
     fn clause_outputs_predict(&self, lit: &[u64]) -> Vec<bool> {
-        let words = self.words;
-        let include = self.include.as_slice();
-        let valid = self.valid.as_slice();
-        (0..self.n_clauses)
-            .map(|j| fire_predict(&include[j * words..(j + 1) * words], lit, valid, words))
-            .collect()
+        self.literal_index
+            .get_or_init(|| {
+                LiteralIndex::build(&self.include, &self.valid, self.n_clauses, self.words)
+            })
+            .clause_outputs(lit)
+    }
+
+    /// Drop the inference map; called by every method that can change the
+    /// include bitsets or the valid mask.
+    fn reset_literal_index(&mut self) {
+        self.literal_index = std::sync::OnceLock::new();
     }
 
     /// Internal: predict from a raw literal slice without allocation beyond clause outputs.
@@ -1075,6 +1099,7 @@ impl CoalescedTsetlinMachine {
 
     /// Train on a single encoded sample with true label `y`.
     pub fn fit_one(&mut self, sample: &EncodedSample, y: usize) {
+        self.reset_literal_index();
         self.fit_one_lit(&sample.0, y);
     }
 
@@ -1085,6 +1110,7 @@ impl CoalescedTsetlinMachine {
     /// enough (requires `--features parallel`). Prints a one-time hint when a large
     /// model is trained exactly without the flag.
     pub fn fit_epoch(&mut self, batch: &EncodedBatch, ys: &[usize]) {
+        self.reset_literal_index();
         debug_assert_eq!(batch.words, self.words);
         let n = batch.n;
         assert_eq!(n, ys.len());
@@ -1516,6 +1542,68 @@ mod tests {
             tm_focused.accuracy(&bte, &yte) > 0.85,
             "focused should converge"
         );
+    }
+
+    /// The literal → clause map gives every clause's `fire_predict` output,
+    /// and is rebuilt after anything that changes the clauses: more training,
+    /// a grown vocabulary, a saved and loaded model.
+    #[test]
+    fn literal_index_tracks_the_clauses() {
+        let full_scan = |tm: &CoalescedTsetlinMachine, lit: &[u64]| -> Vec<bool> {
+            let w = tm.words;
+            (0..tm.n_clauses)
+                .map(|j| {
+                    crate::clause_bank::dense::fire_predict(
+                        &tm.include[j * w..(j + 1) * w],
+                        lit,
+                        &tm.valid,
+                        w,
+                    )
+                })
+                .collect()
+        };
+        let check = |tm: &CoalescedTsetlinMachine, b: &EncodedBatch| {
+            for i in 0..b.n {
+                let lit = &b.data[i * b.words..(i + 1) * b.words];
+                assert_eq!(tm.clause_outputs_predict(lit), full_scan(tm, lit));
+            }
+        };
+        let (xtr, ytr) = make_xor(400, 0.0, 7);
+        let e = enc(12);
+        let b = e.encode_batch(&as_slices(&xtr));
+        let mut tm = CoalescedTsetlinMachine::with_config(2, 12, 40, 10, 3.0, 8, true, 3);
+        check(&tm, &b);
+        for _ in 0..3 {
+            tm.fit_epoch(&b, &ytr);
+            check(&tm, &b);
+        }
+
+        tm.grow_features(20);
+        let wide: Vec<Vec<u8>> = xtr
+            .iter()
+            .map(|x| {
+                let mut v = x.clone();
+                v.resize(20, 1);
+                v
+            })
+            .collect();
+        let b20 = enc(20).encode_batch(&as_slices(&wide));
+        check(&tm, &b20);
+        tm.fit_epoch(&b20, &ytr);
+        check(&tm, &b20);
+
+        #[cfg(feature = "serde")]
+        {
+            let dir =
+                std::env::temp_dir().join(format!("tmu-literal-index-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("m.bin");
+            crate::serial::SaveLoad::save(&tm, &path).unwrap();
+            let back: CoalescedTsetlinMachine = crate::serial::SaveLoad::load(&path).unwrap();
+            check(&back, &b20);
+            assert_eq!(back.predict_batch(&b20), tm.predict_batch(&b20));
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[test]

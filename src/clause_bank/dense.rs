@@ -131,12 +131,6 @@ pub(crate) fn expand_bits_to_bytes(bits: &[u64], n: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Returns `true` if a clause fires for inference (no included literal is violated).
-///
-/// `inc` is the clause include bitset (`words` u64s, 1 bit per literal).
-/// Empty clauses (no included literals) return `false`, matching TMU predict semantics.
-/// Use [`clause_fire`] during training where empty clauses must return `true`.
-#[inline(always)]
 /// A clause's included literals from its include bitset, in literal order:
 /// `(feature, false)` for a literal on a feature, `(feature, true)` for one on
 /// its negation (literals `n_features..n_literals`). Jumps from set bit to set
@@ -165,6 +159,92 @@ pub(crate) fn rule_from_include(
     rule
 }
 
+/// TMU's literal → clause map (`literal_clause_map` in `ClauseBank.c`) for
+/// inference: for each literal, the clauses that include it. A clause fires
+/// when it includes at least one literal and none of them is false, so a
+/// sample's clause outputs come from its false literals and the clauses that
+/// use them, not from every clause's whole include bitset. Exactly the result
+/// of [`fire_predict`] on every clause. TMU updates per-clause counters from
+/// the literals that changed since the previous sample; this works out each
+/// sample on its own, so one map serves many threads at once.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LiteralIndex {
+    /// `clauses[start[l]..start[l + 1]]` include literal `l`.
+    start: Vec<u32>,
+    clauses: Vec<u32>,
+    /// Literals some clause includes.
+    used: Vec<u64>,
+    /// Clauses that include at least one (valid) literal.
+    nonempty: Vec<bool>,
+}
+
+impl LiteralIndex {
+    /// Build from include bitsets (`words` per clause) masked by `valid`.
+    pub(crate) fn build(include: &[u64], valid: &[u64], n_clauses: usize, words: usize) -> Self {
+        let n_bits = words * WORD_BITS;
+        let mut count = vec![0u32; n_bits + 1];
+        let mut used = vec![0u64; words];
+        let mut nonempty = vec![false; n_clauses];
+        for j in 0..n_clauses {
+            for k in 0..words {
+                let mut bits = include[j * words + k] & valid[k];
+                used[k] |= bits;
+                nonempty[j] |= bits != 0;
+                while bits != 0 {
+                    count[k * WORD_BITS + bits.trailing_zeros() as usize + 1] += 1;
+                    bits &= bits - 1;
+                }
+            }
+        }
+        for l in 0..n_bits {
+            count[l + 1] += count[l];
+        }
+        let start = count;
+        let mut fill = start.clone();
+        let mut clauses = vec![0u32; start[n_bits] as usize];
+        for j in 0..n_clauses {
+            for k in 0..words {
+                let mut bits = include[j * words + k] & valid[k];
+                while bits != 0 {
+                    let l = k * WORD_BITS + bits.trailing_zeros() as usize;
+                    clauses[fill[l] as usize] = j as u32;
+                    fill[l] += 1;
+                    bits &= bits - 1;
+                }
+            }
+        }
+        LiteralIndex {
+            start,
+            clauses,
+            used,
+            nonempty,
+        }
+    }
+
+    /// Clause outputs for packed literals `lit`: what [`fire_predict`] gives
+    /// for each clause.
+    pub(crate) fn clause_outputs(&self, lit: &[u64]) -> Vec<bool> {
+        let mut out = self.nonempty.clone();
+        for (k, (&used, &lit)) in self.used.iter().zip(lit).enumerate() {
+            let mut false_used = used & !lit;
+            while false_used != 0 {
+                let l = k * WORD_BITS + false_used.trailing_zeros() as usize;
+                for &j in &self.clauses[self.start[l] as usize..self.start[l + 1] as usize] {
+                    out[j as usize] = false;
+                }
+                false_used &= false_used - 1;
+            }
+        }
+        out
+    }
+}
+
+/// Returns `true` if a clause fires for inference (no included literal is violated).
+///
+/// `inc` is the clause include bitset (`words` u64s, 1 bit per literal).
+/// Empty clauses (no included literals) return `false`, matching TMU predict semantics.
+/// Use [`clause_fire`] during training where empty clauses must return `true`.
+#[inline(always)]
 pub(crate) fn fire_predict(inc: &[u64], lit: &[u64], valid: &[u64], words: usize) -> bool {
     let mut violation = 0u64;
     let mut included = 0u64;
@@ -1590,6 +1670,61 @@ pub(crate) fn type_iii_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn literal_index_matches_fire_predict() {
+        let mut rng = Rng::new(23);
+        let mut bits = |density: u64| -> u64 {
+            (0..64).fold(0u64, |w, b| {
+                w | (u64::from(rng.next_u64() % 64 < density) << b)
+            })
+        };
+        for (n_clauses, words) in [(1usize, 1usize), (10, 3), (100, 9), (64, 375)] {
+            for _ in 0..20 {
+                // Sparse clauses, some empty; literals mostly true.
+                let include: Vec<u64> = (0..n_clauses * words)
+                    .map(|i| if i % 7 == 0 { 0 } else { bits(1) })
+                    .collect();
+                let valid: Vec<u64> = (0..words).map(|_| !bits(2)).collect();
+                let index = LiteralIndex::build(&include, &valid, n_clauses, words);
+                for _ in 0..10 {
+                    let lit: Vec<u64> = (0..words).map(|_| !bits(1)).collect();
+                    let want: Vec<bool> = (0..n_clauses)
+                        .map(|j| {
+                            fire_predict(&include[j * words..(j + 1) * words], &lit, &valid, words)
+                        })
+                        .collect();
+                    assert_eq!(index.clause_outputs(&lit), want);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fire_predict_matches_a_full_scan() {
+        let mut rng = Rng::new(11);
+        let mut bits = |density: u64| -> u64 {
+            (0..64).fold(0u64, |w, b| {
+                w | (u64::from(rng.next_u64() % 64 < density) << b)
+            })
+        };
+        for words in [1usize, 7, 8, 9, 16, 17, 375] {
+            for _ in 0..200 {
+                let inc: Vec<u64> = (0..words).map(|_| bits(1)).collect();
+                // Mostly-set literals and validity, so some clauses fire.
+                let lit: Vec<u64> = (0..words).map(|_| !bits(1)).collect();
+                let valid: Vec<u64> = (0..words).map(|_| !bits(2)).collect();
+                let mut violation = 0u64;
+                let mut included = 0u64;
+                for k in 0..words {
+                    violation |= inc[k] & valid[k] & !lit[k];
+                    included |= inc[k] & valid[k];
+                }
+                let want = violation == 0 && included != 0;
+                assert_eq!(fire_predict(&inc, &lit, &valid, words), want);
+            }
+        }
+    }
 
     #[test]
     fn rule_from_include_matches_a_literal_by_literal_scan() {

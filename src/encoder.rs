@@ -393,7 +393,13 @@ impl Encoder {
                 // Looked up rather than assumed last: extend_categorical appends
                 // new tokens after the "<OOV>" sentinel.
                 let oov_idx = *vocab.get("<OOV>").expect("categorical vocab missing <OOV>");
-                let mut bin = vec![0u8; self.n_features];
+                // Every feature starts absent: positive literal bits clear,
+                // negated literal bits (n_features..2*n_features) set. Each
+                // token then flips its feature's pair, the layout `pack` writes,
+                // without touching every feature.
+                let nf = self.n_features;
+                let mut out = vec![0u64; self.words];
+                set_bit_range(&mut out, nf, 2 * nf);
                 for &token in tokens {
                     let idx = if let Some(&i) = vocab.get(token) {
                         i
@@ -406,10 +412,10 @@ impl Encoder {
                     } else {
                         oov_idx
                     };
-                    bin[idx] = 1;
+                    out[idx / 64] |= 1 << (idx % 64);
+                    let neg = nf + idx;
+                    out[neg / 64] &= !(1 << (neg % 64));
                 }
-                let mut out = vec![0u64; self.words];
-                pack(&bin, self.n_features, &mut out);
                 EncodedSample(out)
             }
             _ => panic!("encode_one_categorical requires a categorical encoder"),
@@ -477,6 +483,18 @@ impl Encoder {
     }
 }
 
+/// Set bits `from..to` of a packed bit array, a whole word at a time.
+fn set_bit_range(bits: &mut [u64], from: usize, to: usize) {
+    let mut j = from;
+    while j < to {
+        let (w, b) = (j / 64, j % 64);
+        let n = (64 - b).min(to - j);
+        let mask = if n == 64 { !0 } else { ((1u64 << n) - 1) << b };
+        bits[w] |= mask;
+        j += n;
+    }
+}
+
 #[cfg(test)]
 mod grow_tests {
     use super::*;
@@ -491,6 +509,60 @@ mod grow_tests {
         let s2: Vec<&str> = vec!["proc::powershell.exe", "user::bob"];
         let train: Vec<&[&str]> = vec![s1.as_slice(), s2.as_slice()];
         Encoder::fit_categorical(&train)
+    }
+
+    /// Setting each token's bits directly matches the byte-vector-then-`pack`
+    /// encoding: known tokens, unseen values of a known column, unknown
+    /// columns, duplicates, and vocabularies that end mid-word.
+    #[test]
+    fn encode_one_categorical_matches_pack() {
+        for n_tokens in [1usize, 30, 63, 64, 65, 200] {
+            let names: Vec<String> = (0..n_tokens).map(|i| format!("c{}::v{i}", i % 7)).collect();
+            let rows: Vec<Vec<&str>> = names
+                .chunks(3)
+                .map(|c| c.iter().map(String::as_str).collect())
+                .collect();
+            let rows: Vec<&[&str]> = rows.iter().map(Vec::as_slice).collect();
+            let enc = Encoder::fit_categorical(&rows);
+            let EncoderKind::Categorical {
+                vocab,
+                known_columns,
+                ..
+            } = &enc.kind
+            else {
+                unreachable!()
+            };
+            let oov = vocab["<OOV>"];
+            let samples: [&[&str]; 4] = [
+                &[],
+                &[
+                    names[0].as_str(),
+                    names[n_tokens - 1].as_str(),
+                    names[0].as_str(),
+                ],
+                &["c3::never-seen", "zz::nope"],
+                &["c1::other", names[n_tokens / 2].as_str(), "plain"],
+            ];
+            for toks in samples {
+                let mut bin = vec![0u8; enc.n_features];
+                for t in toks {
+                    let idx = vocab.get(*t).copied().unwrap_or_else(|| {
+                        t.split("::")
+                            .next()
+                            .and_then(|c| known_columns.get(c).copied())
+                            .unwrap_or(oov)
+                    });
+                    bin[idx] = 1;
+                }
+                let mut want = vec![0u64; enc.words];
+                pack(&bin, enc.n_features, &mut want);
+                assert_eq!(
+                    enc.encode_one_categorical(toks).0,
+                    want,
+                    "{n_tokens} {toks:?}"
+                );
+            }
+        }
     }
 
     #[test]
