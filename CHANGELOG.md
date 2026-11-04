@@ -6,6 +6,18 @@ All notable changes to tmu-rs are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Held-out autoencoder scoring:** `held_out_scores(&sample, &mut out)` and
+  `held_out_fired_clauses(&sample, output)` on `TMCoalescedAutoEncoder` and
+  `TMAutoEncoder`. Each output's vote is taken with that output's own feature
+  hidden, as training hides it; plain `reconstruct_scores` lets a clause look
+  at the bit it votes on and echo it back. Through the literal → clause map,
+  extended with each clause's single feature: a clause fires for output `o`
+  when all its false literals are on `o` and it has a literal on another
+  feature, so one pass gives every clause's verdict for every output. Tested
+  against removing each output's literals from every clause and evaluating
+  it (random banks with and without feature negation; trained models).
+
 ### Changed
 - **Autoencoder inference through TMU's literal → clause map**
   (`TMCoalescedAutoEncoder`, `TMAutoEncoder`), as the classifiers since #42:

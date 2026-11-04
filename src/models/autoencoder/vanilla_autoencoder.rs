@@ -8,7 +8,7 @@ use crate::clause_bank::dense::rule_from_include;
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::{DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN, use_parallel};
 use crate::clause_bank::dense::{
-    GOLDEN, LiteralIndex, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of,
+    GOLDEN, HeldOut, HeldOutIndex, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of,
     expand_bits_to_bytes, rebuild_include, type_i_update_bytes, type_ii_update_bytes,
     type_iii_update, words_for,
 };
@@ -53,7 +53,7 @@ pub struct TMAutoEncoder {
     /// `&mut self` / `mut self` method, so it never outlives the include
     /// bitsets it was built from.
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub(crate) literal_index: std::sync::OnceLock<LiteralIndex>,
+    pub(crate) literal_index: std::sync::OnceLock<HeldOutIndex>,
     pub(crate) half: u8,
     pub(crate) max_state: u8,
 
@@ -313,16 +313,63 @@ impl TMAutoEncoder {
     /// fire), through the literal → clause map: computed once per sample for
     /// all outputs' clauses.
     fn clause_outputs_predict(&self, lit: &[u64]) -> Vec<bool> {
-        self.literal_index
-            .get_or_init(|| {
-                LiteralIndex::build(
-                    &self.include,
-                    &self.valid,
-                    self.n_features * self.clauses_per_output,
-                    self.words,
-                )
+        self.index().map.clause_outputs(lit)
+    }
+
+    fn index(&self) -> &HeldOutIndex {
+        self.literal_index.get_or_init(|| {
+            HeldOutIndex::build(
+                &self.include,
+                &self.valid,
+                self.n_features * self.clauses_per_output,
+                self.words,
+                self.n_features,
+            )
+        })
+    }
+
+    /// Whether each clause votes on its own output with that output's feature
+    /// hidden (clause `o * clauses_per_output + j` votes on output `o`).
+    fn held_out_outputs(&self, lit: &[u64]) -> Vec<bool> {
+        let cpo = self.clauses_per_output;
+        self.index()
+            .classify(lit)
+            .into_iter()
+            .enumerate()
+            .map(|(cj, c)| {
+                let o = (cj / cpo) as u32;
+                match c {
+                    HeldOut::All => true,
+                    HeldOut::AllBut(f) => f != o,
+                    HeldOut::Only(f) => f == o,
+                    HeldOut::Never => false,
+                }
             })
-            .clause_outputs(lit)
+            .collect()
+    }
+
+    /// Like [`reconstruct_scores`](Self::reconstruct_scores), but each
+    /// output's vote is taken with that output's own feature hidden, as
+    /// training hides it. Training never updates literal `o` in output `o`'s
+    /// clauses, so it keeps its initial state there; plain reconstruction can
+    /// then echo bit `o` back. Hidden, the vote says how well the *rest* of the
+    /// sample predicts each bit.
+    pub fn held_out_scores(&self, sample: &EncodedSample, out: &mut [i32]) {
+        debug_assert_eq!(out.len(), self.n_features);
+        self.sums_of(&self.held_out_outputs(&sample.0), out);
+        let t = self.threshold;
+        out.iter_mut().for_each(|s| *s = (*s).clamp(-t, t));
+    }
+
+    /// The clauses (local to `output`) that vote on it with its own feature
+    /// hidden (see [`held_out_scores`](Self::held_out_scores)).
+    pub fn held_out_fired_clauses(&self, sample: &EncodedSample, output: usize) -> Vec<usize> {
+        let cpo = self.clauses_per_output;
+        self.held_out_outputs(&sample.0)[output * cpo..(output + 1) * cpo]
+            .iter()
+            .enumerate()
+            .filter_map(|(j, &f)| f.then_some(j))
+            .collect()
     }
 
     /// Drop the inference map; called by every method that can change the
@@ -1314,5 +1361,62 @@ mod tests {
         check(&ae, "after one epoch");
         ae.fit_epoch(&batch);
         check(&ae, "after more training");
+    }
+
+    #[test]
+    fn held_out_scores_hide_each_outputs_own_feature() {
+        let mut rng = Rng::new(9);
+        let xs: Vec<Vec<u8>> = (0..300)
+            .map(|_| {
+                (0..70)
+                    .map(|_| rng.next_u64().is_multiple_of(5) as u8)
+                    .collect()
+            })
+            .collect();
+        let e = enc(70);
+        let refs: Vec<&[u8]> = xs.iter().map(|v| v.as_slice()).collect();
+        let batch = e.encode_batch(&refs);
+        let mut ae = TMAutoEncoder::with_config(70, 4, 8, 3.0, 8, true, 3);
+        for round in 0..2 {
+            ae.fit_epoch(&batch);
+            let (cpo, w, nf) = (ae.clauses_per_output, ae.words, ae.n_features);
+            let mut got = vec![0i32; nf];
+            for x in xs.iter().take(30) {
+                let s = e.encode_one(x);
+                ae.held_out_scores(&s, &mut got);
+                for (o, &vote) in got.iter().enumerate() {
+                    let fired: Vec<usize> = (0..cpo)
+                        .filter(|&j| {
+                            crate::clause_bank::dense::fires_hidden(
+                                &ae.include,
+                                &ae.valid,
+                                w,
+                                nf,
+                                &s.0,
+                                o * cpo + j,
+                                o,
+                            )
+                        })
+                        .collect();
+                    let sum: i32 = fired
+                        .iter()
+                        .map(|&j| {
+                            let v = ae.weights[o * cpo + j];
+                            if j & 1 == 0 { v } else { -v }
+                        })
+                        .sum();
+                    assert_eq!(
+                        vote,
+                        sum.clamp(-ae.threshold, ae.threshold),
+                        "round {round}, output {o}"
+                    );
+                    assert_eq!(
+                        ae.held_out_fired_clauses(&s, o),
+                        fired,
+                        "round {round}, output {o}"
+                    );
+                }
+            }
+        }
     }
 }

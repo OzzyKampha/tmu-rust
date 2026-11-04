@@ -9,7 +9,7 @@ use crate::clause_bank::dense::rule_from_include;
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::{DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN, use_parallel};
 use crate::clause_bank::dense::{
-    GOLDEN, LiteralIndex, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of,
+    GOLDEN, HeldOut, HeldOutIndex, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of,
     expand_bits_to_bytes, rebuild_include, type_i_update_bytes, type_ii_update_bytes,
     type_iii_update, words_for,
 };
@@ -58,7 +58,7 @@ pub struct TMCoalescedAutoEncoder {
     /// `&mut self` / `mut self` method, so it never outlives the include
     /// bitsets it was built from.
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub(crate) literal_index: std::sync::OnceLock<LiteralIndex>,
+    pub(crate) literal_index: std::sync::OnceLock<InferenceIndex>,
     pub(crate) half: u8,
     pub(crate) max_state: u8,
 
@@ -96,6 +96,15 @@ pub struct TMCoalescedAutoEncoder {
     /// Rows combined into one [`Self::fit_examples`] example.
     #[cfg_attr(feature = "serde", serde(skip, default = "one_row"))]
     pub(crate) accumulation: usize,
+}
+
+/// What inference reads, built from the clause bank on first prediction: the
+/// literal → clause map (with each clause's single feature, for held-out
+/// scoring) and the weights clause-major (`weights_t[j * n_features + o]`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct InferenceIndex {
+    held: HeldOutIndex,
+    weights_t: Vec<i32>,
 }
 
 #[cfg(feature = "serde")]
@@ -414,14 +423,78 @@ impl TMCoalescedAutoEncoder {
     /// output does not depend on the output being voted on, so it is computed
     /// once per sample and shared by every output's vote.
     fn fired_predict(&self, lit: &[u64]) -> Vec<usize> {
-        self.literal_index
-            .get_or_init(|| {
-                LiteralIndex::build(&self.include, &self.valid, self.n_clauses, self.words)
-            })
+        self.index()
+            .held
+            .map
             .clause_outputs(lit)
             .into_iter()
             .enumerate()
             .filter_map(|(j, fires)| fires.then_some(j))
+            .collect()
+    }
+
+    fn index(&self) -> &InferenceIndex {
+        self.literal_index.get_or_init(|| {
+            let (nc, nf) = (self.n_clauses, self.n_features);
+            let mut weights_t = vec![0i32; nf * nc];
+            for o in 0..nf {
+                for j in 0..nc {
+                    weights_t[j * nf + o] = self.weights[o * nc + j];
+                }
+            }
+            InferenceIndex {
+                held: HeldOutIndex::build(&self.include, &self.valid, nc, self.words, nf),
+                weights_t,
+            }
+        })
+    }
+
+    /// Like [`reconstruct_scores`](Self::reconstruct_scores), but each
+    /// output's vote is taken with that output's own feature hidden (its two
+    /// literals left out of every clause), as training hides it.
+    ///
+    /// Plain reconstruction lets a clause look at the very bit it votes on: a
+    /// clause that other outputs taught to include literal `o` echoes bit `o`
+    /// back. Hidden, the vote says how well the *rest* of the sample predicts
+    /// each bit — what an anomaly score wants. One pass through the literal →
+    /// clause map gives every clause's verdict for every output.
+    pub fn held_out_scores(&self, sample: &EncodedSample, out: &mut [i32]) {
+        let nf = self.n_features;
+        debug_assert_eq!(out.len(), nf);
+        let index = self.index();
+        out.iter_mut().for_each(|s| *s = 0);
+        for (j, class) in index.held.classify(&sample.0).into_iter().enumerate() {
+            let row = &index.weights_t[j * nf..(j + 1) * nf];
+            match class {
+                HeldOut::All => out.iter_mut().zip(row).for_each(|(s, w)| *s += w),
+                HeldOut::AllBut(f) => {
+                    out.iter_mut().zip(row).for_each(|(s, w)| *s += w);
+                    out[f as usize] -= row[f as usize];
+                }
+                HeldOut::Only(f) => out[f as usize] += row[f as usize],
+                HeldOut::Never => {}
+            }
+        }
+        let t = self.threshold;
+        out.iter_mut().for_each(|s| *s = (*s).clamp(-t, t));
+    }
+
+    /// The shared clauses that vote on `output` with `output`'s own feature
+    /// hidden (see [`held_out_scores`](Self::held_out_scores)).
+    pub fn held_out_fired_clauses(&self, sample: &EncodedSample, output: usize) -> Vec<usize> {
+        let o = output as u32;
+        self.index()
+            .held
+            .classify(&sample.0)
+            .into_iter()
+            .enumerate()
+            .filter(|(_, c)| match *c {
+                HeldOut::All => true,
+                HeldOut::AllBut(f) => f != o,
+                HeldOut::Only(f) => f == o,
+                HeldOut::Never => false,
+            })
+            .map(|(j, _)| j)
             .collect()
     }
 
@@ -1470,5 +1543,84 @@ mod tests {
         back.reconstruct_scores(&s, &mut after);
         assert_eq!(before, after);
         assert_eq!(after, scores_by_scan(&back, &s));
+    }
+
+    #[test]
+    fn held_out_scores_hide_each_outputs_own_feature() {
+        let mut rng = Rng::new(9);
+        let xs: Vec<Vec<u8>> = (0..300)
+            .map(|_| {
+                (0..70)
+                    .map(|_| rng.next_u64().is_multiple_of(5) as u8)
+                    .collect()
+            })
+            .collect();
+        let e = enc(70);
+        let batch = e.encode_batch(&as_slices(&xs));
+        let mut ae = TMCoalescedAutoEncoder::with_config(70, 40, 8, 3.0, 8, true, 3);
+        for round in 0..2 {
+            ae.fit_epoch(&batch); // the second round must rebuild the index
+            let (nc, w, nf) = (ae.n_clauses, ae.words, ae.n_features);
+            let mut got = vec![0i32; nf];
+            for x in xs.iter().take(30) {
+                let s = e.encode_one(x);
+                ae.held_out_scores(&s, &mut got);
+                for (o, &vote) in got.iter().enumerate() {
+                    let fired: Vec<usize> = (0..nc)
+                        .filter(|&j| {
+                            crate::clause_bank::dense::fires_hidden(
+                                &ae.include,
+                                &ae.valid,
+                                w,
+                                nf,
+                                &s.0,
+                                j,
+                                o,
+                            )
+                        })
+                        .collect();
+                    let sum: i32 = fired.iter().map(|&j| ae.weights[o * nc + j]).sum();
+                    assert_eq!(
+                        vote,
+                        sum.clamp(-ae.threshold, ae.threshold),
+                        "round {round}, output {o}"
+                    );
+                    assert_eq!(
+                        ae.held_out_fired_clauses(&s, o),
+                        fired,
+                        "round {round}, output {o}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn held_out_scores_ignore_a_clause_on_the_hidden_bit_alone() {
+        // A clause including only literal 0 echoes bit 0 when reconstructing;
+        // held out, it is empty and says nothing about output 0.
+        let mut ae = TMCoalescedAutoEncoder::with_config(3, 1, 5, 3.0, 8, true, 1).start_excluded();
+        ae.ta[0] = ae.half;
+        let (n_lit, words, half) = (ae.n_literals, ae.words, ae.half);
+        let valid = ae.valid.clone();
+        rebuild_include(
+            &ae.ta[..n_lit],
+            &mut ae.include[..words],
+            &valid,
+            words,
+            n_lit,
+            half,
+        );
+        ae.weights[..3].copy_from_slice(&[3, 3, 3]);
+        ae.reset_literal_index();
+        let sample = enc(3).encode_one(&[1, 1, 0]);
+        let (mut plain, mut held) = (vec![0i32; 3], vec![0i32; 3]);
+        ae.reconstruct_scores(&sample, &mut plain);
+        ae.held_out_scores(&sample, &mut held);
+        assert_eq!(plain, vec![3, 3, 3]);
+        assert_eq!(held, vec![0, 3, 3]);
+        // Bit 0 off: the clause fails, except for output 0, where it is empty.
+        ae.held_out_scores(&enc(3).encode_one(&[0, 1, 0]), &mut held);
+        assert_eq!(held, vec![0, 0, 0]);
     }
 }
