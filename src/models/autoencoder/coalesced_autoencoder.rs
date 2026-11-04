@@ -98,6 +98,63 @@ pub struct TMCoalescedAutoEncoder {
     pub(crate) accumulation: usize,
 }
 
+/// One sample's held-out votes from a [`TMCoalescedAutoEncoder`]
+/// ([`TMCoalescedAutoEncoder::held_out_votes`]): each output's clamped vote
+/// with its own feature hidden, and the clauses behind each vote.
+#[derive(Clone, Debug)]
+pub struct HeldOutVotes<'a> {
+    ae: &'a TMCoalescedAutoEncoder,
+    classes: Vec<HeldOut>,
+    scores: Vec<i32>,
+}
+
+impl HeldOutVotes<'_> {
+    /// Each output's clamped held-out vote (`held_out_scores`).
+    pub fn scores(&self) -> &[i32] {
+        &self.scores
+    }
+
+    /// The shared clauses that vote on `output` with its feature hidden.
+    pub fn fired_clauses(&self, output: usize) -> Vec<usize> {
+        fired_for(&self.classes, output)
+    }
+
+    /// The clause with the strongest vote on `output` in one direction among
+    /// those voting on it, and its weight: the most negative weight when
+    /// `against`, else the most positive (the first such clause on ties).
+    /// `None` when no clause votes that way.
+    pub fn strongest_clause(&self, output: usize, against: bool) -> Option<(usize, i32)> {
+        let nc = self.ae.n_clauses;
+        let ws = &self.ae.weights[output * nc..(output + 1) * nc];
+        let mut best: Option<(usize, i32)> = None;
+        for j in self.fired_clauses(output) {
+            let w = ws[j];
+            let wanted = if against { w < 0 } else { w > 0 };
+            let better = |b: i32| if against { w < b } else { w > b };
+            if wanted && best.is_none_or(|(_, b)| better(b)) {
+                best = Some((j, w));
+            }
+        }
+        best
+    }
+}
+
+/// The clauses whose verdict lets them vote on `output`.
+fn fired_for(classes: &[HeldOut], output: usize) -> Vec<usize> {
+    let o = output as u32;
+    classes
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| match **c {
+            HeldOut::All => true,
+            HeldOut::AllBut(f) => f != o,
+            HeldOut::Only(f) => f == o,
+            HeldOut::Never => false,
+        })
+        .map(|(j, _)| j)
+        .collect()
+}
+
 /// What inference reads, built from the clause bank on first prediction: the
 /// literal → clause map (with each clause's single feature, for held-out
 /// scoring) and the weights clause-major (`weights_t[j * n_features + o]`).
@@ -459,43 +516,46 @@ impl TMCoalescedAutoEncoder {
     /// each bit — what an anomaly score wants. One pass through the literal →
     /// clause map gives every clause's verdict for every output.
     pub fn held_out_scores(&self, sample: &EncodedSample, out: &mut [i32]) {
+        debug_assert_eq!(out.len(), self.n_features);
+        out.copy_from_slice(self.held_out_votes(sample).scores());
+    }
+
+    /// The held-out votes for `sample` (as [`held_out_scores`](Self::held_out_scores)),
+    /// kept with every clause's verdict, so the clauses behind any output's vote
+    /// can be read without evaluating the clauses again: what an explanation of
+    /// several outputs needs.
+    pub fn held_out_votes(&self, sample: &EncodedSample) -> HeldOutVotes<'_> {
         let nf = self.n_features;
-        debug_assert_eq!(out.len(), nf);
         let index = self.index();
-        out.iter_mut().for_each(|s| *s = 0);
-        for (j, class) in index.held.classify(&sample.0).into_iter().enumerate() {
+        let classes = index.held.classify(&sample.0);
+        let mut scores = vec![0i32; nf];
+        for (j, &class) in classes.iter().enumerate() {
             let row = &index.weights_t[j * nf..(j + 1) * nf];
             match class {
-                HeldOut::All => out.iter_mut().zip(row).for_each(|(s, w)| *s += w),
+                HeldOut::All => scores.iter_mut().zip(row).for_each(|(s, w)| *s += w),
                 HeldOut::AllBut(f) => {
-                    out.iter_mut().zip(row).for_each(|(s, w)| *s += w);
-                    out[f as usize] -= row[f as usize];
+                    scores.iter_mut().zip(row).for_each(|(s, w)| *s += w);
+                    scores[f as usize] -= row[f as usize];
                 }
-                HeldOut::Only(f) => out[f as usize] += row[f as usize],
+                HeldOut::Only(f) => scores[f as usize] += row[f as usize],
                 HeldOut::Never => {}
             }
         }
         let t = self.threshold;
-        out.iter_mut().for_each(|s| *s = (*s).clamp(-t, t));
+        scores.iter_mut().for_each(|s| *s = (*s).clamp(-t, t));
+        HeldOutVotes {
+            ae: self,
+            classes,
+            scores,
+        }
     }
 
     /// The shared clauses that vote on `output` with `output`'s own feature
-    /// hidden (see [`held_out_scores`](Self::held_out_scores)).
+    /// hidden (see [`held_out_scores`](Self::held_out_scores)). For several
+    /// outputs of one sample, [`held_out_votes`](Self::held_out_votes)
+    /// evaluates the clauses once.
     pub fn held_out_fired_clauses(&self, sample: &EncodedSample, output: usize) -> Vec<usize> {
-        let o = output as u32;
-        self.index()
-            .held
-            .classify(&sample.0)
-            .into_iter()
-            .enumerate()
-            .filter(|(_, c)| match *c {
-                HeldOut::All => true,
-                HeldOut::AllBut(f) => f != o,
-                HeldOut::Only(f) => f == o,
-                HeldOut::Never => false,
-            })
-            .map(|(j, _)| j)
-            .collect()
+        fired_for(&self.index().held.classify(&sample.0), output)
     }
 
     /// Drop the inference map; called by every method that can change the
@@ -1590,6 +1650,23 @@ mod tests {
                         fired,
                         "round {round}, output {o}"
                     );
+                    let votes = ae.held_out_votes(&s);
+                    assert_eq!(votes.scores()[o], vote);
+                    assert_eq!(votes.fired_clauses(o), fired);
+                    for against in [true, false] {
+                        // The first clause with the most extreme weight that way.
+                        let mut want: Option<(usize, i32)> = None;
+                        for &j in &fired {
+                            let w = ae.weights[o * nc + j];
+                            let wanted = if against { w < 0 } else { w > 0 };
+                            let better =
+                                want.is_none_or(|(_, b)| if against { w < b } else { w > b });
+                            if wanted && better {
+                                want = Some((j, w));
+                            }
+                        }
+                        assert_eq!(votes.strongest_clause(o, against), want);
+                    }
                 }
             }
         }

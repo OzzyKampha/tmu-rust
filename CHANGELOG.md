@@ -17,6 +17,10 @@ All notable changes to tmu-rs are documented here.
   feature, so one pass gives every clause's verdict for every output. Tested
   against removing each output's literals from every clause and evaluating
   it (random banks with and without feature negation; trained models).
+  `TMCoalescedAutoEncoder::held_out_votes(&sample)` returns the votes with
+  every clause's verdict kept (`HeldOutVotes`: `scores()`,
+  `fired_clauses(output)`, `strongest_clause(output, against)`), so
+  explaining several outputs of one sample evaluates the clauses once.
 
 ### Changed
 - **Autoencoder inference through TMU's literal → clause map**
