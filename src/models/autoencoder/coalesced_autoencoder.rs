@@ -126,8 +126,12 @@ impl HeldOutVotes<'_> {
     pub fn strongest_clause(&self, output: usize, against: bool) -> Option<(usize, i32)> {
         let nc = self.ae.n_clauses;
         let ws = &self.ae.weights[output * nc..(output + 1) * nc];
+        let o = output as u32;
         let mut best: Option<(usize, i32)> = None;
-        for j in self.fired_clauses(output) {
+        for (j, &class) in self.classes.iter().enumerate() {
+            if !votes_on(class, o) {
+                continue;
+            }
             let w = ws[j];
             let wanted = if against { w < 0 } else { w > 0 };
             let better = |b: i32| if against { w < b } else { w > b };
@@ -139,19 +143,22 @@ impl HeldOutVotes<'_> {
     }
 }
 
+/// Whether a clause with this verdict votes on output `o`.
+#[inline]
+fn votes_on(class: HeldOut, o: u32) -> bool {
+    match class {
+        HeldOut::All => true,
+        HeldOut::AllBut(f) => f != o,
+        HeldOut::Only(f) => f == o,
+        HeldOut::Never => false,
+    }
+}
+
 /// The clauses whose verdict lets them vote on `output`.
 fn fired_for(classes: &[HeldOut], output: usize) -> Vec<usize> {
     let o = output as u32;
-    classes
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| match **c {
-            HeldOut::All => true,
-            HeldOut::AllBut(f) => f != o,
-            HeldOut::Only(f) => f == o,
-            HeldOut::Never => false,
-        })
-        .map(|(j, _)| j)
+    (0..classes.len())
+        .filter(|&j| votes_on(classes[j], o))
         .collect()
 }
 
