@@ -1,5 +1,6 @@
 //! GPU [`TMCoalescedAutoEncoder`].
 
+use super::CudaError;
 use super::autoencoder::reconstruction_accuracy;
 use super::common::{
     DenseState, N_DIGITS, Result, STAGE_BYTES, TRAIN_CHUNK, blocks, dense_scores, digits_mask,
@@ -36,6 +37,11 @@ pub struct CudaTMCoalescedAutoEncoder {
 impl TMCoalescedAutoEncoder {
     /// Copy this model to a CUDA device for GPU training / inference.
     pub fn to_cuda(&self, device: &CudaDevice) -> Result<CudaTMCoalescedAutoEncoder> {
+        if self.shuffle_outputs {
+            return Err(CudaError::Invalid(
+                "shuffle_outputs(true) is not available on the GPU; train it on the CPU".into(),
+            ));
+        }
         CudaTMCoalescedAutoEncoder::new(self.clone(), device)
     }
 }

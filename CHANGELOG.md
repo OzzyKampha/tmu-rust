@@ -7,6 +7,24 @@ All notable changes to tmu-rs are documented here.
 ## [Unreleased]
 
 ### Added
+- **TMU's autoencoder training for `TMCoalescedAutoEncoder`** (opt-in; the
+  default `fit_epoch` is bit-identical to before):
+  - `fit_examples(&batch, number_of_examples)` trains like TMU's
+    `TMAutoEncoder.fit`: each example trains every output, in a fresh random
+    order, on an example made for that output — target drawn first (each
+    feature's frequency, or `output_balancing(p)`), then a random row with
+    that value, or the union of `accumulation(n)` such rows. `fit_epoch`
+    trains every output on the same row.
+  - `start_excluded()`: start with every literal excluded, as TMU's clause
+    bank does (by default about half start included).
+  - `shuffle_outputs(true)`: a fresh output order per sample in `fit_epoch` /
+    `fit_one` too. CPU only: `to_cuda` refuses it.
+  Training settings, not saved (the file format is unchanged).
+  Remaining differences from TMU, kept by design: the training vote hides
+  the output's own literals (TMU hides them only from feedback), every firing
+  clause counts in it (TMU drops clauses the confidence gate skips), and a
+  vote of exactly 0 reconstructs as 0 (TMU: 1).
+
 - **`EncodedBatch::select(rows)`** and **`EncodedBatch::words()`** — copy chosen
   samples (any order, repeats allowed) into a new batch. Lets a training loop
   encode its data once and draw every epoch's shuffled or class-balanced batches
