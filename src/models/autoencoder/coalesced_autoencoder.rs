@@ -9,9 +9,9 @@ use crate::clause_bank::dense::rule_from_include;
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::{DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN, use_parallel};
 use crate::clause_bank::dense::{
-    GOLDEN, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of, expand_bits_to_bytes,
-    fire_predict, rebuild_include, type_i_update_bytes, type_ii_update_bytes, type_iii_update,
-    words_for,
+    GOLDEN, LiteralIndex, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of,
+    expand_bits_to_bytes, rebuild_include, type_i_update_bytes, type_ii_update_bytes,
+    type_iii_update, words_for,
 };
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
@@ -53,6 +53,12 @@ pub struct TMCoalescedAutoEncoder {
     pub(crate) ta: Vec<u8>,
     /// Include bitset. Clause `j` occupies `include[j * words .. (j+1) * words]`.
     pub(crate) include: Vec<u64>,
+    /// Inference map from literals to the clauses that include them (TMU's
+    /// `literal_clause_map`), built on first prediction and dropped by every
+    /// `&mut self` / `mut self` method, so it never outlives the include
+    /// bitsets it was built from.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) literal_index: std::sync::OnceLock<LiteralIndex>,
     pub(crate) half: u8,
     pub(crate) max_state: u8,
 
@@ -267,6 +273,7 @@ impl TMCoalescedAutoEncoder {
             dig_lit_active: digits_of(1.0, MASK_BITS),
             ta,
             include,
+            literal_index: Default::default(),
             half,
             max_state,
             weights,
@@ -292,12 +299,14 @@ impl TMCoalescedAutoEncoder {
 
     /// Limit how many literals each clause may include (Type Ia guard).
     pub fn max_included_literals(mut self, max: usize) -> Self {
+        self.reset_literal_index();
         self.max_included_literals = max;
         self
     }
 
     /// Per-clause dropout probability during training (default: 0.0).
     pub fn clause_drop_p(mut self, p: f64) -> Self {
+        self.reset_literal_index();
         assert!((0.0..1.0).contains(&p), "clause_drop_p must be in [0, 1)");
         self.clause_drop_p = p;
         self
@@ -305,6 +314,7 @@ impl TMCoalescedAutoEncoder {
 
     /// Per-literal dropout probability during training (default: 0.0).
     pub fn literal_drop_p(mut self, p: f64) -> Self {
+        self.reset_literal_index();
         assert!((0.0..1.0).contains(&p), "literal_drop_p must be in [0, 1)");
         self.literal_drop_p = p;
         self.dig_lit_active = digits_of(1.0 - p, MASK_BITS);
@@ -313,6 +323,7 @@ impl TMCoalescedAutoEncoder {
 
     /// Enable Type III feedback with indicator strength `d` (must be > 1.0).
     pub fn type_iii_feedback(mut self, d: f64) -> Self {
+        self.reset_literal_index();
         assert!(d > 1.0, "d must be > 1.0");
         self.d = d;
         self.type_iii = true;
@@ -324,6 +335,7 @@ impl TMCoalescedAutoEncoder {
     /// each automaton starts on either side of it at random, so about half the
     /// literals begin included. Call before training.
     pub fn start_excluded(mut self) -> Self {
+        self.reset_literal_index();
         self.ta.iter_mut().for_each(|t| *t = self.half - 1);
         let (n_literals, words) = (self.n_literals, self.words);
         for j in 0..self.n_clauses {
@@ -344,6 +356,7 @@ impl TMCoalescedAutoEncoder {
     /// so the order changes what is learned. CPU only: `to_cuda` refuses it.
     /// [`fit_examples`](Self::fit_examples) always shuffles.
     pub fn shuffle_outputs(mut self, on: bool) -> Self {
+        self.reset_literal_index();
         self.shuffle_outputs = on;
         self
     }
@@ -353,6 +366,7 @@ impl TMCoalescedAutoEncoder {
     /// TMU) uses each feature's frequency in the training rows; 0.5 trains
     /// rare features on rows that have them half the time.
     pub fn output_balancing(mut self, p: f64) -> Self {
+        self.reset_literal_index();
         assert!(
             (0.0..=1.0).contains(&p),
             "output_balancing must be in [0, 1]"
@@ -364,6 +378,7 @@ impl TMCoalescedAutoEncoder {
     /// TMU's `accumulation` for [`fit_examples`](Self::fit_examples): each
     /// example is the union of this many rows with the drawn target (default 1).
     pub fn accumulation(mut self, rows: usize) -> Self {
+        self.reset_literal_index();
         assert!(rows >= 1, "accumulation must be at least 1");
         self.accumulation = rows;
         self
@@ -394,26 +409,42 @@ impl TMCoalescedAutoEncoder {
 
     // ---- inference ----------------------------------------------------------
 
-    fn reconstruct_lit(&self, lit: &[u64]) -> Vec<u8> {
-        debug_assert_eq!(lit.len(), self.words);
-        let nc = self.n_clauses;
-        let words = self.words;
-        let n_features = self.n_features;
-        let include = self.include.as_slice();
-        let valid = self.valid.as_slice();
+    /// The shared clauses that fire for `lit` (inference semantics: an empty
+    /// clause does not fire), through the literal → clause map. A clause's
+    /// output does not depend on the output being voted on, so it is computed
+    /// once per sample and shared by every output's vote.
+    fn fired_predict(&self, lit: &[u64]) -> Vec<usize> {
+        self.literal_index
+            .get_or_init(|| {
+                LiteralIndex::build(&self.include, &self.valid, self.n_clauses, self.words)
+            })
+            .clause_outputs(lit)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(j, fires)| fires.then_some(j))
+            .collect()
+    }
 
-        let mut out = vec![0u8; n_features];
+    /// Drop the inference map; called by every method that can change the
+    /// include bitsets or the valid mask.
+    fn reset_literal_index(&mut self) {
+        self.literal_index = std::sync::OnceLock::new();
+    }
+
+    /// Each output's weighted sum of the clauses in `fired` (unclamped).
+    fn sums_of(&self, fired: &[usize], out: &mut [i32]) {
+        let nc = self.n_clauses;
         for (o, out_o) in out.iter_mut().enumerate() {
             let ws = &self.weights[o * nc..(o + 1) * nc];
-            let mut sum = 0i32;
-            for (j, &w) in ws.iter().enumerate() {
-                if fire_predict(&include[j * words..(j + 1) * words], lit, valid, words) {
-                    sum += w;
-                }
-            }
-            *out_o = (sum > 0) as u8;
+            *out_o = fired.iter().map(|&j| ws[j]).sum();
         }
-        out
+    }
+
+    fn reconstruct_lit(&self, lit: &[u64]) -> Vec<u8> {
+        debug_assert_eq!(lit.len(), self.words);
+        let mut sums = vec![0i32; self.n_features];
+        self.sums_of(&self.fired_predict(lit), &mut sums);
+        sums.into_iter().map(|s| (s > 0) as u8).collect()
     }
 
     /// Reconstruct a binary vector from an encoded sample.
@@ -442,34 +473,16 @@ impl TMCoalescedAutoEncoder {
 
     /// Fill `out` with the clamped weighted clause sums for each output bit.
     pub fn reconstruct_scores(&self, sample: &EncodedSample, out: &mut [i32]) {
-        let lit = &sample.0;
         debug_assert_eq!(out.len(), self.n_features);
-        let nc = self.n_clauses;
-        let words = self.words;
-        let include = self.include.as_slice();
-        let valid = self.valid.as_slice();
-        for (o, out_o) in out.iter_mut().enumerate() {
-            let ws = &self.weights[o * nc..(o + 1) * nc];
-            let mut sum = 0i32;
-            for (j, &w) in ws.iter().enumerate() {
-                if fire_predict(&include[j * words..(j + 1) * words], lit, valid, words) {
-                    sum += w;
-                }
-            }
-            *out_o = sum.clamp(-self.threshold, self.threshold);
-        }
+        self.sums_of(&self.fired_predict(&sample.0), out);
+        let t = self.threshold;
+        out.iter_mut().for_each(|s| *s = (*s).clamp(-t, t));
     }
 
     /// Return the indices of all shared clauses that fire for `sample`.
     /// The `_output` parameter is accepted for API uniformity but ignored — clauses are shared.
     pub fn fired_clauses(&self, sample: &EncodedSample, _output: usize) -> Vec<usize> {
-        let lit = &sample.0;
-        let words = self.words;
-        let include = self.include.as_slice();
-        let valid = self.valid.as_slice();
-        (0..self.n_clauses)
-            .filter(|&j| fire_predict(&include[j * words..(j + 1) * words], lit, valid, words))
-            .collect()
+        self.fired_predict(&sample.0)
     }
 
     // ---- training helpers ---------------------------------------------------
@@ -856,11 +869,13 @@ impl TMCoalescedAutoEncoder {
 
     /// Train on a single encoded sample (unsupervised — no label required).
     pub fn fit_one(&mut self, sample: &EncodedSample) {
+        self.reset_literal_index();
         self.fit_one_lit(&sample.0);
     }
 
     /// Run one training epoch over an encoded batch, shuffling the order each epoch.
     pub fn fit_epoch(&mut self, batch: &EncodedBatch) {
+        self.reset_literal_index();
         debug_assert_eq!(batch.words, self.words);
         let n = batch.n;
         let mut order: Vec<usize> = (0..n).collect();
@@ -894,6 +909,7 @@ impl TMCoalescedAutoEncoder {
     /// time. The confidence gate is drawn once per example, the literal
     /// dropout mask once per output example.
     pub fn fit_examples(&mut self, batch: &EncodedBatch, number_of_examples: usize) {
+        self.reset_literal_index();
         debug_assert_eq!(batch.words, self.words);
         let n = batch.n;
         if n == 0 {
@@ -1365,5 +1381,94 @@ mod tests {
         assert_eq!(back.accumulation, 1);
         // The excluded start is state, so it is kept.
         assert_eq!(back.ta, ae.ta);
+    }
+
+    /// `reconstruct_scores` by brute force: every clause, `fire_predict`.
+    fn scores_by_scan(ae: &TMCoalescedAutoEncoder, sample: &EncodedSample) -> Vec<i32> {
+        let (nc, w) = (ae.n_clauses, ae.words);
+        (0..ae.n_features)
+            .map(|o| {
+                let s: i32 = (0..nc)
+                    .filter(|&j| {
+                        crate::clause_bank::dense::fire_predict(
+                            &ae.include[j * w..(j + 1) * w],
+                            &sample.0,
+                            &ae.valid,
+                            w,
+                        )
+                    })
+                    .map(|j| ae.weights[o * nc + j])
+                    .sum();
+                s.clamp(-ae.threshold, ae.threshold)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn literal_map_scores_match_a_full_scan_across_training() {
+        // 70 features: literals span three words.
+        let mut rng = Rng::new(4);
+        let xs: Vec<Vec<u8>> = (0..400)
+            .map(|_| {
+                (0..70)
+                    .map(|_| rng.next_u64().is_multiple_of(5) as u8)
+                    .collect()
+            })
+            .collect();
+        let e = enc(70);
+        let batch = e.encode_batch(&as_slices(&xs));
+        let samples: Vec<EncodedSample> = xs.iter().take(40).map(|x| e.encode_one(x)).collect();
+        let check = |ae: &TMCoalescedAutoEncoder, when: &str| {
+            let mut got = vec![0i32; 70];
+            for s in &samples {
+                ae.reconstruct_scores(s, &mut got);
+                assert_eq!(got, scores_by_scan(ae, s), "{when}");
+                let recon: Vec<u8> = got.iter().map(|&v| (v > 0) as u8).collect();
+                assert_eq!(ae.reconstruct(s), recon, "{when}");
+                let fired: Vec<usize> = (0..ae.n_clauses)
+                    .filter(|&j| {
+                        crate::clause_bank::dense::fire_predict(
+                            &ae.include[j * ae.words..(j + 1) * ae.words],
+                            &s.0,
+                            &ae.valid,
+                            ae.words,
+                        )
+                    })
+                    .collect();
+                assert_eq!(ae.fired_clauses(s, 0), fired, "{when}");
+            }
+        };
+        let mut ae = TMCoalescedAutoEncoder::with_config(70, 30, 10, 3.0, 8, true, 2);
+        check(&ae, "untrained");
+        ae.fit_epoch(&batch);
+        check(&ae, "after one epoch"); // the map is built here ...
+        ae.fit_epoch(&batch);
+        check(&ae, "after more training"); // ... and must be rebuilt here
+        ae.fit_examples(&batch, 100);
+        check(&ae, "after fit_examples");
+        let ae = ae.start_excluded();
+        check(&ae, "after start_excluded");
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn literal_map_scores_match_after_save_load() {
+        use crate::serial::SaveLoad;
+        let xs = make_mirrored(300, 6, 3);
+        let e = enc(12);
+        let batch = e.encode_batch(&as_slices(&xs));
+        let mut ae = TMCoalescedAutoEncoder::with_config(12, 20, 15, 3.9, 8, true, 42);
+        ae.fit_epoch(&batch);
+        let s = e.encode_one(&xs[0]);
+        let mut before = vec![0i32; 12];
+        ae.reconstruct_scores(&s, &mut before); // builds the map
+        let path = std::env::temp_dir().join(format!("tmu_cae_map_{}.bin", std::process::id()));
+        ae.save(&path).unwrap();
+        let back = TMCoalescedAutoEncoder::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut after = vec![0i32; 12];
+        back.reconstruct_scores(&s, &mut after);
+        assert_eq!(before, after);
+        assert_eq!(after, scores_by_scan(&back, &s));
     }
 }

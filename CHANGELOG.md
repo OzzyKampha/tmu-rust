@@ -6,6 +6,19 @@ All notable changes to tmu-rs are documented here.
 
 ## [Unreleased]
 
+### Changed
+- **Autoencoder inference through TMU's literal → clause map**
+  (`TMCoalescedAutoEncoder`, `TMAutoEncoder`), as the classifiers since #42:
+  a sample's clause outputs come from its false literals and the clauses that
+  include them, and are computed once per sample for every output. The
+  coalesced autoencoder evaluated every shared clause once per output before.
+  Same results (tests against a full `fire_predict` scan across training,
+  `fit_examples`, `start_excluded` and save/load; saved outputs of 1,000
+  samples compared before/after). 384 features, 256 shared clauses:
+  `reconstruct_scores` 1,190 → 10 µs per sample; vanilla, 8 clauses per
+  output: 45 → 26 µs. The map is built on first prediction and dropped by
+  every `&mut self` / `mut self` method and the CUDA `to_cpu` copies.
+
 ### Added
 - **TMU's autoencoder training for `TMCoalescedAutoEncoder`** (opt-in; the
   default `fit_epoch` is bit-identical to before):
