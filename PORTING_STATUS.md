@@ -11,8 +11,8 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | `TMClassifier` | ✅ Ported | Weighted multiclass; full training + inference API |
 | `TMCoalesced` | ✅ Ported | Shared clause bank + signed per-class weight matrix; focused negative sampling |
 | `TMRegressor` | ✅ Ported | Continuous-output weighted clauses; feedback probability driven by current prediction vs target |
-| `TMAutoEncoder` | ✅ Ported | Unsupervised; dedicated per-output clause banks |
-| `TMCoalescedAutoEncoder` | ✅ Ported | Coalesced variant: shared clause bank + signed per-output weights |
+| `TMAutoEncoder` | ✅ tmu-rs variant | Unsupervised; dedicated per-output clause banks (TMU has no counterpart: its one autoencoder is the coalesced one) |
+| `TMCoalescedAutoEncoder` | ✅ Ported | TMU's `TMAutoEncoder`: shared clause bank + signed per-output weights. TMU's per-output examples (`output_balancing`, `accumulation`), all-excluded start and output shuffling are opt-in (`fit_examples`, `start_excluded`, `shuffle_outputs`) |
 | `TMCompositeClassifier` | ✅ Ported | Ensemble of `TsetlinMachine` models; class scores summed at inference |
 | Convolutional TM | ✅ Ported | 1-D receptive-field clauses; weight tying across patch positions |
 | `ClauseBankSparse` / `TMSparseClassifier` | ✅ Ported | Per-clause included/excluded index lists with **absorbing actions** (literals removed at the exclude floor); vanilla-only, scalar, no Type III / parallel / AVX2 in v1 |

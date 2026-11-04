@@ -1,4 +1,5 @@
-//! Coalesced Tsetlin Machine autoencoder.
+//! Coalesced Tsetlin Machine autoencoder: TMU's `TMAutoEncoder`
+//! (`tmu/models/autoencoder/autoencoder.py`).
 //!
 //! A **single shared clause bank** of `n_clauses` clauses is scored by every output
 //! bit position via signed per-output weights, mirroring the coalesced architecture
@@ -78,6 +79,22 @@ pub struct TMCoalescedAutoEncoder {
 
     pub(crate) literals: Vec<u64>,
     pub(crate) rng: Rng,
+
+    /// Train outputs in a fresh random order for every sample (see
+    /// [`Self::shuffle_outputs`]). A training setting: not saved.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) shuffle_outputs: bool,
+    /// [`Self::fit_examples`]' target probability; 0 = each feature's frequency.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) output_balancing: f64,
+    /// Rows combined into one [`Self::fit_examples`] example.
+    #[cfg_attr(feature = "serde", serde(skip, default = "one_row"))]
+    pub(crate) accumulation: usize,
+}
+
+#[cfg(feature = "serde")]
+fn one_row() -> usize {
+    1
 }
 
 #[cfg(feature = "serde")]
@@ -265,6 +282,9 @@ impl TMCoalescedAutoEncoder {
             clause_gate_rng,
             literals: vec![0u64; words],
             rng,
+            shuffle_outputs: false,
+            output_balancing: 0.0,
+            accumulation: 1,
         }
     }
 
@@ -296,6 +316,56 @@ impl TMCoalescedAutoEncoder {
         assert!(d > 1.0, "d must be > 1.0");
         self.d = d;
         self.type_iii = true;
+        self
+    }
+
+    /// Start with every literal excluded, as TMU initialises its clause bank
+    /// (each automaton one step below the include threshold). By default
+    /// each automaton starts on either side of it at random, so about half the
+    /// literals begin included. Call before training.
+    pub fn start_excluded(mut self) -> Self {
+        self.ta.iter_mut().for_each(|t| *t = self.half - 1);
+        let (n_literals, words) = (self.n_literals, self.words);
+        for j in 0..self.n_clauses {
+            rebuild_include(
+                &self.ta[j * n_literals..(j + 1) * n_literals],
+                &mut self.include[j * words..(j + 1) * words],
+                &self.valid,
+                words,
+                n_literals,
+                self.half,
+            );
+        }
+        self
+    }
+
+    /// Train the outputs of each sample in a fresh random order, as TMU does,
+    /// instead of `0..n_features` (default off). Outputs share the clause bank,
+    /// so the order changes what is learned. CPU only: `to_cuda` refuses it.
+    /// [`fit_examples`](Self::fit_examples) always shuffles.
+    pub fn shuffle_outputs(mut self, on: bool) -> Self {
+        self.shuffle_outputs = on;
+        self
+    }
+
+    /// TMU's `output_balancing` for [`fit_examples`](Self::fit_examples): the
+    /// probability that an output's target is "present". 0 (the default, as in
+    /// TMU) uses each feature's frequency in the training rows; 0.5 trains
+    /// rare features on rows that have them half the time.
+    pub fn output_balancing(mut self, p: f64) -> Self {
+        assert!(
+            (0.0..=1.0).contains(&p),
+            "output_balancing must be in [0, 1]"
+        );
+        self.output_balancing = p;
+        self
+    }
+
+    /// TMU's `accumulation` for [`fit_examples`](Self::fit_examples): each
+    /// example is the union of this many rows with the drawn target (default 1).
+    pub fn accumulation(mut self, rows: usize) -> Self {
+        assert!(rows >= 1, "accumulation must be at least 1");
+        self.accumulation = rows;
         self
     }
 
@@ -646,28 +716,123 @@ impl TMCoalescedAutoEncoder {
         }
     }
 
-    fn fit_one_lit(&mut self, lit: &[u64]) {
-        debug_assert_eq!(lit.len(), self.words);
-        self.literals.copy_from_slice(lit);
-
-        let nc = self.n_clauses;
-        let n_features = self.n_features;
-        let n_literals = self.n_literals;
+    /// Literal-dropout mask for one sample (all active without dropout).
+    fn draw_literal_active(&mut self) -> Vec<u64> {
         let words = self.words;
-
-        let lit_b = expand_bits_to_bytes(lit, n_literals);
-
-        let mut lit_active: Vec<u64> = if self.literal_drop_p > 0.0 {
+        if self.literal_drop_p > 0.0 {
             let rng = &mut self.literal_rng;
             let dig = &self.dig_lit_active;
             (0..words).map(|_| bmask_word(rng, dig)).collect()
         } else {
             vec![!0u64; words]
+        }
+    }
+
+    /// The order outputs are trained in this round: `0..n_features`, or a
+    /// fresh shuffle (from the model's RNG) when `shuffled`.
+    fn output_order(&mut self, shuffled: bool) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.n_features).collect();
+        if shuffled {
+            for i in (1..order.len()).rev() {
+                let k = self.rng.below(i + 1);
+                order.swap(i, k);
+            }
+        }
+        order
+    }
+
+    /// Train output `o` towards `target` on the sample in `self.literals`
+    /// (`lit_b` its bytes), with `o`'s own literals hidden. `lit_active` /
+    /// `active_b` are the sample's active literals; they are masked for `o`
+    /// and restored before returning.
+    #[allow(clippy::too_many_arguments)]
+    fn train_output(
+        &mut self,
+        o: usize,
+        target: u8,
+        lit_b: &[u8],
+        lit_active: &mut [u64],
+        active_b: &mut [u8],
+        clause_outputs: &mut [bool],
+        update_clause: &[bool],
+    ) {
+        let nc = self.n_clauses;
+        let n_features = self.n_features;
+        let words = self.words;
+
+        // Mask literal o and its negation so clauses cannot trivially memorise bit o.
+        let neg_o = o + n_features;
+        let word_o = o / WORD_BITS;
+        let word_neg_o = neg_o / WORD_BITS;
+        let save_word_o = lit_active[word_o];
+        let save_word_neg_o = lit_active[word_neg_o];
+        let save_ab_o = active_b[o];
+        let save_ab_neg_o = active_b[neg_o];
+        lit_active[word_o] &= !(1u64 << (o % WORD_BITS));
+        lit_active[word_neg_o] &= !(1u64 << (neg_o % WORD_BITS));
+        active_b[o] = 0;
+        active_b[neg_o] = 0;
+
+        // Compute clause fires under this output's feature mask (into the reused buffer).
+        {
+            let include = self.include.as_slice();
+            let valid = self.valid.as_slice();
+            let litv = self.literals.as_slice();
+            for (j, out) in clause_outputs.iter_mut().enumerate() {
+                *out = clause_fire(
+                    &include[j * words..(j + 1) * words],
+                    litv,
+                    valid,
+                    words,
+                    lit_active,
+                );
+            }
+        }
+
+        // Weighted sum (no clause dropout — matches vanilla AE convention).
+        let sum = {
+            let ws = &self.weights[o * nc..(o + 1) * nc];
+            let mut s = 0i32;
+            for (j, &fire) in clause_outputs.iter().enumerate() {
+                if fire {
+                    s += ws[j];
+                }
+            }
+            s.clamp(-self.threshold, self.threshold)
         };
+
+        let lit = std::mem::take(&mut self.literals);
+        self.update_output_coalesced(
+            o,
+            target,
+            sum,
+            clause_outputs,
+            update_clause,
+            lit_b,
+            active_b,
+            &lit,
+            lit_active,
+        );
+        self.literals = lit;
+
+        // Restore feature mask for the next output's iteration.
+        lit_active[word_o] = save_word_o;
+        lit_active[word_neg_o] = save_word_neg_o;
+        active_b[o] = save_ab_o;
+        active_b[neg_o] = save_ab_neg_o;
+    }
+
+    fn fit_one_lit(&mut self, lit: &[u64]) {
+        debug_assert_eq!(lit.len(), self.words);
+        self.literals.copy_from_slice(lit);
+        let nc = self.n_clauses;
+        let n_literals = self.n_literals;
+
+        let lit_b = expand_bits_to_bytes(lit, n_literals);
+        let mut lit_active = self.draw_literal_active();
         let mut active_b = expand_bits_to_bytes(&lit_active, n_literals);
 
-        // Reused across every output below — was reallocated per output (n_features
-        // times per sample) before; now allocated once per sample.
+        // Reused across every output below.
         let mut clause_outputs = vec![false; nc];
 
         // Confidence gate is drawn once per sample and shared by every output's
@@ -675,67 +840,17 @@ impl TMCoalescedAutoEncoder {
         let mut update_clause = vec![true; nc];
         self.confidence_gate(&mut update_clause);
 
-        for o in 0..n_features {
+        for o in self.output_order(self.shuffle_outputs) {
             let target = ((lit[o / WORD_BITS] >> (o % WORD_BITS)) & 1) as u8;
-
-            // Mask literal o and its negation so clauses cannot trivially memorise bit o.
-            let neg_o = o + n_features;
-            let word_o = o / WORD_BITS;
-            let word_neg_o = neg_o / WORD_BITS;
-            let save_word_o = lit_active[word_o];
-            let save_word_neg_o = lit_active[word_neg_o];
-            let save_ab_o = active_b[o];
-            let save_ab_neg_o = active_b[neg_o];
-            lit_active[word_o] &= !(1u64 << (o % WORD_BITS));
-            lit_active[word_neg_o] &= !(1u64 << (neg_o % WORD_BITS));
-            active_b[o] = 0;
-            active_b[neg_o] = 0;
-
-            // Compute clause fires under this output's feature mask (into the reused buffer).
-            {
-                let include = self.include.as_slice();
-                let valid = self.valid.as_slice();
-                let litv = self.literals.as_slice();
-                for (j, out) in clause_outputs.iter_mut().enumerate() {
-                    *out = clause_fire(
-                        &include[j * words..(j + 1) * words],
-                        litv,
-                        valid,
-                        words,
-                        &lit_active,
-                    );
-                }
-            }
-
-            // Weighted sum (no clause dropout — matches vanilla AE convention).
-            let sum = {
-                let ws = &self.weights[o * nc..(o + 1) * nc];
-                let mut s = 0i32;
-                for (j, &fire) in clause_outputs.iter().enumerate() {
-                    if fire {
-                        s += ws[j];
-                    }
-                }
-                s.clamp(-self.threshold, self.threshold)
-            };
-
-            self.update_output_coalesced(
+            self.train_output(
                 o,
                 target,
-                sum,
-                &clause_outputs,
-                &update_clause,
                 &lit_b,
-                &active_b,
-                lit,
-                &lit_active,
+                &mut lit_active,
+                &mut active_b,
+                &mut clause_outputs,
+                &update_clause,
             );
-
-            // Restore feature mask for the next output's iteration.
-            lit_active[word_o] = save_word_o;
-            lit_active[word_neg_o] = save_word_neg_o;
-            active_b[o] = save_ab_o;
-            active_b[neg_o] = save_ab_neg_o;
         }
     }
 
@@ -757,6 +872,104 @@ impl TMCoalescedAutoEncoder {
         let data = batch.data.as_slice();
         for &i in &order {
             self.fit_one_lit(&data[i * w..(i + 1) * w]);
+        }
+    }
+
+    /// Train as TMU's `TMAutoEncoder.fit(X, number_of_examples)`: every
+    /// example trains each output, in a fresh random order, on an example
+    /// made for that output.
+    ///
+    /// For output `o`, the target is drawn first: present with probability
+    /// [`output_balancing`](Self::output_balancing) if set, else with bit `o`'s
+    /// frequency in `batch`. The example is then a random row of `batch` with
+    /// bit `o` equal to the target, or the union of
+    /// [`accumulation`](Self::accumulation) such rows. If bit `o` is in every
+    /// row or in none, the rows are drawn at random and the target is kept as
+    /// drawn (as TMU does).
+    ///
+    /// [`fit_epoch`](Self::fit_epoch) instead trains every output on the same
+    /// row, towards that row's own bits. Here each output sees examples chosen
+    /// for it, so a rare feature is trained on rows that have it as often as
+    /// its target is drawn present — with `output_balancing(0.5)`, half the
+    /// time. The confidence gate is drawn once per example, the literal
+    /// dropout mask once per output example.
+    pub fn fit_examples(&mut self, batch: &EncodedBatch, number_of_examples: usize) {
+        debug_assert_eq!(batch.words, self.words);
+        let n = batch.n;
+        if n == 0 {
+            return;
+        }
+        let nf = self.n_features;
+        let nc = self.n_clauses;
+        let words = self.words;
+        let n_literals = self.n_literals;
+        let data = batch.data.as_slice();
+        let bit =
+            |row: usize, f: usize| (data[row * words + f / WORD_BITS] >> (f % WORD_BITS)) & 1 == 1;
+
+        // Rows that have each feature (sorted), TMU's CSC columns.
+        let mut with: Vec<Vec<u32>> = vec![Vec::new(); nf];
+        for row in 0..n {
+            for (f, rows) in with.iter_mut().enumerate() {
+                if bit(row, f) {
+                    rows.push(row as u32);
+                }
+            }
+        }
+
+        let mut clause_outputs = vec![false; nc];
+        let mut update_clause = vec![true; nc];
+        let mut union = vec![false; nf];
+        for _ in 0..number_of_examples {
+            let order = self.output_order(true);
+            self.confidence_gate(&mut update_clause);
+            for o in order {
+                let rows = &with[o];
+                let p_true = if self.output_balancing > 0.0 {
+                    self.output_balancing
+                } else {
+                    rows.len() as f64 / n as f64
+                };
+                let target = self.rng.next_f64() <= p_true;
+
+                // The example: the union of `accumulation` rows.
+                union.iter_mut().for_each(|b| *b = false);
+                let degenerate = rows.is_empty() || rows.len() == n;
+                for _ in 0..self.accumulation {
+                    let row = if degenerate {
+                        self.rng.below(n)
+                    } else if target {
+                        rows[self.rng.below(rows.len())] as usize
+                    } else {
+                        loop {
+                            let r = self.rng.below(n);
+                            if rows.binary_search(&(r as u32)).is_err() {
+                                break r;
+                            }
+                        }
+                    };
+                    for (f, b) in union.iter_mut().enumerate() {
+                        *b |= bit(row, f);
+                    }
+                }
+                self.literals.iter_mut().for_each(|w| *w = 0);
+                for (f, &b) in union.iter().enumerate() {
+                    let l = if b { f } else { f + nf };
+                    self.literals[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
+                }
+                let lit_b = expand_bits_to_bytes(&self.literals, n_literals);
+                let mut lit_active = self.draw_literal_active();
+                let mut active_b = expand_bits_to_bytes(&lit_active, n_literals);
+                self.train_output(
+                    o,
+                    u8::from(target),
+                    &lit_b,
+                    &mut lit_active,
+                    &mut active_b,
+                    &mut clause_outputs,
+                    &update_clause,
+                );
+            }
         }
     }
 
@@ -1039,5 +1252,118 @@ mod tests {
         for _ in 0..5 {
             ae.fit_epoch(&batch);
         }
+    }
+
+    #[test]
+    fn start_excluded_leaves_every_clause_empty() {
+        let ae = TMCoalescedAutoEncoder::with_config(12, 20, 15, 3.9, 8, true, 42).start_excluded();
+        assert!(ae.ta.iter().all(|&t| t == ae.half - 1));
+        assert!(ae.include.iter().all(|&w| w == 0));
+        // Empty clauses never fire at prediction, so every vote is 0.
+        let sample = enc(12).encode_one(&[1; 12]);
+        let mut out = vec![1i32; 12];
+        ae.reconstruct_scores(&sample, &mut out);
+        assert_eq!(out, vec![0; 12]);
+    }
+
+    #[test]
+    fn shuffled_outputs_change_training_and_still_learn() {
+        let xs = make_mirrored(2000, 6, 1);
+        let e = enc(12);
+        let batch = e.encode_batch(&as_slices(&xs));
+        let mut fixed = TMCoalescedAutoEncoder::with_config(12, 20, 15, 3.9, 8, true, 42);
+        let mut shuffled =
+            TMCoalescedAutoEncoder::with_config(12, 20, 15, 3.9, 8, true, 42).shuffle_outputs(true);
+        for _ in 0..20 {
+            fixed.fit_epoch(&batch);
+            shuffled.fit_epoch(&batch);
+        }
+        assert_ne!(fixed.ta, shuffled.ta, "the output order should matter");
+        let acc = shuffled.reconstruction_accuracy(&batch);
+        assert!(acc > 0.80, "shuffled outputs: accuracy {acc:.4}");
+    }
+
+    #[test]
+    fn fit_examples_learns_like_tmu() {
+        let xs = make_mirrored(2000, 6, 1);
+        let e = enc(12);
+        let batch = e.encode_batch(&as_slices(&xs));
+        for (name, ae) in [
+            (
+                "frequency",
+                TMCoalescedAutoEncoder::with_config(12, 20, 15, 3.9, 8, true, 42),
+            ),
+            (
+                "balanced, excluded start",
+                TMCoalescedAutoEncoder::with_config(12, 20, 15, 3.9, 8, true, 42)
+                    .output_balancing(0.5)
+                    .start_excluded(),
+            ),
+            (
+                "accumulation 2",
+                TMCoalescedAutoEncoder::with_config(12, 20, 15, 3.9, 8, true, 42).accumulation(2),
+            ),
+        ] {
+            let mut ae = ae;
+            for _ in 0..20 {
+                ae.fit_examples(&batch, 2000);
+            }
+            let acc = ae.reconstruction_accuracy(&batch);
+            // Two rows' union no longer mirrors exactly, so accumulation
+            // learns a looser rule.
+            let bar = if name.starts_with("accumulation") {
+                0.70
+            } else {
+                0.80
+            };
+            assert!(acc > bar, "{name}: accuracy {acc:.4}");
+        }
+    }
+
+    #[test]
+    fn fit_examples_is_deterministic_and_handles_constant_features() {
+        // Feature 0 is always on and feature 1 always off: no row has the
+        // other value, so examples for them are drawn at random (no endless
+        // search for a matching row).
+        let mut rng = Rng::new(3);
+        let xs: Vec<Vec<u8>> = (0..300)
+            .map(|_| {
+                let mut v: Vec<u8> = (0..8).map(|_| (rng.next_u64() & 1) as u8).collect();
+                v[0] = 1;
+                v[1] = 0;
+                v
+            })
+            .collect();
+        let batch = enc(8).encode_batch(&as_slices(&xs));
+        let train = || {
+            let mut ae = TMCoalescedAutoEncoder::with_config(8, 10, 8, 3.0, 8, true, 7)
+                .output_balancing(0.5);
+            ae.fit_examples(&batch, 300);
+            ae
+        };
+        let (a, b) = (train(), train());
+        assert_eq!(a.ta, b.ta);
+        assert_eq!(a.weights, b.weights);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn training_settings_are_not_saved() {
+        use crate::serial::SaveLoad;
+        let ae = TMCoalescedAutoEncoder::with_config(6, 4, 5, 3.0, 8, true, 1)
+            .shuffle_outputs(true)
+            .output_balancing(0.5)
+            .accumulation(3)
+            .start_excluded();
+        let dir = std::env::temp_dir().join(format!("tmu_cae_settings_{}", std::process::id()));
+        let path = dir.with_extension("bin");
+        ae.save(&path).unwrap();
+        let back = TMCoalescedAutoEncoder::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!back.shuffle_outputs);
+        assert_eq!(back.output_balancing, 0.0);
+        assert_eq!(back.accumulation, 1);
+        // The excluded start is state, so it is kept.
+        assert_eq!(back.ta, ae.ta);
     }
 }

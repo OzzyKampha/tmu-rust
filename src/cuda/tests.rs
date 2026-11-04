@@ -848,6 +848,20 @@ mod refusals {
             .reuse_random_feedback(false);
         assert!(c.to_cuda(&device()).is_err());
     }
+
+    #[test]
+    fn shuffled_autoencoder_outputs_are_refused_on_the_gpu() {
+        if skip() {
+            return;
+        }
+        let ae = crate::TMCoalescedAutoEncoder::with_config(8, 10, 8, 3.0, 8, true, 1)
+            .shuffle_outputs(true);
+        assert!(ae.to_cuda(&device()).is_err());
+        // The excluded start is state only: the GPU takes it.
+        let ae =
+            crate::TMCoalescedAutoEncoder::with_config(8, 10, 8, 3.0, 8, true, 1).start_excluded();
+        assert!(ae.to_cuda(&device()).is_ok());
+    }
 }
 
 mod composite {

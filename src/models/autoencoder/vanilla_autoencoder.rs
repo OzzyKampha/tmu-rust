@@ -1,6 +1,8 @@
 //! Vanilla weighted Tsetlin Machine autoencoder.
 //!
-//! Mirrors TMU's `vanilla_autoencoder.py` / `TMAutoEncoder`.
+//! A tmu-rs variant with a clause bank per output. TMU's one autoencoder
+//! (`tmu/models/autoencoder/autoencoder.py`, `TMAutoEncoder`) shares one clause
+//! bank across outputs: that is [`crate::TMCoalescedAutoEncoder`].
 
 use crate::clause_bank::dense::rule_from_include;
 #[cfg(feature = "parallel")]
