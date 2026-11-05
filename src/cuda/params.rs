@@ -62,11 +62,15 @@ params! {
     }
     CoPlanParams {
         master_rng: u64, class_rngs: u64, weights: u64, fire: u64, active: u64, plan: u64,
-        inv: u64, keep: u64,
+        inv: u64, keep: u64, mask_s0: u64,
         drop_p: f64,
         n_clauses: u32, n_classes: u32, words: u32, y: u32,
         threshold: i32,
         focused: u32, dig_inv: u32, dig_keep: u32, n_digits: u32, _pad: u32,
+    }
+    CoMasksParams {
+        mask_s0: u64, inv: u64, keep: u64,
+        words: u32, dig_inv: u32, dig_keep: u32, n_digits: u32,
     }
     CoUpdateParams {
         ta: u64, include: u64, weights: u64, rngs: u64, ind: u64, cat: u64, valid: u64,

@@ -31,8 +31,32 @@ All notable changes to tmu-rs are documented here.
   frequency its CPU path uses: `output_balancing(0.5)` reproduces that. (As
   released in TMU 0.8.3, `TMAutoEncoder.fit` passes `target_true_p=` to the
   CUDA bank's `produce_autoencoder_example`, which does not take it.)
+- **Autoencoder training progress:** `fit_epoch_progress` and
+  `fit_examples_progress` on `TMCoalescedAutoEncoder` and its CUDA twin call
+  back with the rows (examples) trained so far, for a progress line inside a
+  long epoch. They train the same model as `fit_epoch` / `fit_examples`.
+- Examples `cuda_coalesced_sparse` and `cuda_sparse_bank`: GPU vs CPU training
+  speed on wide sparse inputs (44,428 features, a few dozen set per sample),
+  each checked bit-identical to the CPU.
 
 ### Changed
+- **Coalesced GPU training ~20× faster on wide inputs**, still bit-identical to
+  the CPU. The y / neg feedback masks were drawn by one thread of `co_plan`
+  (2 × 2 × words × 12 sequential SplitMix64 draws per sample); a new `co_masks`
+  kernel draws them a thread per mask word, from the counter-based stream
+  (`rng_peek`). `shared_fire` evaluates a clause per block with coalesced
+  reads instead of a clause per thread (also for the coalesced autoencoder,
+  whose masks are drawn across a block). `co_update` counts a clause's
+  included literals only for Type Ia under a literal cap, and moves a word's
+  64 TA states as eight u64s when the clause is 8-byte aligned. 44,428
+  features, 100 clauses, RTX A500 Laptop: 316 → 6,576 samples/s (one CPU
+  thread: ~1,700).
+- **Sparse clause bank on the GPU:** `sp_update` decides its per-literal draws
+  on the draw's 53-bit integer (`m <= floor(p · 2^53)`, exactly `rng_f64() <=
+  p`) instead of in double precision, which most GPUs run at a fraction of
+  single-precision speed. The list walk stays one thread per clause, in the
+  CPU's order, so the bank remains slower on the GPU than on the CPU for
+  small models.
 - **Autoencoder inference through TMU's literal → clause map**
   (`TMCoalescedAutoEncoder`, `TMAutoEncoder`), as the classifiers since #42:
   a sample's clause outputs come from its false literals and the clauses that

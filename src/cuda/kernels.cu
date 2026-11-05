@@ -59,6 +59,17 @@ __device__ __forceinline__ double u64_to_f64(u64 x) {
     return (double)(x >> 11) * (1.0 / 9007199254740992.0);
 }
 __device__ __forceinline__ double rng_f64(u64* s) { return u64_to_f64(rng_next(s)); }
+// `rng_f64(s) <= p` without double arithmetic (slow on most GPUs), for a `p`
+// fixed across many draws: the draw is m / 2^53 for the 53-bit integer m, so it
+// is <= p exactly when m <= floor(p * 2^53). -1 = never (p < 0 or NaN).
+__device__ __forceinline__ long long rng_cut(double p) {
+    if (!(p >= 0.0)) return -1;
+    if (p >= 1.0) return 1LL << 53;
+    return (long long)(p * 9007199254740992.0);  // >= 0: truncation is floor
+}
+__device__ __forceinline__ bool rng_le(u64* s, long long cut) {
+    return (long long)(rng_next(s) >> 11) <= cut;
+}
 // The k-th (0-based) upcoming draw of a stream at state `s`, without advancing.
 // SplitMix64 is counter-based, so a run of unconditional draws can be split
 // across threads.
@@ -73,6 +84,33 @@ __device__ u64 bmask_word(u64* s, u32 digits, int n_digits) {
         w = ((digits >> i) & 1u) ? (r | w) : (r & w);
     }
     return w;
+}
+
+// The mask `bmask_word` would return after `first` earlier draws of the stream
+// at state `s`, without advancing it.
+__device__ __forceinline__ u64 bmask_word_at(u64 s, u64 first, u32 digits, int n_digits) {
+    u64 w = 0;
+    for (int i = n_digits - 1; i >= 0; --i) {
+        u64 r = rng_peek(s, first++);
+        w = ((digits >> i) & 1u) ? (r | w) : (r & w);
+    }
+    return w;
+}
+
+// `words` inv mask words then `words` keep mask words from the stream at state
+// `s`, after `skip` earlier draws: what thread 0 calling `bmask_word` 2 * words
+// times would produce, split across the block (block-cooperative). The caller
+// advances the stream by masks_draws(words, n_digits).
+__device__ void masks_block(u64 s, u64 skip, u64* inv, u64* keep, int words, u32 dig_inv,
+                            u32 dig_keep, int n_digits) {
+    for (int k = threadIdx.x; k < words; k += blockDim.x) {
+        inv[k] = bmask_word_at(s, skip + (u64)k * n_digits, dig_inv, n_digits);
+        keep[k] = bmask_word_at(s, skip + (u64)(words + k) * n_digits, dig_keep, n_digits);
+    }
+}
+
+__device__ __forceinline__ u64 masks_draws(int words, int n_digits) {
+    return 2ULL * (u64)words * (u64)n_digits;
 }
 
 // ---------------------------------------------------------------------------
@@ -157,11 +195,37 @@ __device__ int block_included(const u64* inc, const u64* valid, int words) {
 #define ACT_IA 2
 #define ACT_II 3
 
+// New state of TA `b` of a word under `action`.
+__device__ __forceinline__ u32 ta_step(int action, u32 tv, int b, u64 a, u64 lw, u64 iv, u64 kp,
+                                       u32 boost, u32 half, u32 max_state) {
+    u32 la = (u32)(a >> b) & 1u;
+    u32 present = (u32)(lw >> b) & 1u;
+    u32 x;
+    if (action == ACT_IA) {
+        u32 incv = present & (boost | ((u32)(kp >> b) & 1u)) & la;
+        u32 dec = (1u - present) & ((u32)(iv >> b) & 1u) & (u32)(tv < max_state) & la;
+        x = tv + incv;
+        if (x > max_state) x = max_state;
+        x = x >= dec ? x - dec : 0;
+    } else if (action == ACT_IB) {
+        u32 dec = ((u32)(iv >> b) & 1u) & (u32)(tv < max_state) & la;
+        x = tv >= dec ? tv - dec : 0;
+    } else {
+        u32 incv = (1u - present) & (u32)(tv < half) & (u32)(tv > 0) & la;
+        x = tv + incv;
+        if (x > max_state) x = max_state;
+    }
+    return x;
+}
+
 __device__ void ta_feedback_block(u8* ta, u64* inc, const u64* valid, const u64* lit,
                                   const u64* act, int ex_a, int ex_b, const u64* inv,
                                   const u64* keep, int words, int n_literals, int action,
                                   u32 boost, u32 half, u32 max_state) {
     if (action != ACT_NONE) {
+        // A word's 64 states move as eight u64s when the clause's states are
+        // 8-byte aligned (n_literals % 8 == 0); the TA loop is memory-bound.
+        bool wide = ((unsigned long long)ta & 7ULL) == 0;
         for (int k = threadIdx.x; k < words; k += blockDim.x) {
             u64 a = act_word(act, k, ex_a, ex_b);
             u64 lw = lit[k];
@@ -171,27 +235,25 @@ __device__ void ta_feedback_block(u8* ta, u64* inc, const u64* valid, const u64*
             int lim = imin(64, n_literals - base);
             u8* t = ta + base;
             u64 newinc = 0;
-            for (int b = 0; b < lim; b++) {
-                u32 la = (u32)(a >> b) & 1u;
-                u32 present = (u32)(lw >> b) & 1u;
-                u32 tv = t[b];
-                u32 x;
-                if (action == ACT_IA) {
-                    u32 incv = present & (boost | ((u32)(kp >> b) & 1u)) & la;
-                    u32 dec = (1u - present) & ((u32)(iv >> b) & 1u) & (u32)(tv < max_state) & la;
-                    x = tv + incv;
-                    if (x > max_state) x = max_state;
-                    x = x >= dec ? x - dec : 0;
-                } else if (action == ACT_IB) {
-                    u32 dec = ((u32)(iv >> b) & 1u) & (u32)(tv < max_state) & la;
-                    x = tv >= dec ? tv - dec : 0;
-                } else {
-                    u32 incv = (1u - present) & (u32)(tv < half) & (u32)(tv > 0) & la;
-                    x = tv + incv;
-                    if (x > max_state) x = max_state;
+            if (wide && lim == 64) {
+                u64* t8 = (u64*)t;
+                for (int q = 0; q < 8; q++) {
+                    u64 v = t8[q], out = 0;
+                    for (int i = 0; i < 8; i++) {
+                        int b = q * 8 + i;
+                        u32 x = ta_step(action, (u32)(v >> (8 * i)) & 0xFFu, b, a, lw, iv, kp,
+                                        boost, half, max_state);
+                        out |= (u64)x << (8 * i);
+                        newinc |= (u64)(x >= half) << b;
+                    }
+                    t8[q] = out;
                 }
-                t[b] = (u8)x;
-                newinc |= (u64)(x >= half) << b;
+            } else {
+                for (int b = 0; b < lim; b++) {
+                    u32 x = ta_step(action, t[b], b, a, lw, iv, kp, boost, half, max_state);
+                    t[b] = (u8)x;
+                    newinc |= (u64)(x >= half) << b;
+                }
             }
             inc[k] = newinc & valid[k];
         }
@@ -307,6 +369,20 @@ __device__ void gen_group_masks(u64* rng_state, u64* drop_s0, u64* inv, u64* kee
     for (int k = 0; k < words; k++) inv[k] = bmask_word(&s, dig_inv, n_digits);
     for (int k = 0; k < words; k++) keep[k] = bmask_word(&s, dig_keep, n_digits);
     *rng_state = s;
+}
+
+// gen_group_masks for one group, split across the block (block-cooperative).
+__device__ void gen_group_masks_block(u64* rng_state, u64* drop_s0, u64* inv, u64* keep,
+                                      int words, u32 n_drop_draws, double drop_p, u32 dig_inv,
+                                      u32 dig_keep, int n_digits) {
+    u64 s = *rng_state;
+    u64 skip = drop_p > 0.0 ? (u64)n_drop_draws : 0;
+    masks_block(s, skip, inv, keep, words, dig_inv, dig_keep, n_digits);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *drop_s0 = s;
+        *rng_state = s + (skip + masks_draws(words, n_digits)) * GOLDEN;
+    }
 }
 
 __device__ __forceinline__ double feedback_p(int target, int sum, int threshold, double cw) {
@@ -624,17 +700,28 @@ struct SharedFireParams {
     int ex_a, ex_b;
 };
 
+// One block per clause (n_fire_blocks == n_clauses), then one block building
+// the output's masks when out_rng is set.
 extern "C" __global__ void shared_fire(const SharedFireParams p) {
+    __shared__ int s_viol;
     if (blockIdx.x < p.n_fire_blocks) {
-        u32 j = blockIdx.x * blockDim.x + threadIdx.x;
-        if (j >= p.n_clauses) return;
-        bool f = clause_fire_t(p.include + (u64)j * p.words, p.lit, p.valid, p.act, p.ex_a, p.ex_b,
-                               p.words);
-        p.fire[j] = f;
-        if (f && p.sum) atomicAdd(p.sum, p.w_out[j]);
-    } else if (threadIdx.x == 0 && p.out_rng) {
-        gen_group_masks(p.out_rng, p.drop_s0, p.inv, p.keep, p.words, p.n_clauses, p.drop_p,
-                        p.dig_inv, p.dig_keep, p.n_digits);
+        u32 j = blockIdx.x;
+        if (threadIdx.x == 0) s_viol = 0;
+        __syncthreads();
+        const u64* inc = p.include + (u64)j * p.words;
+        u64 v = 0;
+        for (int k = threadIdx.x; k < (int)p.words; k += blockDim.x)
+            v |= inc[k] & p.valid[k] & act_word(p.act, k, p.ex_a, p.ex_b) & ~p.lit[k];
+        if (v) s_viol = 1;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            bool f = !s_viol;
+            p.fire[j] = f;
+            if (f && p.sum) atomicAdd(p.sum, p.w_out[j]);
+        }
+    } else if (p.out_rng) {
+        gen_group_masks_block(p.out_rng, p.drop_s0, p.inv, p.keep, p.words, p.n_clauses, p.drop_p,
+                              p.dig_inv, p.dig_keep, p.n_digits);
     }
 }
 
@@ -648,21 +735,22 @@ __device__ void coalesced_pass(u8* ta, u64* inc, int* w, u64* rng_sh, u8* ind, u
                                u64 max_inc, double d, u32 boost, u32 half, u32 max_state,
                                u32 type_iii, double pf_i, double pf_ii, int allow_inc,
                                u32 half_ind, u32 max_ind) {
-    __shared__ int s_action;
+    __shared__ int s_action, s_count;
     if (!active) return;
-    int n_inc = max_inc != NO_LIMIT ? block_included(inc, valid, words) : 0;
     if (threadIdx.x == 0) {
         int positive = *w >= 0;
         int give_i = target ? positive : !positive;
         int action = ACT_NONE;
         if (rng_f64(rng_sh) <= prob * (give_i ? pf_i : pf_ii)) {
             if (give_i) {
-                int fu = out_j && (max_inc == NO_LIMIT || (u64)n_inc < max_inc);
-                action = fu ? ACT_IA : ACT_IB;
+                action = out_j ? ACT_IA : ACT_IB;
             } else if (out_j) {
                 action = ACT_II;
             }
         }
+        // Type Ia under a literal cap needs the clause's included count; counted
+        // below only then, as it reads the whole clause.
+        s_count = action == ACT_IA && max_inc != NO_LIMIT;
         if (out_j && rng_f64(rng_sh) <= prob) {
             if (target) {
                 if (allow_inc && *w != BIG_INT) *w += 1;
@@ -673,6 +761,11 @@ __device__ void coalesced_pass(u8* ta, u64* inc, int* w, u64* rng_sh, u8* ind, u
         s_action = action;
     }
     __syncthreads();
+    if (s_count) {
+        int n_inc = block_included(inc, valid, words);
+        if (threadIdx.x == 0 && (u64)n_inc >= max_inc) s_action = ACT_IB;
+        __syncthreads();
+    }
     ta_feedback_block(ta, inc, valid, lit, act, ex_a, ex_b, inv, keep, words, n_literals, s_action,
                       boost, half, max_state);
     if (type_iii)
@@ -692,6 +785,7 @@ struct CoPlanParams {
     int* plan;             // out: [y, neg, sum_y, sum_neg]
     u64* inv;              // [2 * words]: y then neg
     u64* keep;
+    u64* mask_s0;          // out: [2] y's and neg's class streams before their masks
     double drop_p;
     u32 n_clauses, n_classes, words, y;
     int threshold;
@@ -708,6 +802,7 @@ __device__ int co_class_sum(const CoPlanParams& p, u32 c) {
 // Dynamic shared memory: n_classes ints.
 extern "C" __global__ void co_plan(const CoPlanParams p) {
     __shared__ int s_neg;
+    __shared__ u64 s_ry, s_rn;
     int* sums = (int*)tmu_dyn_smem;
     u64 s0 = *p.master_rng;
     for (u32 j = threadIdx.x; j < p.n_clauses; j += blockDim.x)
@@ -749,15 +844,20 @@ extern "C" __global__ void co_plan(const CoPlanParams p) {
         }
         *p.master_rng = s;
         s_neg = neg;
-        u64* ry = &p.class_rngs[p.y];
-        for (u32 k = 0; k < p.words; k++) p.inv[k] = bmask_word(ry, p.dig_inv, p.n_digits);
-        for (u32 k = 0; k < p.words; k++) p.keep[k] = bmask_word(ry, p.dig_keep, p.n_digits);
-        u64* rn = &p.class_rngs[neg];
-        for (u32 k = 0; k < p.words; k++) p.inv[p.words + k] = bmask_word(rn, p.dig_inv, p.n_digits);
-        for (u32 k = 0; k < p.words; k++) p.keep[p.words + k] = bmask_word(rn, p.dig_keep, p.n_digits);
+        s_ry = p.class_rngs[p.y];
+        s_rn = p.class_rngs[neg];
     }
     __syncthreads();
     int neg = s_neg;
+    // y's and neg's masks are drawn by co_masks, from the class streams where
+    // they stand now; the streams move past those draws here.
+    if (threadIdx.x == 0) {
+        u64 n = masks_draws(p.words, p.n_digits);
+        p.mask_s0[0] = s_ry;
+        p.mask_s0[1] = s_rn;
+        p.class_rngs[p.y] = s_ry + n * GOLDEN;
+        p.class_rngs[neg] = s_rn + n * GOLDEN;
+    }
     int sy = co_class_sum(p, p.y);
     int sn = co_class_sum(p, (u32)neg);
     // TMU's max_positive_clauses: how many of y's weights are >= 0 (before the update).
@@ -772,6 +872,28 @@ extern "C" __global__ void co_plan(const CoPlanParams p) {
         p.plan[3] = sn;
         p.plan[4] = npos;
     }
+}
+
+// The y and neg feedback masks co_plan left to draw: one thread per mask word,
+// thread t < 4 * words. Each class stream yields inv words then keep words.
+struct CoMasksParams {
+    const u64* mask_s0;    // [2] from co_plan
+    u64* inv;              // [2 * words]: y then neg
+    u64* keep;
+    u32 words, dig_inv, dig_keep, n_digits;
+};
+
+extern "C" __global__ void co_masks(const CoMasksParams p) {
+    u32 t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= 4 * p.words) return;
+    u32 pass = t / (2 * p.words), r = t % (2 * p.words);
+    bool is_inv = r < p.words;
+    u64 w = bmask_word_at(p.mask_s0[pass], (u64)r * p.n_digits, is_inv ? p.dig_inv : p.dig_keep,
+                          p.n_digits);
+    if (is_inv)
+        p.inv[(u64)pass * p.words + r] = w;
+    else
+        p.keep[(u64)pass * p.words + r - p.words] = w;
 }
 
 struct CoUpdateParams {
@@ -1195,7 +1317,8 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
     int fired = p.fire[t];
     int* w = &p.weights[cj];
     u32 rate = p.rate > 0 ? p.rate : 1;
-    double inv_rate = 1.0 / (double)rate;
+    long long inv_rate = rng_cut(1.0 / (double)rate);
+    long long keep_p = rng_cut(p.keep_p), inv_p = rng_cut(p.inv_p);
     if (type_i) {
         int fu = fired && (p.max_inc == NO_LIMIT || (u64)n_inc < p.max_inc);
         if (fu && p.weighted) *w = imin(*w + 1, p.threshold);
@@ -1212,8 +1335,8 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
                     }
                     u32 st = inc_st[i];
                     if (fu && bit_of(p.lit, l)) {
-                        if (st < p.max_state && (p.boost || rng_f64(&s) <= p.keep_p)) inc_st[i] = (u8)(st + 1);
-                    } else if (rng_f64(&s) <= p.inv_p) {
+                        if (st < p.max_state && (p.boost || rng_le(&s, keep_p))) inc_st[i] = (u8)(st + 1);
+                    } else if (rng_le(&s, inv_p)) {
                         u32 ns = st - 1;
                         if (ns < p.half) {
                             sp_swap_remove(inc_idx, inc_st, &n_inc, i);
@@ -1226,7 +1349,7 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
                     }
                     i++;
                 }
-            } else if (rate == 1 || rng_f64(&s) <= inv_rate) {
+            } else if (rate == 1 || rng_le(&s, inv_rate)) {
                 u32 i = 0;
                 while (i < n_exc) {
                     u32 l = exc_idx[i];
@@ -1237,7 +1360,7 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
                     u32 st = exc_st[i];
                     if (fu && bit_of(p.lit, l)) {
                         if ((p.max_inc == NO_LIMIT || (u64)n_inc < p.max_inc) &&
-                            (p.boost || rng_f64(&s) <= p.keep_p)) {
+                            (p.boost || rng_le(&s, keep_p))) {
                             u32 ns = st + rate < p.max_state ? st + rate : p.max_state;
                             if (ns >= p.half) {
                                 sp_swap_remove(exc_idx, exc_st, &n_exc, i);
@@ -1248,7 +1371,7 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
                             }
                             exc_st[i] = (u8)ns;
                         }
-                    } else if (st > rate && rng_f64(&s) <= p.inv_p) {
+                    } else if (st > rate && rng_le(&s, inv_p)) {
                         if (sp_lower(p, exc_idx, exc_st, &n_exc, una_idx, &n_una, &n_abs, i, st - rate))
                             continue;
                     }
@@ -1259,7 +1382,7 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
     } else if (fired) {
         if (p.weighted) *w = imax(*w - 1, 1);
         // Type II — candidates only, with probability 1/rate, by rate.
-        if (rate == 1 || rng_f64(&s) <= inv_rate) {
+        if (rate == 1 || rng_le(&s, inv_rate)) {
             u32 i = 0;
             while (i < n_exc) {
                 u32 l = exc_idx[i];
@@ -1376,6 +1499,7 @@ static const TmuEmuEntry tmu_emu_table[] = {
     TMU_K(conv_update, ConvUpdateParams)
     TMU_K(shared_fire, SharedFireParams)
     TMU_K(co_plan, CoPlanParams)
+    TMU_K(co_masks, CoMasksParams)
     TMU_K(co_update, CoUpdateParams)
     TMU_K(cae_gate, CaeGateParams)
     TMU_K(cae_update, CaeUpdateParams)
