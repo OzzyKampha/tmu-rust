@@ -1273,6 +1273,24 @@ impl TsetlinMachine {
         }
     }
 
+    /// How many automata sit at each state: `counts[s]` is the number of
+    /// (clause, literal) automata at state `s`, for `s` in `0..=max_state`.
+    /// States at or above `max_state / 2 + 1` include their literal; `0` is the
+    /// exclude floor (what [`absorbed_exclude_fraction`](Self::absorbed_exclude_fraction)
+    /// counts) and `max_state` the include ceiling.
+    pub fn ta_state_histogram(&self) -> Vec<u64> {
+        let mut counts = vec![0u64; usize::from(self.max_state) + 1];
+        for cj in 0..self.n_classes * self.clauses_per_class {
+            let base = cj * self.n_literals;
+            for l in 0..self.n_literals {
+                if self.valid[l / WORD_BITS] & (1u64 << (l % WORD_BITS)) != 0 {
+                    counts[usize::from(self.ta[base + l])] += 1;
+                }
+            }
+        }
+        counts
+    }
+
     // ---- interpretability ------------------------------------------------
 
     /// Return the included literals for clause `clause` of `class` as `(feature_index, is_negated)` pairs.
@@ -2068,6 +2086,23 @@ mod tests {
     }
 
     // ---- class_weights -------------------------------------------------------
+
+    #[test]
+    fn ta_state_histogram_counts_every_automaton() {
+        let (xtr, ytr) = make_xor(1000, 0.0, 62);
+        let btr = enc(12).encode_batch(&as_slices(&xtr));
+        let mut tm = TsetlinMachine::with_config(2, 12, 10, 15, 3.9, 4, true, 42);
+        for _ in 0..20 {
+            tm.fit_epoch(&btr, &ytr);
+        }
+        let h = tm.ta_state_histogram();
+        assert_eq!(h.len(), 16, "4 state bits: states 0..=15");
+        let total: u64 = h.iter().sum();
+        assert_eq!(total, 2 * 10 * 24, "classes x clauses x literals");
+        let frac = |n: u64| n as f64 / total as f64;
+        assert_eq!(frac(h[0]), tm.absorbed_exclude_fraction());
+        assert_eq!(frac(h[15]), tm.absorbed_include_fraction());
+    }
 
     #[test]
     fn class_weights_unit_same_as_default() {
