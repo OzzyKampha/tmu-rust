@@ -21,6 +21,16 @@ All notable changes to tmu-rs are documented here.
   every clause's verdict kept (`HeldOutVotes`: `scores()`,
   `fired_clauses(output)`, `strongest_clause(output, against)`), so
   explaining several outputs of one sample evaluates the clauses once.
+- **`CudaTMCoalescedAutoEncoder::fit_examples`**: TMU's autoencoder training on
+  the GPU, bit-identical to the CPU's `fit_examples` (every random stream
+  included). The examples are drawn on the host with the CPU model's code; the
+  GPU evaluates and updates the clauses, through the same kernels as
+  `fit_epoch` (`cae_update` takes the drawn target). TMU's own CUDA clause
+  bank builds the examples in a kernel, the same algorithm, but draws every
+  target present or absent 50/50 (`rng_gen.choice(2)`), ignoring the
+  frequency its CPU path uses: `output_balancing(0.5)` reproduces that. (As
+  released in TMU 0.8.3, `TMAutoEncoder.fit` passes `target_true_p=` to the
+  CUDA bank's `produce_autoencoder_example`, which does not take it.)
 
 ### Changed
 - **Autoencoder inference through TMU's literal → clause map**

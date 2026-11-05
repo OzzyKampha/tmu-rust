@@ -875,6 +875,7 @@ struct CaeUpdateParams {
     int threshold;
     int nf;
     u32 boost, half, max_state, type_iii;
+    int target;            // >= 0: the target; -1: bit o of lit (fit_epoch)
 };
 
 extern "C" __global__ void cae_update(const CaeUpdateParams p) {
@@ -883,7 +884,7 @@ extern "C" __global__ void cae_update(const CaeUpdateParams p) {
     u32 j = blockIdx.x;
     u8* ta = p.ta + (u64)j * p.n_literals;
     u64* inc = p.include + (u64)j * p.words;
-    int target = (int)((p.lit[p.o >> 6] >> (p.o & 63)) & 1ULL);
+    int target = p.target >= 0 ? p.target : (int)((p.lit[p.o >> 6] >> (p.o & 63)) & 1ULL);
     int sum = iclamp(*p.sum, -p.threshold, p.threshold);
     double prob = feedback_p(target, sum, p.threshold, 1.0);
     int not_dropped = !(p.drop_p > 0.0) || u64_to_f64(rng_peek(*p.drop_s0, j)) >= p.drop_p;

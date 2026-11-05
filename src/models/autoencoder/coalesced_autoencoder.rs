@@ -870,7 +870,7 @@ impl TMCoalescedAutoEncoder {
     }
 
     /// Literal-dropout mask for one sample (all active without dropout).
-    fn draw_literal_active(&mut self) -> Vec<u64> {
+    pub(crate) fn draw_literal_active(&mut self) -> Vec<u64> {
         let words = self.words;
         if self.literal_drop_p > 0.0 {
             let rng = &mut self.literal_rng;
@@ -883,7 +883,7 @@ impl TMCoalescedAutoEncoder {
 
     /// The order outputs are trained in this round: `0..n_features`, or a
     /// fresh shuffle (from the model's RNG) when `shuffled`.
-    fn output_order(&mut self, shuffled: bool) -> Vec<usize> {
+    pub(crate) fn output_order(&mut self, shuffled: bool) -> Vec<usize> {
         let mut order: Vec<usize> = (0..self.n_features).collect();
         if shuffled {
             for i in (1..order.len()).rev() {
@@ -1055,64 +1055,17 @@ impl TMCoalescedAutoEncoder {
         if n == 0 {
             return;
         }
-        let nf = self.n_features;
         let nc = self.n_clauses;
-        let words = self.words;
         let n_literals = self.n_literals;
-        let data = batch.data.as_slice();
-        let bit =
-            |row: usize, f: usize| (data[row * words + f / WORD_BITS] >> (f % WORD_BITS)) & 1 == 1;
-
-        // Rows that have each feature (sorted), TMU's CSC columns.
-        let mut with: Vec<Vec<u32>> = vec![Vec::new(); nf];
-        for row in 0..n {
-            for (f, rows) in with.iter_mut().enumerate() {
-                if bit(row, f) {
-                    rows.push(row as u32);
-                }
-            }
-        }
-
+        let with = self.rows_with_features(batch);
         let mut clause_outputs = vec![false; nc];
         let mut update_clause = vec![true; nc];
-        let mut union = vec![false; nf];
+        let mut union = vec![false; self.n_features];
         for _ in 0..number_of_examples {
             let order = self.output_order(true);
             self.confidence_gate(&mut update_clause);
             for o in order {
-                let rows = &with[o];
-                let p_true = if self.output_balancing > 0.0 {
-                    self.output_balancing
-                } else {
-                    rows.len() as f64 / n as f64
-                };
-                let target = self.rng.next_f64() <= p_true;
-
-                // The example: the union of `accumulation` rows.
-                union.iter_mut().for_each(|b| *b = false);
-                let degenerate = rows.is_empty() || rows.len() == n;
-                for _ in 0..self.accumulation {
-                    let row = if degenerate {
-                        self.rng.below(n)
-                    } else if target {
-                        rows[self.rng.below(rows.len())] as usize
-                    } else {
-                        loop {
-                            let r = self.rng.below(n);
-                            if rows.binary_search(&(r as u32)).is_err() {
-                                break r;
-                            }
-                        }
-                    };
-                    for (f, b) in union.iter_mut().enumerate() {
-                        *b |= bit(row, f);
-                    }
-                }
-                self.literals.iter_mut().for_each(|w| *w = 0);
-                for (f, &b) in union.iter().enumerate() {
-                    let l = if b { f } else { f + nf };
-                    self.literals[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
-                }
+                let target = self.draw_example(batch, &with, o, &mut union);
                 let lit_b = expand_bits_to_bytes(&self.literals, n_literals);
                 let mut lit_active = self.draw_literal_active();
                 let mut active_b = expand_bits_to_bytes(&lit_active, n_literals);
@@ -1127,6 +1080,75 @@ impl TMCoalescedAutoEncoder {
                 );
             }
         }
+    }
+
+    /// The rows of `batch` that have each feature, sorted: TMU's CSC columns,
+    /// from which [`fit_examples`](Self::fit_examples) draws its examples.
+    pub(crate) fn rows_with_features(&self, batch: &EncodedBatch) -> Vec<Vec<u32>> {
+        let (nf, words) = (self.n_features, self.words);
+        let mut with: Vec<Vec<u32>> = vec![Vec::new(); nf];
+        for row in 0..batch.n {
+            let r = &batch.data[row * words..(row + 1) * words];
+            for (f, rows) in with.iter_mut().enumerate() {
+                if (r[f / WORD_BITS] >> (f % WORD_BITS)) & 1 == 1 {
+                    rows.push(row as u32);
+                }
+            }
+        }
+        with
+    }
+
+    /// Draw output `o`'s training example into `self.literals` (TMU's
+    /// `tmu_produce_autoencoder_example`) and return its target: present with
+    /// probability [`output_balancing`](Self::output_balancing) if set, else
+    /// the feature's frequency; the example is the union of
+    /// [`accumulation`](Self::accumulation) rows with that value (random rows
+    /// when the feature is in every row or in none). `union` is scratch space,
+    /// `n_features` long.
+    pub(crate) fn draw_example(
+        &mut self,
+        batch: &EncodedBatch,
+        with: &[Vec<u32>],
+        o: usize,
+        union: &mut [bool],
+    ) -> bool {
+        let (n, nf, words) = (batch.n, self.n_features, self.words);
+        let data = batch.data.as_slice();
+        let bit =
+            |row: usize, f: usize| (data[row * words + f / WORD_BITS] >> (f % WORD_BITS)) & 1 == 1;
+        let rows = &with[o];
+        let p_true = if self.output_balancing > 0.0 {
+            self.output_balancing
+        } else {
+            rows.len() as f64 / n as f64
+        };
+        let target = self.rng.next_f64() <= p_true;
+
+        union.iter_mut().for_each(|b| *b = false);
+        let degenerate = rows.is_empty() || rows.len() == n;
+        for _ in 0..self.accumulation {
+            let row = if degenerate {
+                self.rng.below(n)
+            } else if target {
+                rows[self.rng.below(rows.len())] as usize
+            } else {
+                loop {
+                    let r = self.rng.below(n);
+                    if rows.binary_search(&(r as u32)).is_err() {
+                        break r;
+                    }
+                }
+            };
+            for (f, b) in union.iter_mut().enumerate() {
+                *b |= bit(row, f);
+            }
+        }
+        self.literals.iter_mut().for_each(|w| *w = 0);
+        for (f, &b) in union.iter().enumerate() {
+            let l = if b { f } else { f + nf };
+            self.literals[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
+        }
+        target
     }
 
     // ---- evaluation ---------------------------------------------------------
