@@ -697,6 +697,28 @@ impl TMSparseClassifier {
         self.bank.count_absorbed_exclude() as f64 / total as f64
     }
 
+    /// How many automata sit at each state: `counts[s]` is the number of
+    /// literals at state `s` (`0..=max_state`) in the clauses' included and
+    /// candidate lists. Literals absorbed out of the lists
+    /// ([`absorbed_literals`](Self::absorbed_literals)) and literals not yet
+    /// inserted (with `literal_insertion_state`) have no automaton and are not
+    /// counted.
+    pub fn ta_state_histogram(&self) -> Vec<u64> {
+        let mut counts = vec![0u64; usize::from(self.bank.max_state) + 1];
+        for c in &self.bank.clauses {
+            for &s in c.included_state.iter().chain(&c.excluded_state) {
+                counts[usize::from(s)] += 1;
+            }
+        }
+        counts
+    }
+
+    /// Number of (clause, literal) pairs absorbed out of the candidate lists
+    /// (see [`absorbing`](Self::absorbing)): removed for good.
+    pub fn absorbed_literals(&self) -> u64 {
+        self.bank.count_absorbed_exclude()
+    }
+
     // ---- interpretability ------------------------------------------------
 
     /// Return the included literals for `clause` of `class` as
@@ -755,6 +777,30 @@ mod tests {
     fn encode(xs: &[Vec<u8>], enc: &Encoder) -> EncodedBatch {
         let rows: Vec<&[u8]> = xs.iter().map(|v| v.as_slice()).collect();
         enc.encode_batch(&rows)
+    }
+
+    #[test]
+    fn ta_state_histogram_and_absorbed_literals_cover_every_slot() {
+        let (xtr, ytr) = make_xor(1000, 0.0, 62);
+        let tr = encode(&xtr, &Encoder::for_binary(N_FEATURES));
+        let mut tm =
+            TMSparseClassifier::with_config(2, N_FEATURES, 10, 15, 3.9, 4, true, 42).absorbing(2);
+        for _ in 0..20 {
+            tm.fit_epoch(&tr, &ytr);
+        }
+        let h = tm.ta_state_histogram();
+        assert_eq!(h.len(), 16, "4 state bits: states 0..=15");
+        let slots = (2 * 10 * 2 * N_FEATURES) as u64;
+        let absorbed = tm.absorbed_literals();
+        assert!(
+            absorbed > 0,
+            "absorbing at 2 must absorb something in 20 epochs"
+        );
+        assert_eq!(h.iter().sum::<u64>() + absorbed, slots);
+        assert_eq!(
+            absorbed as f64 / slots as f64,
+            tm.absorbed_exclude_fraction()
+        );
     }
 
     fn train_sparse(seed: u64, epochs: usize) -> (TMSparseClassifier, EncodedBatch, Vec<usize>) {

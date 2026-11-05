@@ -7,6 +7,12 @@ All notable changes to tmu-rs are documented here.
 ## [Unreleased]
 
 ### Added
+- **TA state histograms:** `ta_state_histogram()` on `TsetlinMachine`,
+  `CoalescedTsetlinMachine` and `TMSparseClassifier` counts the automata at
+  each state `0..=max_state`, for watching a machine converge (how many sit at
+  the exclude floor, how many include). On the sparse bank it counts the
+  included and candidate lists; `TMSparseClassifier::absorbed_literals()`
+  gives the exact number of literals absorbed out of them.
 - **Held-out autoencoder scoring:** `held_out_scores(&sample, &mut out)` and
   `held_out_fired_clauses(&sample, output)` on `TMCoalescedAutoEncoder` and
   `TMAutoEncoder`. Each output's vote is taken with that output's own feature
