@@ -469,7 +469,23 @@ fn feedback(p: &Params, team: &mut Team, lit: &[u64], positive: bool) {
                 if matched {
                     feedback_1_matched(states, lit, team.included[j].len() <= p.l, p.limit);
                 } else {
-                    feedback_1_unmatched(states, &mut team.rng, p.n_features, p.s_draws);
+                    // Only the drawn literals change: drop those that fell
+                    // below the limit instead of rescanning every state.
+                    let included = &mut team.included[j];
+                    let drop = |l: usize| {
+                        if let Ok(k) = included.binary_search(&(l as u32)) {
+                            included.remove(k);
+                        }
+                    };
+                    feedback_1_unmatched(
+                        states,
+                        &mut team.rng,
+                        p.n_features,
+                        p.s_draws,
+                        p.limit,
+                        drop,
+                    );
+                    continue;
                 }
             } else if matched {
                 feedback_2(states, lit, p.limit);
@@ -499,16 +515,25 @@ fn feedback_1_matched(states: &mut [u8], lit: &[u64], grow: bool, limit: u8) {
 }
 
 /// Feedback 1, clause unmatched: `s_draws` times, lower one random positive
-/// literal and one random negated literal.
-fn feedback_1_unmatched(states: &mut [u8], rng: &mut Rng, n_features: usize, s_draws: usize) {
+/// literal and one random negated literal (drawn in that order, as the
+/// reference). `excluded(l)` is called for each literal that falls from the
+/// include limit to below it.
+fn feedback_1_unmatched(
+    states: &mut [u8],
+    rng: &mut Rng,
+    n_features: usize,
+    s_draws: usize,
+    limit: u8,
+    mut excluded: impl FnMut(usize),
+) {
     for _ in 0..s_draws {
-        let i = rng.below(n_features);
-        if states[i] > STATE_MIN {
-            states[i] -= 1;
-        }
-        let i = n_features + rng.below(n_features);
-        if states[i] > STATE_MIN {
-            states[i] -= 1;
+        for i in [rng.below(n_features), n_features + rng.below(n_features)] {
+            if states[i] > STATE_MIN {
+                states[i] -= 1;
+                if states[i] + 1 == limit {
+                    excluded(i);
+                }
+            }
         }
     }
 }
@@ -593,7 +618,14 @@ mod tests {
         );
         let mut s = vec![1u8, 0, 1, 0];
         let mut rng = Rng::new(1);
-        feedback_1_unmatched(&mut s, &mut rng, 2, 50);
+        let mut dropped = Vec::new();
+        feedback_1_unmatched(&mut s, &mut rng, 2, 50, 1, |l| dropped.push(l));
+        dropped.sort();
+        assert_eq!(
+            dropped,
+            vec![0, 2],
+            "the literals that fell below the limit"
+        );
         assert!(
             s.iter().all(|&v| v == 0),
             "random decrements floor at 0: {s:?}"
