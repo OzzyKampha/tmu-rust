@@ -358,6 +358,40 @@ impl TMFuzzyPatternClassifier {
         }
     }
 
+    /// Widen the input to `n` features (`n >= n_features`), keeping everything
+    /// learned: the new literals start one below the include limit, as at
+    /// initialisation, and are included nowhere, so every clause scores old
+    /// inputs (with the new features absent) exactly as before.
+    pub fn grow_features(&mut self, n: usize) {
+        let old = self.n_features;
+        assert!(n >= old, "cannot shrink {old} features to {n}");
+        if n == old {
+            return;
+        }
+        let init = self.include_limit - 1;
+        let (old_nl, new_nl) = (2 * old, 2 * n);
+        for team in &mut self.teams {
+            let mut states = vec![init; self.clauses_per_class * new_nl];
+            for j in 0..self.clauses_per_class {
+                let (src, dst) = (&team.states[j * old_nl..(j + 1) * old_nl], j * new_nl);
+                states[dst..dst + old].copy_from_slice(&src[..old]);
+                states[dst + n..dst + n + old].copy_from_slice(&src[old..]);
+            }
+            team.states = states;
+            for inc in &mut team.included {
+                for l in inc.iter_mut() {
+                    if *l as usize >= old {
+                        *l += (n - old) as u32;
+                    }
+                }
+            }
+        }
+        self.n_features = n;
+        self.n_literals = new_nl;
+        self.words = words_for(new_nl);
+        self.s_draws = (n as f64 / self.specificity).round_ties_even() as usize;
+    }
+
     /// How many literal automata sit at each state, over every clause of
     /// every class.
     pub fn state_histogram(&self) -> [u64; 256] {
@@ -658,6 +692,40 @@ mod tests {
             assert_eq!(a.teams[c].states, b.teams[c].states, "class {c}");
             assert_eq!(a.teams[c].included, b.teams[c].included, "class {c}");
         }
+    }
+
+    #[test]
+    fn grow_features_keeps_what_was_learned() {
+        let (mut tm, _) = train(5);
+        let (xte, _) = noisy_xor(300, 0.0, 6);
+        let before: Vec<usize> = xte
+            .iter()
+            .map(|x| tm.predict(&EncodedSample::from_bits(x, 12)))
+            .collect();
+        let rules: Vec<Vec<u32>> = (0..20)
+            .map(|j| tm.included_literals(1, j).to_vec())
+            .collect();
+        tm.grow_features(20);
+        assert_eq!(tm.n_features(), 20);
+        assert_eq!(tm.s_draws(), 10, "round(20 / 2)");
+        for (x, &p) in xte.iter().zip(&before) {
+            let mut wide = x.clone();
+            wide.resize(20, 0);
+            assert_eq!(tm.predict(&EncodedSample::from_bits(&wide, 20)), p);
+        }
+        for (j, r) in rules.iter().enumerate() {
+            let moved: Vec<u32> = r.iter().map(|&l| if l >= 12 { l + 8 } else { l }).collect();
+            assert_eq!(tm.included_literals(1, j), moved.as_slice(), "clause {j}");
+            assert_eq!(
+                tm.literal_state(1, j, 12),
+                tm.include_limit - 1,
+                "new feature starts fresh"
+            );
+        }
+        // It keeps training on the wider input.
+        let mut wide = xte[0].clone();
+        wide.resize(20, 1);
+        tm.fit_one(&EncodedSample::from_bits(&wide, 20), 1);
     }
 
     #[cfg(feature = "serde")]

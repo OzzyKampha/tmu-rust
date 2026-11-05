@@ -19,7 +19,7 @@ All notable changes to tmu-rs are documented here.
   the same result. `scripts/check_fuzzy_pattern.py` retrains the reference
   algorithm (transliterated from `src/FuzzyPatternTM.jl`, same RNG) and
   compares every state: identical over four settings. Save/load (tag 10) and
-  `ClauseInspect`. Example: `fuzzy_pattern`.
+  `ClauseInspect`, `grow_features`. Example: `fuzzy_pattern`.
 - **TA state histograms:** `ta_state_histogram()` on `TsetlinMachine`,
   `CoalescedTsetlinMachine` and `TMSparseClassifier` counts the automata at
   each state `0..=max_state`, for watching a machine converge (how many sit at
