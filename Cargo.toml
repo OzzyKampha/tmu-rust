@@ -72,6 +72,14 @@ name = "sparse_vs_dense"   # dense vs sparse head-to-head (accuracy / memory / s
 path = "examples/sparse_vs_dense.rs"
 
 [[example]]
+name = "fuzzy_pattern"     # TMFuzzyPatternClassifier on noisy XOR, next to the vanilla machine
+path = "examples/fuzzy_pattern.rs"
+
+[[example]]
+name = "fuzzy_pattern_dump"  # trains a small FPTM and prints it as JSON for scripts/check_fuzzy_pattern.py
+path = "examples/fuzzy_pattern_dump.rs"
+
+[[example]]
 name = "breast_cancer"     # TMU BreastCancerDemo
 path = "examples/breast_cancer.rs"
 

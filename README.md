@@ -56,6 +56,7 @@ let accuracy = tm.accuracy(&test_x, &test_y);
   - `TMCompositeClassifier` — ensemble of per-class Tsetlin Machines with independent clause banks
   - `TMAutoEncoder` — binary reconstruction via positive-only clause banks
   - `TMSparseClassifier` — sparse clause bank with **absorbing actions**: literals are permanently dropped from each clause as training converges, so memory and per-clause evaluation scale with the number of *active* literals (a big win in high-dimensional, sparsely-relevant feature spaces)
+  - `TMFuzzyPatternClassifier` — the **Fuzzy-Pattern Tsetlin Machine** ([arXiv:2508.08350](https://arxiv.org/abs/2508.08350)): a clause loses one point per failing literal instead of going silent, so it votes `min(literals, LF) - failures` (floored at 0). Not part of TMU; ported from the reference Julia code ([BooBSD/FuzzyPatternTM](https://github.com/BooBSD/FuzzyPatternTM), MIT) and checked state by state against a transliteration of it (`scripts/check_fuzzy_pattern.py`)
 - Optional multi-threaded training via [Rayon](https://github.com/rayon-rs/rayon) (`--features parallel`)
 - Optional **CUDA GPU training and inference for every model** (`--features cuda`) — bit-identical to CPU training; see [GPU (CUDA)](#gpu-cuda)
 - AVX2 fast paths for clause update loops with runtime dispatch — u8 TA counters processed 32-wide (4× smaller working set vs u32; scalar fallback on non-AVX2 targets)
@@ -148,6 +149,7 @@ The examples reproduce the [`cair/tmu`](https://github.com/cair/tmu) demos with 
 | `InterpretabilityDemo` | `interpretability` | — | `cargo run --release --example interpretability` |
 | `TMCoalescedClassifier` | `coalesced` | — | `cargo run --release --example coalesced` |
 | `TMSparseClassifier` | `sparse` | — | `cargo run --release --example sparse` |
+| *(FPTM)* `TMFuzzyPatternClassifier` | `fuzzy_pattern` | — | `cargo run --release --example fuzzy_pattern` |
 | `BreastCancerDemo` | `breast_cancer` | scikit-learn | see [Data preparation](#data-preparation) |
 | `MNISTDemo` / `MNISTDemoWeightedClauses` | `mnist` | MNIST | see [Data preparation](#data-preparation) |
 | `IMDbTextCategorizationDemo` | `imdb` | Keras IMDb | see [Data preparation](#data-preparation) |

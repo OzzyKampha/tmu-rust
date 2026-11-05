@@ -7,6 +7,19 @@ All notable changes to tmu-rs are documented here.
 ## [Unreleased]
 
 ### Added
+- **Fuzzy-Pattern Tsetlin Machine:** `TMFuzzyPatternClassifier`, a port of
+  Artem Hnilov's FPTM ([arXiv:2508.08350](https://arxiv.org/abs/2508.08350);
+  reference code `BooBSD/FuzzyPatternTM`, MIT). A clause with `n` included
+  literals scores `min(n, LF)` minus its failing literals, floored at 0, so a
+  partly matching clause still votes; votes are unweighted (positive minus
+  negative clauses) and predictions use them unclamped. Settings: `T`,
+  specificity `S` (`round(features / S)` random decrements), `max_literals`
+  (`L`), `literal_failures` (`LF`), `include_limit`. Deterministic per seed;
+  with `--features parallel` the classes of a sample train in parallel with
+  the same result. `scripts/check_fuzzy_pattern.py` retrains the reference
+  algorithm (transliterated from `src/FuzzyPatternTM.jl`, same RNG) and
+  compares every state: identical over four settings. Save/load (tag 10) and
+  `ClauseInspect`. Example: `fuzzy_pattern`.
 - **TA state histograms:** `ta_state_histogram()` on `TsetlinMachine`,
   `CoalescedTsetlinMachine` and `TMSparseClassifier` counts the automata at
   each state `0..=max_state`, for watching a machine converge (how many sit at

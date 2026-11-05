@@ -1,7 +1,7 @@
 use crate::encoder::EncodedSample;
 use crate::models::{
-    CoalescedTsetlinMachine, TMAutoEncoder, TMCoalescedAutoEncoder, TMRegressor,
-    TMSparseClassifier, TsetlinMachine,
+    CoalescedTsetlinMachine, TMAutoEncoder, TMCoalescedAutoEncoder, TMFuzzyPatternClassifier,
+    TMRegressor, TMSparseClassifier, TsetlinMachine,
 };
 
 /// Uniform clause-inspection interface across all TM model types.
@@ -93,6 +93,33 @@ impl ClauseInspect for TMSparseClassifier {
     }
     fn clause_rule(&self, output: usize, clause: usize) -> Vec<(usize, bool)> {
         self.clause_rule(output, clause)
+    }
+    fn fired_clauses(&self, sample: &EncodedSample, output: usize) -> Vec<usize> {
+        self.fired_clauses(sample, output)
+    }
+}
+
+/// Fuzzy-pattern clauses are unweighted: positive (even) clauses weigh +1 and
+/// negative (odd) ones -1. "Fired" means a fuzzy score above 0.
+impl ClauseInspect for TMFuzzyPatternClassifier {
+    fn n_clauses(&self) -> usize {
+        self.clauses_per_class()
+    }
+    fn n_outputs(&self) -> usize {
+        self.n_classes()
+    }
+    fn clause_weight(&self, _output: usize, clause: usize) -> i32 {
+        if clause.is_multiple_of(2) { 1 } else { -1 }
+    }
+    fn clause_rule(&self, output: usize, clause: usize) -> Vec<(usize, bool)> {
+        let nf = self.n_features();
+        self.included_literals(output, clause)
+            .iter()
+            .map(|&l| {
+                let l = l as usize;
+                if l < nf { (l, false) } else { (l - nf, true) }
+            })
+            .collect()
     }
     fn fired_clauses(&self, sample: &EncodedSample, output: usize) -> Vec<usize> {
         self.fired_clauses(sample, output)
