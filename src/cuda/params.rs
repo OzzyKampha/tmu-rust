@@ -90,6 +90,7 @@ params! {
         n_clauses: u32, words: u32, n_literals: u32, o: u32,
         threshold: i32, nf: i32,
         boost: u32, half: u32, max_state: u32, type_iii: u32,
+        target: i32,
     }
     RgFireParams {
         include: u64, valid: u64, lit: u64, weights: u64, pred_sum: u64,

@@ -9,9 +9,9 @@ use crate::clause_bank::dense::rule_from_include;
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::{DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN, use_parallel};
 use crate::clause_bank::dense::{
-    GOLDEN, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of, expand_bits_to_bytes,
-    fire_predict, rebuild_include, type_i_update_bytes, type_ii_update_bytes, type_iii_update,
-    words_for,
+    GOLDEN, HeldOut, HeldOutIndex, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of,
+    expand_bits_to_bytes, rebuild_include, type_i_update_bytes, type_ii_update_bytes,
+    type_iii_update, words_for,
 };
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
@@ -53,6 +53,12 @@ pub struct TMCoalescedAutoEncoder {
     pub(crate) ta: Vec<u8>,
     /// Include bitset. Clause `j` occupies `include[j * words .. (j+1) * words]`.
     pub(crate) include: Vec<u64>,
+    /// Inference map from literals to the clauses that include them (TMU's
+    /// `literal_clause_map`), built on first prediction and dropped by every
+    /// `&mut self` / `mut self` method, so it never outlives the include
+    /// bitsets it was built from.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) literal_index: std::sync::OnceLock<InferenceIndex>,
     pub(crate) half: u8,
     pub(crate) max_state: u8,
 
@@ -90,6 +96,79 @@ pub struct TMCoalescedAutoEncoder {
     /// Rows combined into one [`Self::fit_examples`] example.
     #[cfg_attr(feature = "serde", serde(skip, default = "one_row"))]
     pub(crate) accumulation: usize,
+}
+
+/// One sample's held-out votes from a [`TMCoalescedAutoEncoder`]
+/// ([`TMCoalescedAutoEncoder::held_out_votes`]): each output's clamped vote
+/// with its own feature hidden, and the clauses behind each vote.
+#[derive(Clone, Debug)]
+pub struct HeldOutVotes<'a> {
+    ae: &'a TMCoalescedAutoEncoder,
+    classes: Vec<HeldOut>,
+    scores: Vec<i32>,
+}
+
+impl HeldOutVotes<'_> {
+    /// Each output's clamped held-out vote (`held_out_scores`).
+    pub fn scores(&self) -> &[i32] {
+        &self.scores
+    }
+
+    /// The shared clauses that vote on `output` with its feature hidden.
+    pub fn fired_clauses(&self, output: usize) -> Vec<usize> {
+        fired_for(&self.classes, output)
+    }
+
+    /// The clause with the strongest vote on `output` in one direction among
+    /// those voting on it, and its weight: the most negative weight when
+    /// `against`, else the most positive (the first such clause on ties).
+    /// `None` when no clause votes that way.
+    pub fn strongest_clause(&self, output: usize, against: bool) -> Option<(usize, i32)> {
+        let nc = self.ae.n_clauses;
+        let ws = &self.ae.weights[output * nc..(output + 1) * nc];
+        let o = output as u32;
+        let mut best: Option<(usize, i32)> = None;
+        for (j, &class) in self.classes.iter().enumerate() {
+            if !votes_on(class, o) {
+                continue;
+            }
+            let w = ws[j];
+            let wanted = if against { w < 0 } else { w > 0 };
+            let better = |b: i32| if against { w < b } else { w > b };
+            if wanted && best.is_none_or(|(_, b)| better(b)) {
+                best = Some((j, w));
+            }
+        }
+        best
+    }
+}
+
+/// Whether a clause with this verdict votes on output `o`.
+#[inline]
+fn votes_on(class: HeldOut, o: u32) -> bool {
+    match class {
+        HeldOut::All => true,
+        HeldOut::AllBut(f) => f != o,
+        HeldOut::Only(f) => f == o,
+        HeldOut::Never => false,
+    }
+}
+
+/// The clauses whose verdict lets them vote on `output`.
+fn fired_for(classes: &[HeldOut], output: usize) -> Vec<usize> {
+    let o = output as u32;
+    (0..classes.len())
+        .filter(|&j| votes_on(classes[j], o))
+        .collect()
+}
+
+/// What inference reads, built from the clause bank on first prediction: the
+/// literal → clause map (with each clause's single feature, for held-out
+/// scoring) and the weights clause-major (`weights_t[j * n_features + o]`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct InferenceIndex {
+    held: HeldOutIndex,
+    weights_t: Vec<i32>,
 }
 
 #[cfg(feature = "serde")]
@@ -267,6 +346,7 @@ impl TMCoalescedAutoEncoder {
             dig_lit_active: digits_of(1.0, MASK_BITS),
             ta,
             include,
+            literal_index: Default::default(),
             half,
             max_state,
             weights,
@@ -292,12 +372,14 @@ impl TMCoalescedAutoEncoder {
 
     /// Limit how many literals each clause may include (Type Ia guard).
     pub fn max_included_literals(mut self, max: usize) -> Self {
+        self.reset_literal_index();
         self.max_included_literals = max;
         self
     }
 
     /// Per-clause dropout probability during training (default: 0.0).
     pub fn clause_drop_p(mut self, p: f64) -> Self {
+        self.reset_literal_index();
         assert!((0.0..1.0).contains(&p), "clause_drop_p must be in [0, 1)");
         self.clause_drop_p = p;
         self
@@ -305,6 +387,7 @@ impl TMCoalescedAutoEncoder {
 
     /// Per-literal dropout probability during training (default: 0.0).
     pub fn literal_drop_p(mut self, p: f64) -> Self {
+        self.reset_literal_index();
         assert!((0.0..1.0).contains(&p), "literal_drop_p must be in [0, 1)");
         self.literal_drop_p = p;
         self.dig_lit_active = digits_of(1.0 - p, MASK_BITS);
@@ -313,6 +396,7 @@ impl TMCoalescedAutoEncoder {
 
     /// Enable Type III feedback with indicator strength `d` (must be > 1.0).
     pub fn type_iii_feedback(mut self, d: f64) -> Self {
+        self.reset_literal_index();
         assert!(d > 1.0, "d must be > 1.0");
         self.d = d;
         self.type_iii = true;
@@ -324,6 +408,7 @@ impl TMCoalescedAutoEncoder {
     /// each automaton starts on either side of it at random, so about half the
     /// literals begin included. Call before training.
     pub fn start_excluded(mut self) -> Self {
+        self.reset_literal_index();
         self.ta.iter_mut().for_each(|t| *t = self.half - 1);
         let (n_literals, words) = (self.n_literals, self.words);
         for j in 0..self.n_clauses {
@@ -344,6 +429,7 @@ impl TMCoalescedAutoEncoder {
     /// so the order changes what is learned. CPU only: `to_cuda` refuses it.
     /// [`fit_examples`](Self::fit_examples) always shuffles.
     pub fn shuffle_outputs(mut self, on: bool) -> Self {
+        self.reset_literal_index();
         self.shuffle_outputs = on;
         self
     }
@@ -353,6 +439,7 @@ impl TMCoalescedAutoEncoder {
     /// TMU) uses each feature's frequency in the training rows; 0.5 trains
     /// rare features on rows that have them half the time.
     pub fn output_balancing(mut self, p: f64) -> Self {
+        self.reset_literal_index();
         assert!(
             (0.0..=1.0).contains(&p),
             "output_balancing must be in [0, 1]"
@@ -364,6 +451,7 @@ impl TMCoalescedAutoEncoder {
     /// TMU's `accumulation` for [`fit_examples`](Self::fit_examples): each
     /// example is the union of this many rows with the drawn target (default 1).
     pub fn accumulation(mut self, rows: usize) -> Self {
+        self.reset_literal_index();
         assert!(rows >= 1, "accumulation must be at least 1");
         self.accumulation = rows;
         self
@@ -394,26 +482,109 @@ impl TMCoalescedAutoEncoder {
 
     // ---- inference ----------------------------------------------------------
 
-    fn reconstruct_lit(&self, lit: &[u64]) -> Vec<u8> {
-        debug_assert_eq!(lit.len(), self.words);
-        let nc = self.n_clauses;
-        let words = self.words;
-        let n_features = self.n_features;
-        let include = self.include.as_slice();
-        let valid = self.valid.as_slice();
+    /// The shared clauses that fire for `lit` (inference semantics: an empty
+    /// clause does not fire), through the literal → clause map. A clause's
+    /// output does not depend on the output being voted on, so it is computed
+    /// once per sample and shared by every output's vote.
+    fn fired_predict(&self, lit: &[u64]) -> Vec<usize> {
+        self.index()
+            .held
+            .map
+            .clause_outputs(lit)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(j, fires)| fires.then_some(j))
+            .collect()
+    }
 
-        let mut out = vec![0u8; n_features];
-        for (o, out_o) in out.iter_mut().enumerate() {
-            let ws = &self.weights[o * nc..(o + 1) * nc];
-            let mut sum = 0i32;
-            for (j, &w) in ws.iter().enumerate() {
-                if fire_predict(&include[j * words..(j + 1) * words], lit, valid, words) {
-                    sum += w;
+    fn index(&self) -> &InferenceIndex {
+        self.literal_index.get_or_init(|| {
+            let (nc, nf) = (self.n_clauses, self.n_features);
+            let mut weights_t = vec![0i32; nf * nc];
+            for o in 0..nf {
+                for j in 0..nc {
+                    weights_t[j * nf + o] = self.weights[o * nc + j];
                 }
             }
-            *out_o = (sum > 0) as u8;
+            InferenceIndex {
+                held: HeldOutIndex::build(&self.include, &self.valid, nc, self.words, nf),
+                weights_t,
+            }
+        })
+    }
+
+    /// Like [`reconstruct_scores`](Self::reconstruct_scores), but each
+    /// output's vote is taken with that output's own feature hidden (its two
+    /// literals left out of every clause), as training hides it.
+    ///
+    /// Plain reconstruction lets a clause look at the very bit it votes on: a
+    /// clause that other outputs taught to include literal `o` echoes bit `o`
+    /// back. Hidden, the vote says how well the *rest* of the sample predicts
+    /// each bit — what an anomaly score wants. One pass through the literal →
+    /// clause map gives every clause's verdict for every output.
+    pub fn held_out_scores(&self, sample: &EncodedSample, out: &mut [i32]) {
+        debug_assert_eq!(out.len(), self.n_features);
+        out.copy_from_slice(self.held_out_votes(sample).scores());
+    }
+
+    /// The held-out votes for `sample` (as [`held_out_scores`](Self::held_out_scores)),
+    /// kept with every clause's verdict, so the clauses behind any output's vote
+    /// can be read without evaluating the clauses again: what an explanation of
+    /// several outputs needs.
+    pub fn held_out_votes(&self, sample: &EncodedSample) -> HeldOutVotes<'_> {
+        let nf = self.n_features;
+        let index = self.index();
+        let classes = index.held.classify(&sample.0);
+        let mut scores = vec![0i32; nf];
+        for (j, &class) in classes.iter().enumerate() {
+            let row = &index.weights_t[j * nf..(j + 1) * nf];
+            match class {
+                HeldOut::All => scores.iter_mut().zip(row).for_each(|(s, w)| *s += w),
+                HeldOut::AllBut(f) => {
+                    scores.iter_mut().zip(row).for_each(|(s, w)| *s += w);
+                    scores[f as usize] -= row[f as usize];
+                }
+                HeldOut::Only(f) => scores[f as usize] += row[f as usize],
+                HeldOut::Never => {}
+            }
         }
-        out
+        let t = self.threshold;
+        scores.iter_mut().for_each(|s| *s = (*s).clamp(-t, t));
+        HeldOutVotes {
+            ae: self,
+            classes,
+            scores,
+        }
+    }
+
+    /// The shared clauses that vote on `output` with `output`'s own feature
+    /// hidden (see [`held_out_scores`](Self::held_out_scores)). For several
+    /// outputs of one sample, [`held_out_votes`](Self::held_out_votes)
+    /// evaluates the clauses once.
+    pub fn held_out_fired_clauses(&self, sample: &EncodedSample, output: usize) -> Vec<usize> {
+        fired_for(&self.index().held.classify(&sample.0), output)
+    }
+
+    /// Drop the inference map; called by every method that can change the
+    /// include bitsets or the valid mask.
+    fn reset_literal_index(&mut self) {
+        self.literal_index = std::sync::OnceLock::new();
+    }
+
+    /// Each output's weighted sum of the clauses in `fired` (unclamped).
+    fn sums_of(&self, fired: &[usize], out: &mut [i32]) {
+        let nc = self.n_clauses;
+        for (o, out_o) in out.iter_mut().enumerate() {
+            let ws = &self.weights[o * nc..(o + 1) * nc];
+            *out_o = fired.iter().map(|&j| ws[j]).sum();
+        }
+    }
+
+    fn reconstruct_lit(&self, lit: &[u64]) -> Vec<u8> {
+        debug_assert_eq!(lit.len(), self.words);
+        let mut sums = vec![0i32; self.n_features];
+        self.sums_of(&self.fired_predict(lit), &mut sums);
+        sums.into_iter().map(|s| (s > 0) as u8).collect()
     }
 
     /// Reconstruct a binary vector from an encoded sample.
@@ -442,34 +613,16 @@ impl TMCoalescedAutoEncoder {
 
     /// Fill `out` with the clamped weighted clause sums for each output bit.
     pub fn reconstruct_scores(&self, sample: &EncodedSample, out: &mut [i32]) {
-        let lit = &sample.0;
         debug_assert_eq!(out.len(), self.n_features);
-        let nc = self.n_clauses;
-        let words = self.words;
-        let include = self.include.as_slice();
-        let valid = self.valid.as_slice();
-        for (o, out_o) in out.iter_mut().enumerate() {
-            let ws = &self.weights[o * nc..(o + 1) * nc];
-            let mut sum = 0i32;
-            for (j, &w) in ws.iter().enumerate() {
-                if fire_predict(&include[j * words..(j + 1) * words], lit, valid, words) {
-                    sum += w;
-                }
-            }
-            *out_o = sum.clamp(-self.threshold, self.threshold);
-        }
+        self.sums_of(&self.fired_predict(&sample.0), out);
+        let t = self.threshold;
+        out.iter_mut().for_each(|s| *s = (*s).clamp(-t, t));
     }
 
     /// Return the indices of all shared clauses that fire for `sample`.
     /// The `_output` parameter is accepted for API uniformity but ignored — clauses are shared.
     pub fn fired_clauses(&self, sample: &EncodedSample, _output: usize) -> Vec<usize> {
-        let lit = &sample.0;
-        let words = self.words;
-        let include = self.include.as_slice();
-        let valid = self.valid.as_slice();
-        (0..self.n_clauses)
-            .filter(|&j| fire_predict(&include[j * words..(j + 1) * words], lit, valid, words))
-            .collect()
+        self.fired_predict(&sample.0)
     }
 
     // ---- training helpers ---------------------------------------------------
@@ -717,7 +870,7 @@ impl TMCoalescedAutoEncoder {
     }
 
     /// Literal-dropout mask for one sample (all active without dropout).
-    fn draw_literal_active(&mut self) -> Vec<u64> {
+    pub(crate) fn draw_literal_active(&mut self) -> Vec<u64> {
         let words = self.words;
         if self.literal_drop_p > 0.0 {
             let rng = &mut self.literal_rng;
@@ -730,7 +883,7 @@ impl TMCoalescedAutoEncoder {
 
     /// The order outputs are trained in this round: `0..n_features`, or a
     /// fresh shuffle (from the model's RNG) when `shuffled`.
-    fn output_order(&mut self, shuffled: bool) -> Vec<usize> {
+    pub(crate) fn output_order(&mut self, shuffled: bool) -> Vec<usize> {
         let mut order: Vec<usize> = (0..self.n_features).collect();
         if shuffled {
             for i in (1..order.len()).rev() {
@@ -856,11 +1009,13 @@ impl TMCoalescedAutoEncoder {
 
     /// Train on a single encoded sample (unsupervised — no label required).
     pub fn fit_one(&mut self, sample: &EncodedSample) {
+        self.reset_literal_index();
         self.fit_one_lit(&sample.0);
     }
 
     /// Run one training epoch over an encoded batch, shuffling the order each epoch.
     pub fn fit_epoch(&mut self, batch: &EncodedBatch) {
+        self.reset_literal_index();
         debug_assert_eq!(batch.words, self.words);
         let n = batch.n;
         let mut order: Vec<usize> = (0..n).collect();
@@ -894,69 +1049,23 @@ impl TMCoalescedAutoEncoder {
     /// time. The confidence gate is drawn once per example, the literal
     /// dropout mask once per output example.
     pub fn fit_examples(&mut self, batch: &EncodedBatch, number_of_examples: usize) {
+        self.reset_literal_index();
         debug_assert_eq!(batch.words, self.words);
         let n = batch.n;
         if n == 0 {
             return;
         }
-        let nf = self.n_features;
         let nc = self.n_clauses;
-        let words = self.words;
         let n_literals = self.n_literals;
-        let data = batch.data.as_slice();
-        let bit =
-            |row: usize, f: usize| (data[row * words + f / WORD_BITS] >> (f % WORD_BITS)) & 1 == 1;
-
-        // Rows that have each feature (sorted), TMU's CSC columns.
-        let mut with: Vec<Vec<u32>> = vec![Vec::new(); nf];
-        for row in 0..n {
-            for (f, rows) in with.iter_mut().enumerate() {
-                if bit(row, f) {
-                    rows.push(row as u32);
-                }
-            }
-        }
-
+        let with = self.rows_with_features(batch);
         let mut clause_outputs = vec![false; nc];
         let mut update_clause = vec![true; nc];
-        let mut union = vec![false; nf];
+        let mut union = vec![false; self.n_features];
         for _ in 0..number_of_examples {
             let order = self.output_order(true);
             self.confidence_gate(&mut update_clause);
             for o in order {
-                let rows = &with[o];
-                let p_true = if self.output_balancing > 0.0 {
-                    self.output_balancing
-                } else {
-                    rows.len() as f64 / n as f64
-                };
-                let target = self.rng.next_f64() <= p_true;
-
-                // The example: the union of `accumulation` rows.
-                union.iter_mut().for_each(|b| *b = false);
-                let degenerate = rows.is_empty() || rows.len() == n;
-                for _ in 0..self.accumulation {
-                    let row = if degenerate {
-                        self.rng.below(n)
-                    } else if target {
-                        rows[self.rng.below(rows.len())] as usize
-                    } else {
-                        loop {
-                            let r = self.rng.below(n);
-                            if rows.binary_search(&(r as u32)).is_err() {
-                                break r;
-                            }
-                        }
-                    };
-                    for (f, b) in union.iter_mut().enumerate() {
-                        *b |= bit(row, f);
-                    }
-                }
-                self.literals.iter_mut().for_each(|w| *w = 0);
-                for (f, &b) in union.iter().enumerate() {
-                    let l = if b { f } else { f + nf };
-                    self.literals[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
-                }
+                let target = self.draw_example(batch, &with, o, &mut union);
                 let lit_b = expand_bits_to_bytes(&self.literals, n_literals);
                 let mut lit_active = self.draw_literal_active();
                 let mut active_b = expand_bits_to_bytes(&lit_active, n_literals);
@@ -971,6 +1080,75 @@ impl TMCoalescedAutoEncoder {
                 );
             }
         }
+    }
+
+    /// The rows of `batch` that have each feature, sorted: TMU's CSC columns,
+    /// from which [`fit_examples`](Self::fit_examples) draws its examples.
+    pub(crate) fn rows_with_features(&self, batch: &EncodedBatch) -> Vec<Vec<u32>> {
+        let (nf, words) = (self.n_features, self.words);
+        let mut with: Vec<Vec<u32>> = vec![Vec::new(); nf];
+        for row in 0..batch.n {
+            let r = &batch.data[row * words..(row + 1) * words];
+            for (f, rows) in with.iter_mut().enumerate() {
+                if (r[f / WORD_BITS] >> (f % WORD_BITS)) & 1 == 1 {
+                    rows.push(row as u32);
+                }
+            }
+        }
+        with
+    }
+
+    /// Draw output `o`'s training example into `self.literals` (TMU's
+    /// `tmu_produce_autoencoder_example`) and return its target: present with
+    /// probability [`output_balancing`](Self::output_balancing) if set, else
+    /// the feature's frequency; the example is the union of
+    /// [`accumulation`](Self::accumulation) rows with that value (random rows
+    /// when the feature is in every row or in none). `union` is scratch space,
+    /// `n_features` long.
+    pub(crate) fn draw_example(
+        &mut self,
+        batch: &EncodedBatch,
+        with: &[Vec<u32>],
+        o: usize,
+        union: &mut [bool],
+    ) -> bool {
+        let (n, nf, words) = (batch.n, self.n_features, self.words);
+        let data = batch.data.as_slice();
+        let bit =
+            |row: usize, f: usize| (data[row * words + f / WORD_BITS] >> (f % WORD_BITS)) & 1 == 1;
+        let rows = &with[o];
+        let p_true = if self.output_balancing > 0.0 {
+            self.output_balancing
+        } else {
+            rows.len() as f64 / n as f64
+        };
+        let target = self.rng.next_f64() <= p_true;
+
+        union.iter_mut().for_each(|b| *b = false);
+        let degenerate = rows.is_empty() || rows.len() == n;
+        for _ in 0..self.accumulation {
+            let row = if degenerate {
+                self.rng.below(n)
+            } else if target {
+                rows[self.rng.below(rows.len())] as usize
+            } else {
+                loop {
+                    let r = self.rng.below(n);
+                    if rows.binary_search(&(r as u32)).is_err() {
+                        break r;
+                    }
+                }
+            };
+            for (f, b) in union.iter_mut().enumerate() {
+                *b |= bit(row, f);
+            }
+        }
+        self.literals.iter_mut().for_each(|w| *w = 0);
+        for (f, &b) in union.iter().enumerate() {
+            let l = if b { f } else { f + nf };
+            self.literals[l / WORD_BITS] |= 1u64 << (l % WORD_BITS);
+        }
+        target
     }
 
     // ---- evaluation ---------------------------------------------------------
@@ -1365,5 +1543,190 @@ mod tests {
         assert_eq!(back.accumulation, 1);
         // The excluded start is state, so it is kept.
         assert_eq!(back.ta, ae.ta);
+    }
+
+    /// `reconstruct_scores` by brute force: every clause, `fire_predict`.
+    fn scores_by_scan(ae: &TMCoalescedAutoEncoder, sample: &EncodedSample) -> Vec<i32> {
+        let (nc, w) = (ae.n_clauses, ae.words);
+        (0..ae.n_features)
+            .map(|o| {
+                let s: i32 = (0..nc)
+                    .filter(|&j| {
+                        crate::clause_bank::dense::fire_predict(
+                            &ae.include[j * w..(j + 1) * w],
+                            &sample.0,
+                            &ae.valid,
+                            w,
+                        )
+                    })
+                    .map(|j| ae.weights[o * nc + j])
+                    .sum();
+                s.clamp(-ae.threshold, ae.threshold)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn literal_map_scores_match_a_full_scan_across_training() {
+        // 70 features: literals span three words.
+        let mut rng = Rng::new(4);
+        let xs: Vec<Vec<u8>> = (0..400)
+            .map(|_| {
+                (0..70)
+                    .map(|_| rng.next_u64().is_multiple_of(5) as u8)
+                    .collect()
+            })
+            .collect();
+        let e = enc(70);
+        let batch = e.encode_batch(&as_slices(&xs));
+        let samples: Vec<EncodedSample> = xs.iter().take(40).map(|x| e.encode_one(x)).collect();
+        let check = |ae: &TMCoalescedAutoEncoder, when: &str| {
+            let mut got = vec![0i32; 70];
+            for s in &samples {
+                ae.reconstruct_scores(s, &mut got);
+                assert_eq!(got, scores_by_scan(ae, s), "{when}");
+                let recon: Vec<u8> = got.iter().map(|&v| (v > 0) as u8).collect();
+                assert_eq!(ae.reconstruct(s), recon, "{when}");
+                let fired: Vec<usize> = (0..ae.n_clauses)
+                    .filter(|&j| {
+                        crate::clause_bank::dense::fire_predict(
+                            &ae.include[j * ae.words..(j + 1) * ae.words],
+                            &s.0,
+                            &ae.valid,
+                            ae.words,
+                        )
+                    })
+                    .collect();
+                assert_eq!(ae.fired_clauses(s, 0), fired, "{when}");
+            }
+        };
+        let mut ae = TMCoalescedAutoEncoder::with_config(70, 30, 10, 3.0, 8, true, 2);
+        check(&ae, "untrained");
+        ae.fit_epoch(&batch);
+        check(&ae, "after one epoch"); // the map is built here ...
+        ae.fit_epoch(&batch);
+        check(&ae, "after more training"); // ... and must be rebuilt here
+        ae.fit_examples(&batch, 100);
+        check(&ae, "after fit_examples");
+        let ae = ae.start_excluded();
+        check(&ae, "after start_excluded");
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn literal_map_scores_match_after_save_load() {
+        use crate::serial::SaveLoad;
+        let xs = make_mirrored(300, 6, 3);
+        let e = enc(12);
+        let batch = e.encode_batch(&as_slices(&xs));
+        let mut ae = TMCoalescedAutoEncoder::with_config(12, 20, 15, 3.9, 8, true, 42);
+        ae.fit_epoch(&batch);
+        let s = e.encode_one(&xs[0]);
+        let mut before = vec![0i32; 12];
+        ae.reconstruct_scores(&s, &mut before); // builds the map
+        let path = std::env::temp_dir().join(format!("tmu_cae_map_{}.bin", std::process::id()));
+        ae.save(&path).unwrap();
+        let back = TMCoalescedAutoEncoder::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut after = vec![0i32; 12];
+        back.reconstruct_scores(&s, &mut after);
+        assert_eq!(before, after);
+        assert_eq!(after, scores_by_scan(&back, &s));
+    }
+
+    #[test]
+    fn held_out_scores_hide_each_outputs_own_feature() {
+        let mut rng = Rng::new(9);
+        let xs: Vec<Vec<u8>> = (0..300)
+            .map(|_| {
+                (0..70)
+                    .map(|_| rng.next_u64().is_multiple_of(5) as u8)
+                    .collect()
+            })
+            .collect();
+        let e = enc(70);
+        let batch = e.encode_batch(&as_slices(&xs));
+        let mut ae = TMCoalescedAutoEncoder::with_config(70, 40, 8, 3.0, 8, true, 3);
+        for round in 0..2 {
+            ae.fit_epoch(&batch); // the second round must rebuild the index
+            let (nc, w, nf) = (ae.n_clauses, ae.words, ae.n_features);
+            let mut got = vec![0i32; nf];
+            for x in xs.iter().take(30) {
+                let s = e.encode_one(x);
+                ae.held_out_scores(&s, &mut got);
+                for (o, &vote) in got.iter().enumerate() {
+                    let fired: Vec<usize> = (0..nc)
+                        .filter(|&j| {
+                            crate::clause_bank::dense::fires_hidden(
+                                &ae.include,
+                                &ae.valid,
+                                w,
+                                nf,
+                                &s.0,
+                                j,
+                                o,
+                            )
+                        })
+                        .collect();
+                    let sum: i32 = fired.iter().map(|&j| ae.weights[o * nc + j]).sum();
+                    assert_eq!(
+                        vote,
+                        sum.clamp(-ae.threshold, ae.threshold),
+                        "round {round}, output {o}"
+                    );
+                    assert_eq!(
+                        ae.held_out_fired_clauses(&s, o),
+                        fired,
+                        "round {round}, output {o}"
+                    );
+                    let votes = ae.held_out_votes(&s);
+                    assert_eq!(votes.scores()[o], vote);
+                    assert_eq!(votes.fired_clauses(o), fired);
+                    for against in [true, false] {
+                        // The first clause with the most extreme weight that way.
+                        let mut want: Option<(usize, i32)> = None;
+                        for &j in &fired {
+                            let w = ae.weights[o * nc + j];
+                            let wanted = if against { w < 0 } else { w > 0 };
+                            let better =
+                                want.is_none_or(|(_, b)| if against { w < b } else { w > b });
+                            if wanted && better {
+                                want = Some((j, w));
+                            }
+                        }
+                        assert_eq!(votes.strongest_clause(o, against), want);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn held_out_scores_ignore_a_clause_on_the_hidden_bit_alone() {
+        // A clause including only literal 0 echoes bit 0 when reconstructing;
+        // held out, it is empty and says nothing about output 0.
+        let mut ae = TMCoalescedAutoEncoder::with_config(3, 1, 5, 3.0, 8, true, 1).start_excluded();
+        ae.ta[0] = ae.half;
+        let (n_lit, words, half) = (ae.n_literals, ae.words, ae.half);
+        let valid = ae.valid.clone();
+        rebuild_include(
+            &ae.ta[..n_lit],
+            &mut ae.include[..words],
+            &valid,
+            words,
+            n_lit,
+            half,
+        );
+        ae.weights[..3].copy_from_slice(&[3, 3, 3]);
+        ae.reset_literal_index();
+        let sample = enc(3).encode_one(&[1, 1, 0]);
+        let (mut plain, mut held) = (vec![0i32; 3], vec![0i32; 3]);
+        ae.reconstruct_scores(&sample, &mut plain);
+        ae.held_out_scores(&sample, &mut held);
+        assert_eq!(plain, vec![3, 3, 3]);
+        assert_eq!(held, vec![0, 3, 3]);
+        // Bit 0 off: the clause fails, except for output 0, where it is empty.
+        ae.held_out_scores(&enc(3).encode_one(&[0, 1, 0]), &mut held);
+        assert_eq!(held, vec![0, 0, 0]);
     }
 }

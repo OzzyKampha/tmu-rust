@@ -683,6 +683,78 @@ mod coalesced_autoencoder {
         );
     }
 
+    /// GPU `fit_examples` (TMU's training) against the CPU's, bit for bit.
+    fn check_examples(make: impl Fn() -> TMCoalescedAutoEncoder, dev: &CudaDevice) {
+        let nf = 8;
+        let (mut xs, _) = xor_data(60, nf, 0.0, 31);
+        // A feature in every row and one in none: examples drawn at random.
+        for x in &mut xs {
+            x[6] = 1;
+            x[7] = 0;
+        }
+        let batch = encode(&xs, nf);
+        let mut cpu = make();
+        let mut gpu = make().to_cuda(dev).unwrap();
+        for _ in 0..2 {
+            cpu.fit_examples(&batch, 40);
+            gpu.fit_examples(&batch, 40).unwrap();
+        }
+        let back = gpu.to_cpu().unwrap();
+        assert_dense_eq!(back, cpu);
+        assert_eq!(states(&back.output_rngs), states(&cpu.output_rngs));
+        assert_eq!(back.clause_gate_rng.0, cpu.clause_gate_rng.0);
+        assert_eq!(back.rng.0, cpu.rng.0);
+        assert_eq!(back.literal_rng.0, cpu.literal_rng.0);
+        assert_eq!(
+            gpu.reconstruct_batch(&batch).unwrap(),
+            cpu.reconstruct_batch(&batch)
+        );
+    }
+
+    #[test]
+    fn fit_examples_matches_cpu_default() {
+        if skip() {
+            return;
+        }
+        check_examples(
+            || TMCoalescedAutoEncoder::with_config(8, 12, 8, 3.9, 8, true, 1),
+            &device_serial(),
+        );
+    }
+
+    #[test]
+    fn fit_examples_matches_cpu_all_options() {
+        if skip() {
+            return;
+        }
+        check_examples(
+            || {
+                TMCoalescedAutoEncoder::with_config(8, 10, 6, 2.5, 4, false, 5)
+                    .output_balancing(0.5)
+                    .accumulation(2)
+                    .start_excluded()
+                    .clause_drop_p(0.25)
+                    .literal_drop_p(0.2)
+                    .max_included_literals(3)
+            },
+            &device_serial(),
+        );
+    }
+
+    #[test]
+    fn fit_examples_matches_cpu_type_iii() {
+        if skip() {
+            return;
+        }
+        check_examples(
+            || {
+                TMCoalescedAutoEncoder::with_config(8, 8, 8, 3.9, 8, true, 3)
+                    .type_iii_feedback(20.0)
+            },
+            &device(),
+        );
+    }
+
     #[test]
     fn matches_cpu_default() {
         if skip() {

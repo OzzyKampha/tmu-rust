@@ -8,9 +8,9 @@ use crate::clause_bank::dense::rule_from_include;
 #[cfg(feature = "parallel")]
 use crate::clause_bank::dense::{DENSE_TRAIN_PARALLEL_MIN, PARALLEL_MIN, use_parallel};
 use crate::clause_bank::dense::{
-    GOLDEN, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of, expand_bits_to_bytes,
-    fire_predict, rebuild_include, type_i_update_bytes, type_ii_update_bytes, type_iii_update,
-    words_for,
+    GOLDEN, HeldOut, HeldOutIndex, MASK_BITS, WORD_BITS, bmask_word, clause_fire, digits_of,
+    expand_bits_to_bytes, rebuild_include, type_i_update_bytes, type_ii_update_bytes,
+    type_iii_update, words_for,
 };
 use crate::encoder::{EncodedBatch, EncodedSample};
 use crate::rng::Rng;
@@ -48,6 +48,12 @@ pub struct TMAutoEncoder {
     pub(crate) ta: Vec<u8>,
     /// Include bitset. Same indexing as `ta` but in 64-bit words.
     pub(crate) include: Vec<u64>,
+    /// Inference map from literals to the clauses that include them (TMU's
+    /// `literal_clause_map`), built on first prediction and dropped by every
+    /// `&mut self` / `mut self` method, so it never outlives the include
+    /// bitsets it was built from.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) literal_index: std::sync::OnceLock<HeldOutIndex>,
     pub(crate) half: u8,
     pub(crate) max_state: u8,
 
@@ -223,6 +229,7 @@ impl TMAutoEncoder {
             dig_lit_active: digits_of(1.0, MASK_BITS),
             ta,
             include,
+            literal_index: Default::default(),
             half,
             max_state,
             weights: vec![1i32; n_clauses],
@@ -242,12 +249,14 @@ impl TMAutoEncoder {
 
     /// Limit how many literals each clause may include (Type Ia guard).
     pub fn max_included_literals(mut self, max: usize) -> Self {
+        self.reset_literal_index();
         self.max_included_literals = max;
         self
     }
 
     /// Per-clause dropout probability during training (default: 0.0).
     pub fn clause_drop_p(mut self, p: f64) -> Self {
+        self.reset_literal_index();
         assert!((0.0..1.0).contains(&p), "clause_drop_p must be in [0, 1)");
         self.clause_drop_p = p;
         self
@@ -255,6 +264,7 @@ impl TMAutoEncoder {
 
     /// Per-literal dropout probability during training (default: 0.0).
     pub fn literal_drop_p(mut self, p: f64) -> Self {
+        self.reset_literal_index();
         assert!((0.0..1.0).contains(&p), "literal_drop_p must be in [0, 1)");
         self.literal_drop_p = p;
         self.dig_lit_active = digits_of(1.0 - p, MASK_BITS);
@@ -263,6 +273,7 @@ impl TMAutoEncoder {
 
     /// Enable Type III feedback with indicator strength `d` (must be > 1.0).
     pub fn type_iii_feedback(mut self, d: f64) -> Self {
+        self.reset_literal_index();
         assert!(d > 1.0, "d must be > 1.0");
         self.d = d;
         self.type_iii = true;
@@ -298,32 +309,96 @@ impl TMAutoEncoder {
 
     // ---- inference -----------------------------------------------------------
 
-    #[inline]
-    fn reconstruct_lit(&self, lit: &[u64]) -> Vec<u8> {
-        debug_assert_eq!(lit.len(), self.words);
-        let cpo = self.clauses_per_output;
-        let words = self.words;
-        let n_features = self.n_features;
-        let include = self.include.as_slice();
-        let valid = self.valid.as_slice();
+    /// Every clause's inference output for `lit` (an empty clause does not
+    /// fire), through the literal → clause map: computed once per sample for
+    /// all outputs' clauses.
+    fn clause_outputs_predict(&self, lit: &[u64]) -> Vec<bool> {
+        self.index().map.clause_outputs(lit)
+    }
 
-        let mut out = vec![0u8; n_features];
+    fn index(&self) -> &HeldOutIndex {
+        self.literal_index.get_or_init(|| {
+            HeldOutIndex::build(
+                &self.include,
+                &self.valid,
+                self.n_features * self.clauses_per_output,
+                self.words,
+                self.n_features,
+            )
+        })
+    }
+
+    /// Whether each clause votes on its own output with that output's feature
+    /// hidden (clause `o * clauses_per_output + j` votes on output `o`).
+    fn held_out_outputs(&self, lit: &[u64]) -> Vec<bool> {
+        let cpo = self.clauses_per_output;
+        self.index()
+            .classify(lit)
+            .into_iter()
+            .enumerate()
+            .map(|(cj, c)| {
+                let o = (cj / cpo) as u32;
+                match c {
+                    HeldOut::All => true,
+                    HeldOut::AllBut(f) => f != o,
+                    HeldOut::Only(f) => f == o,
+                    HeldOut::Never => false,
+                }
+            })
+            .collect()
+    }
+
+    /// Like [`reconstruct_scores`](Self::reconstruct_scores), but each
+    /// output's vote is taken with that output's own feature hidden, as
+    /// training hides it. Training never updates literal `o` in output `o`'s
+    /// clauses, so it keeps its initial state there; plain reconstruction can
+    /// then echo bit `o` back. Hidden, the vote says how well the *rest* of the
+    /// sample predicts each bit.
+    pub fn held_out_scores(&self, sample: &EncodedSample, out: &mut [i32]) {
+        debug_assert_eq!(out.len(), self.n_features);
+        self.sums_of(&self.held_out_outputs(&sample.0), out);
+        let t = self.threshold;
+        out.iter_mut().for_each(|s| *s = (*s).clamp(-t, t));
+    }
+
+    /// The clauses (local to `output`) that vote on it with its own feature
+    /// hidden (see [`held_out_scores`](Self::held_out_scores)).
+    pub fn held_out_fired_clauses(&self, sample: &EncodedSample, output: usize) -> Vec<usize> {
+        let cpo = self.clauses_per_output;
+        self.held_out_outputs(&sample.0)[output * cpo..(output + 1) * cpo]
+            .iter()
+            .enumerate()
+            .filter_map(|(j, &f)| f.then_some(j))
+            .collect()
+    }
+
+    /// Drop the inference map; called by every method that can change the
+    /// include bitsets or the valid mask.
+    fn reset_literal_index(&mut self) {
+        self.literal_index = std::sync::OnceLock::new();
+    }
+
+    /// Each output's weighted vote (unclamped) from the clause outputs.
+    fn sums_of(&self, fires: &[bool], out: &mut [i32]) {
+        let cpo = self.clauses_per_output;
         for (o, out_o) in out.iter_mut().enumerate() {
             let cw = &self.weights[o * cpo..(o + 1) * cpo];
-            let mut sum = 0i32;
-            for (j, &w) in cw.iter().enumerate() {
-                let cj = o * cpo + j;
-                if fire_predict(&include[cj * words..(cj + 1) * words], lit, valid, words) {
-                    if j & 1 == 0 {
-                        sum += w;
-                    } else {
-                        sum -= w;
-                    }
-                }
-            }
-            *out_o = (sum > 0) as u8;
+            let fo = &fires[o * cpo..(o + 1) * cpo];
+            *out_o = cw
+                .iter()
+                .zip(fo)
+                .enumerate()
+                .filter(|(_, (_, f))| **f)
+                .map(|(j, (&w, _))| if j & 1 == 0 { w } else { -w })
+                .sum();
         }
-        out
+    }
+
+    fn reconstruct_lit(&self, lit: &[u64]) -> Vec<u8> {
+        debug_assert_eq!(lit.len(), self.words);
+        let mut sums = vec![0i32; self.n_features];
+        self.sums_of(&self.clause_outputs_predict(lit), &mut sums);
+        sums.into_iter().map(|s| (s > 0) as u8).collect()
     }
 
     /// Reconstruct a binary vector from an encoded sample.
@@ -354,45 +429,19 @@ impl TMAutoEncoder {
 
     /// Fill `out` with the clamped weighted clause sums for each output bit.
     pub fn reconstruct_scores(&self, sample: &EncodedSample, out: &mut [i32]) {
-        let lit = &sample.0;
         debug_assert_eq!(out.len(), self.n_features);
-        let cpo = self.clauses_per_output;
-        let words = self.words;
-        let include = self.include.as_slice();
-        let valid = self.valid.as_slice();
-        for (o, out_o) in out.iter_mut().enumerate() {
-            let cw = &self.weights[o * cpo..(o + 1) * cpo];
-            let mut sum = 0i32;
-            for (j, &w) in cw.iter().enumerate() {
-                let cj = o * cpo + j;
-                if fire_predict(&include[cj * words..(cj + 1) * words], lit, valid, words) {
-                    if j & 1 == 0 {
-                        sum += w;
-                    } else {
-                        sum -= w;
-                    }
-                }
-            }
-            *out_o = sum.clamp(-self.threshold, self.threshold);
-        }
+        self.sums_of(&self.clause_outputs_predict(&sample.0), out);
+        let t = self.threshold;
+        out.iter_mut().for_each(|s| *s = (*s).clamp(-t, t));
     }
 
     /// Return the indices of all clauses (local to `output`) that fire for `sample`.
     pub fn fired_clauses(&self, sample: &EncodedSample, output: usize) -> Vec<usize> {
-        let lit = &sample.0;
         let cpo = self.clauses_per_output;
-        let words = self.words;
-        let include = self.include.as_slice();
-        let valid = self.valid.as_slice();
-        (0..cpo)
-            .filter(|&j| {
-                fire_predict(
-                    &include[(output * cpo + j) * words..(output * cpo + j + 1) * words],
-                    lit,
-                    valid,
-                    words,
-                )
-            })
+        self.clause_outputs_predict(&sample.0)[output * cpo..(output + 1) * cpo]
+            .iter()
+            .enumerate()
+            .filter_map(|(j, &f)| f.then_some(j))
             .collect()
     }
 
@@ -659,11 +708,13 @@ impl TMAutoEncoder {
 
     /// Train on a single encoded sample (unsupervised — no label required).
     pub fn fit_one(&mut self, sample: &EncodedSample) {
+        self.reset_literal_index();
         self.fit_one_lit(&sample.0);
     }
 
     /// Run one training epoch over an encoded batch, shuffling the order each epoch.
     pub fn fit_epoch(&mut self, batch: &EncodedBatch) {
+        self.reset_literal_index();
         debug_assert_eq!(batch.words, self.words);
         let n = batch.n;
         let mut order: Vec<usize> = (0..n).collect();
@@ -1240,6 +1291,132 @@ mod tests {
             TMAutoEncoder::with_config(12, 20, 15, 3.9, 8, true, 42).type_iii_feedback(200.0);
         for _ in 0..5 {
             ae.fit_epoch(&batch);
+        }
+    }
+
+    /// `reconstruct_scores` by brute force: every clause, `fire_predict`.
+    fn scores_by_scan(ae: &TMAutoEncoder, sample: &EncodedSample) -> Vec<i32> {
+        let (cpo, w) = (ae.clauses_per_output, ae.words);
+        (0..ae.n_features)
+            .map(|o| {
+                let s: i32 = (0..cpo)
+                    .filter(|&j| {
+                        let cj = o * cpo + j;
+                        crate::clause_bank::dense::fire_predict(
+                            &ae.include[cj * w..(cj + 1) * w],
+                            &sample.0,
+                            &ae.valid,
+                            w,
+                        )
+                    })
+                    .map(|j| {
+                        let v = ae.weights[o * cpo + j];
+                        if j & 1 == 0 { v } else { -v }
+                    })
+                    .sum();
+                s.clamp(-ae.threshold, ae.threshold)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn literal_map_scores_match_a_full_scan_across_training() {
+        let mut rng = Rng::new(4);
+        let xs: Vec<Vec<u8>> = (0..400)
+            .map(|_| {
+                (0..70)
+                    .map(|_| rng.next_u64().is_multiple_of(5) as u8)
+                    .collect()
+            })
+            .collect();
+        let e = enc(70);
+        let refs: Vec<&[u8]> = xs.iter().map(|v| v.as_slice()).collect();
+        let batch = e.encode_batch(&refs);
+        let samples: Vec<EncodedSample> = xs.iter().take(40).map(|x| e.encode_one(x)).collect();
+        let check = |ae: &TMAutoEncoder, when: &str| {
+            let mut got = vec![0i32; 70];
+            for s in &samples {
+                ae.reconstruct_scores(s, &mut got);
+                assert_eq!(got, scores_by_scan(ae, s), "{when}");
+                let recon: Vec<u8> = got.iter().map(|&v| (v > 0) as u8).collect();
+                assert_eq!(ae.reconstruct(s), recon, "{when}");
+            }
+            let o = 5;
+            let fired: Vec<usize> = (0..ae.clauses_per_output)
+                .filter(|&j| {
+                    let cj = o * ae.clauses_per_output + j;
+                    crate::clause_bank::dense::fire_predict(
+                        &ae.include[cj * ae.words..(cj + 1) * ae.words],
+                        &samples[0].0,
+                        &ae.valid,
+                        ae.words,
+                    )
+                })
+                .collect();
+            assert_eq!(ae.fired_clauses(&samples[0], o), fired, "{when}");
+        };
+        let mut ae = TMAutoEncoder::with_config(70, 4, 10, 3.0, 8, true, 2);
+        check(&ae, "untrained");
+        ae.fit_epoch(&batch);
+        check(&ae, "after one epoch");
+        ae.fit_epoch(&batch);
+        check(&ae, "after more training");
+    }
+
+    #[test]
+    fn held_out_scores_hide_each_outputs_own_feature() {
+        let mut rng = Rng::new(9);
+        let xs: Vec<Vec<u8>> = (0..300)
+            .map(|_| {
+                (0..70)
+                    .map(|_| rng.next_u64().is_multiple_of(5) as u8)
+                    .collect()
+            })
+            .collect();
+        let e = enc(70);
+        let refs: Vec<&[u8]> = xs.iter().map(|v| v.as_slice()).collect();
+        let batch = e.encode_batch(&refs);
+        let mut ae = TMAutoEncoder::with_config(70, 4, 8, 3.0, 8, true, 3);
+        for round in 0..2 {
+            ae.fit_epoch(&batch);
+            let (cpo, w, nf) = (ae.clauses_per_output, ae.words, ae.n_features);
+            let mut got = vec![0i32; nf];
+            for x in xs.iter().take(30) {
+                let s = e.encode_one(x);
+                ae.held_out_scores(&s, &mut got);
+                for (o, &vote) in got.iter().enumerate() {
+                    let fired: Vec<usize> = (0..cpo)
+                        .filter(|&j| {
+                            crate::clause_bank::dense::fires_hidden(
+                                &ae.include,
+                                &ae.valid,
+                                w,
+                                nf,
+                                &s.0,
+                                o * cpo + j,
+                                o,
+                            )
+                        })
+                        .collect();
+                    let sum: i32 = fired
+                        .iter()
+                        .map(|&j| {
+                            let v = ae.weights[o * cpo + j];
+                            if j & 1 == 0 { v } else { -v }
+                        })
+                        .sum();
+                    assert_eq!(
+                        vote,
+                        sum.clamp(-ae.threshold, ae.threshold),
+                        "round {round}, output {o}"
+                    );
+                    assert_eq!(
+                        ae.held_out_fired_clauses(&s, o),
+                        fired,
+                        "round {round}, output {o}"
+                    );
+                }
+            }
         }
     }
 }

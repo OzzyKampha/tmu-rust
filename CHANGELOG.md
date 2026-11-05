@@ -7,6 +7,45 @@ All notable changes to tmu-rs are documented here.
 ## [Unreleased]
 
 ### Added
+- **Held-out autoencoder scoring:** `held_out_scores(&sample, &mut out)` and
+  `held_out_fired_clauses(&sample, output)` on `TMCoalescedAutoEncoder` and
+  `TMAutoEncoder`. Each output's vote is taken with that output's own feature
+  hidden, as training hides it; plain `reconstruct_scores` lets a clause look
+  at the bit it votes on and echo it back. Through the literal → clause map,
+  extended with each clause's single feature: a clause fires for output `o`
+  when all its false literals are on `o` and it has a literal on another
+  feature, so one pass gives every clause's verdict for every output. Tested
+  against removing each output's literals from every clause and evaluating
+  it (random banks with and without feature negation; trained models).
+  `TMCoalescedAutoEncoder::held_out_votes(&sample)` returns the votes with
+  every clause's verdict kept (`HeldOutVotes`: `scores()`,
+  `fired_clauses(output)`, `strongest_clause(output, against)`), so
+  explaining several outputs of one sample evaluates the clauses once.
+- **`CudaTMCoalescedAutoEncoder::fit_examples`**: TMU's autoencoder training on
+  the GPU, bit-identical to the CPU's `fit_examples` (every random stream
+  included). The examples are drawn on the host with the CPU model's code; the
+  GPU evaluates and updates the clauses, through the same kernels as
+  `fit_epoch` (`cae_update` takes the drawn target). TMU's own CUDA clause
+  bank builds the examples in a kernel, the same algorithm, but draws every
+  target present or absent 50/50 (`rng_gen.choice(2)`), ignoring the
+  frequency its CPU path uses: `output_balancing(0.5)` reproduces that. (As
+  released in TMU 0.8.3, `TMAutoEncoder.fit` passes `target_true_p=` to the
+  CUDA bank's `produce_autoencoder_example`, which does not take it.)
+
+### Changed
+- **Autoencoder inference through TMU's literal → clause map**
+  (`TMCoalescedAutoEncoder`, `TMAutoEncoder`), as the classifiers since #42:
+  a sample's clause outputs come from its false literals and the clauses that
+  include them, and are computed once per sample for every output. The
+  coalesced autoencoder evaluated every shared clause once per output before.
+  Same results (tests against a full `fire_predict` scan across training,
+  `fit_examples`, `start_excluded` and save/load; saved outputs of 1,000
+  samples compared before/after). 384 features, 256 shared clauses:
+  `reconstruct_scores` 1,190 → 10 µs per sample; vanilla, 8 clauses per
+  output: 45 → 26 µs. The map is built on first prediction and dropped by
+  every `&mut self` / `mut self` method and the CUDA `to_cpu` copies.
+
+### Added
 - **TMU's autoencoder training for `TMCoalescedAutoEncoder`** (opt-in; the
   default `fit_epoch` is bit-identical to before):
   - `fit_examples(&batch, number_of_examples)` trains like TMU's

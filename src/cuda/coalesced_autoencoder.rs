@@ -105,6 +105,7 @@ impl CudaTMCoalescedAutoEncoder {
         self.st
             .download(ta, include, weights, rngs, ind, cat, *type_iii)?;
         restore_rngs(output_rngs, &self.output_rngs.download()?);
+        m.literal_index = Default::default();
         Ok(m)
     }
 
@@ -122,16 +123,13 @@ impl CudaTMCoalescedAutoEncoder {
     }
 
     fn train(&mut self, batch: &EncodedBatch, order: &[usize]) -> Result<()> {
-        let h = &mut self.host;
-        let (words, nc, nf) = (h.words, h.n_clauses, h.n_features);
-        let literal_drop = h.literal_drop_p > 0.0;
+        let (words, nf) = (self.host.words, self.host.n_features);
+        let literal_drop = self.host.literal_drop_p > 0.0;
         let mut lits = vec![0u64; self.chunk * words];
         let mut acts = vec![0u64; if literal_drop { self.chunk * words } else { 0 }];
-        let ib = self.dev.inner.item_block();
-        let cb = self.dev.inner.clause_block(words);
-        let n_fire_blocks = blocks(nc, ib);
 
         for chunk in order.chunks(self.chunk) {
+            let h = &mut self.host;
             for (s, &i) in chunk.iter().enumerate() {
                 lits[s * words..(s + 1) * words]
                     .copy_from_slice(&batch.data[i * words..(i + 1) * words]);
@@ -154,85 +152,162 @@ impl CudaTMCoalescedAutoEncoder {
                 } else {
                     self.acts.ptr()
                 };
-                // Confidence gate: `n_clauses` unconditional draws from the gate
-                // stream, so the host can track that stream itself.
-                let gp = CaeGateParams {
-                    weights: self.st.weights.ptr(),
-                    gate: self.gate.ptr(),
-                    gate_rng: h.clause_gate_rng.0,
-                    n_clauses: nc as u32,
-                    n_features: nf as u32,
-                    threshold: h.threshold,
-                    _pad: 0,
-                };
-                self.dev
-                    .inner
-                    .launch("cae_gate", blocks(nc, ib), ib, 0, &gp)?;
-                h.clause_gate_rng.0 = h
-                    .clause_gate_rng
-                    .0
-                    .wrapping_add((nc as u64).wrapping_mul(GOLDEN));
-
+                self.launch_gate()?;
                 for o in 0..nf {
-                    let fp = SharedFireParams {
-                        include: self.st.include.ptr(),
-                        valid: self.st.valid.ptr(),
-                        lit,
-                        act,
-                        w_out: self.st.weights.at(o * nc),
-                        sum: self.sums.at(s * nf + o),
-                        fire: self.fire.ptr(),
-                        out_rng: self.output_rngs.at(o),
-                        drop_s0: self.drop_s0.ptr(),
-                        inv: self.inv.ptr(),
-                        keep: self.keep.ptr(),
-                        drop_p: h.clause_drop_p,
-                        n_clauses: nc as u32,
-                        words: words as u32,
-                        n_fire_blocks,
-                        dig_inv: digits_mask(&h.dig_inv),
-                        dig_keep: digits_mask(&h.dig_keep),
-                        n_digits: N_DIGITS,
-                        ex_a: o as i32,
-                        ex_b: (o + nf) as i32,
-                    };
-                    self.dev
-                        .inner
-                        .launch("shared_fire", n_fire_blocks + 1, ib, 0, &fp)?;
-                    let up = CaeUpdateParams {
-                        ta: self.st.ta.ptr(),
-                        include: self.st.include.ptr(),
-                        weights: fp.w_out,
-                        rngs: self.st.rngs.ptr(),
-                        ind: self.st.ind.ptr(),
-                        cat: self.st.cat.ptr(),
-                        valid: self.st.valid.ptr(),
-                        lit,
-                        act,
-                        fire: self.fire.ptr(),
-                        gate: self.gate.ptr(),
-                        sum: fp.sum,
-                        drop_s0: fp.drop_s0,
-                        inv: fp.inv,
-                        keep: fp.keep,
-                        drop_p: h.clause_drop_p,
-                        d: h.d,
-                        max_inc: max_inc(h.max_included_literals),
-                        n_clauses: nc as u32,
-                        words: words as u32,
-                        n_literals: h.n_literals as u32,
-                        o: o as u32,
-                        threshold: h.threshold,
-                        nf: nf as i32,
-                        boost: h.boost_true_positive as u32,
-                        half: h.half as u32,
-                        max_state: h.max_state as u32,
-                        type_iii: h.type_iii as u32,
-                    };
-                    self.dev.inner.launch("cae_update", nc as u32, cb, 0, &up)?;
+                    self.launch_output(o, lit, act, self.sums.at(s * nf + o), -1)?;
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Train like TMU's `TMAutoEncoder.fit`, exactly like
+    /// [`TMCoalescedAutoEncoder::fit_examples`]: every example trains each
+    /// output, in a fresh random order, on an example made for that output.
+    ///
+    /// The examples are drawn on the host with the CPU model's own code and
+    /// random streams; the GPU evaluates and updates the clauses, so the
+    /// result is bit-identical to the CPU's. (TMU's CUDA clause bank builds
+    /// the examples in a kernel instead, the same algorithm.)
+    pub fn fit_examples(&mut self, batch: &EncodedBatch, number_of_examples: usize) -> Result<()> {
+        assert_eq!(batch.words, self.host.words);
+        if batch.n == 0 {
+            return Ok(());
+        }
+        let (words, nf) = (self.host.words, self.host.n_features);
+        let literal_drop = self.host.literal_drop_p > 0.0;
+        let with = self.host.rows_with_features(batch);
+        let mut union = vec![false; nf];
+        let mut lits = vec![0u64; nf * words];
+        let mut acts = vec![!0u64; if literal_drop { nf * words } else { 0 }];
+        let mut targets = vec![0i32; nf];
+        let ex_lits = DevBuf::zeros(&self.dev, nf * words)?;
+        let ex_acts = if literal_drop {
+            Some(DevBuf::zeros(&self.dev, nf * words)?)
+        } else {
+            None
+        };
+        let ex_sums: DevBuf<i32> = DevBuf::zeros(&self.dev, nf)?;
+        for _ in 0..number_of_examples {
+            // Host draws in the CPU's order: the output order, then per output
+            // its example (master stream) and literal mask (literal stream).
+            let order = self.host.output_order(true);
+            for &o in &order {
+                targets[o] = i32::from(self.host.draw_example(batch, &with, o, &mut union));
+                lits[o * words..(o + 1) * words].copy_from_slice(&self.host.literals);
+                if literal_drop {
+                    let a = self.host.draw_literal_active();
+                    acts[o * words..(o + 1) * words].copy_from_slice(&a);
+                }
+            }
+            ex_lits.upload(&lits)?;
+            if let Some(a) = &ex_acts {
+                a.upload(&acts)?;
+            }
+            ex_sums.zero_prefix(nf)?;
+            self.launch_gate()?;
+            for &o in &order {
+                let act = match &ex_acts {
+                    Some(a) => a.at(o * words),
+                    None => self.acts.ptr(),
+                };
+                self.launch_output(o, ex_lits.at(o * words), act, ex_sums.at(o), targets[o])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The confidence gate for one sample: `n_clauses` unconditional draws
+    /// from the gate stream, so the host can track that stream itself.
+    fn launch_gate(&mut self) -> Result<()> {
+        let h = &mut self.host;
+        let nc = h.n_clauses;
+        let ib = self.dev.inner.item_block();
+        let gp = CaeGateParams {
+            weights: self.st.weights.ptr(),
+            gate: self.gate.ptr(),
+            gate_rng: h.clause_gate_rng.0,
+            n_clauses: nc as u32,
+            n_features: h.n_features as u32,
+            threshold: h.threshold,
+            _pad: 0,
+        };
+        self.dev
+            .inner
+            .launch("cae_gate", blocks(nc, ib), ib, 0, &gp)?;
+        h.clause_gate_rng.0 = h
+            .clause_gate_rng
+            .0
+            .wrapping_add((nc as u64).wrapping_mul(GOLDEN));
+        Ok(())
+    }
+
+    /// Train output `o` on the sample at `lit` (active literals `act`), its
+    /// vote summed into `sum`: towards `target`, or with `target = -1`
+    /// towards bit `o` of the sample.
+    fn launch_output(&self, o: usize, lit: u64, act: u64, sum: u64, target: i32) -> Result<()> {
+        let h = &self.host;
+        let (words, nc, nf) = (h.words, h.n_clauses, h.n_features);
+        let ib = self.dev.inner.item_block();
+        let cb = self.dev.inner.clause_block(words);
+        let n_fire_blocks = blocks(nc, ib);
+        let fp = SharedFireParams {
+            include: self.st.include.ptr(),
+            valid: self.st.valid.ptr(),
+            lit,
+            act,
+            w_out: self.st.weights.at(o * nc),
+            sum,
+            fire: self.fire.ptr(),
+            out_rng: self.output_rngs.at(o),
+            drop_s0: self.drop_s0.ptr(),
+            inv: self.inv.ptr(),
+            keep: self.keep.ptr(),
+            drop_p: h.clause_drop_p,
+            n_clauses: nc as u32,
+            words: words as u32,
+            n_fire_blocks,
+            dig_inv: digits_mask(&h.dig_inv),
+            dig_keep: digits_mask(&h.dig_keep),
+            n_digits: N_DIGITS,
+            ex_a: o as i32,
+            ex_b: (o + nf) as i32,
+        };
+        self.dev
+            .inner
+            .launch("shared_fire", n_fire_blocks + 1, ib, 0, &fp)?;
+        let up = CaeUpdateParams {
+            ta: self.st.ta.ptr(),
+            include: self.st.include.ptr(),
+            weights: fp.w_out,
+            rngs: self.st.rngs.ptr(),
+            ind: self.st.ind.ptr(),
+            cat: self.st.cat.ptr(),
+            valid: self.st.valid.ptr(),
+            lit,
+            act,
+            fire: self.fire.ptr(),
+            gate: self.gate.ptr(),
+            sum: fp.sum,
+            drop_s0: fp.drop_s0,
+            inv: fp.inv,
+            keep: fp.keep,
+            drop_p: h.clause_drop_p,
+            d: h.d,
+            max_inc: max_inc(h.max_included_literals),
+            n_clauses: nc as u32,
+            words: words as u32,
+            n_literals: h.n_literals as u32,
+            o: o as u32,
+            threshold: h.threshold,
+            nf: nf as i32,
+            boost: h.boost_true_positive as u32,
+            half: h.half as u32,
+            max_state: h.max_state as u32,
+            type_iii: h.type_iii as u32,
+            target,
+        };
+        self.dev.inner.launch("cae_update", nc as u32, cb, 0, &up)?;
         Ok(())
     }
 

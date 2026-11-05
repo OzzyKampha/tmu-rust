@@ -42,8 +42,8 @@ pub use booleanizer::Booleanizer;
 pub use clause_inspect::ClauseInspect;
 pub use encoder::{EncodedBatch, EncodedSample, Encoder};
 pub use models::{
-    CoalescedTsetlinMachine, ConvolutionalTsetlinMachine, TMAutoEncoder, TMCoalescedAutoEncoder,
-    TMCompositeClassifier, TMRegressor, TMSparseClassifier, TsetlinMachine,
+    CoalescedTsetlinMachine, ConvolutionalTsetlinMachine, HeldOutVotes, TMAutoEncoder,
+    TMCoalescedAutoEncoder, TMCompositeClassifier, TMRegressor, TMSparseClassifier, TsetlinMachine,
 };
 pub use rng::Rng;
 #[cfg(feature = "serde")]

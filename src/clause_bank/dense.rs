@@ -239,6 +239,112 @@ impl LiteralIndex {
     }
 }
 
+/// What a clause does for every output at once when that output's own
+/// feature is hidden (its two literals left out of the clause), as an
+/// autoencoder trains each output: see [`HeldOutIndex::classify`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeldOut {
+    /// Fires whichever feature is hidden.
+    All,
+    /// Fires unless feature `f` is hidden (all its literals are on `f`).
+    AllBut(u32),
+    /// Fires only when feature `f` is hidden (all its false literals are on
+    /// `f`, and it has a literal on another feature).
+    Only(u32),
+    Never,
+}
+
+/// The literal → clause map extended for held-out scoring: per clause, the one
+/// feature all its included literals are on, if there is one. A clause fires
+/// with feature `o` hidden when all its false literals are on `o` and some
+/// included literal is not, so a sample's false literals and the clauses that
+/// use them give every clause's verdict for every output at once.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HeldOutIndex {
+    pub(crate) map: LiteralIndex,
+    only_feature: Vec<Option<u32>>,
+    n_features: usize,
+}
+
+impl HeldOutIndex {
+    pub(crate) fn build(
+        include: &[u64],
+        valid: &[u64],
+        n_clauses: usize,
+        words: usize,
+        n_features: usize,
+    ) -> Self {
+        let feature = |l: usize| (if l < n_features { l } else { l - n_features }) as u32;
+        let only_feature = (0..n_clauses)
+            .map(|j| {
+                let mut only: Option<u32> = None;
+                for k in 0..words {
+                    let mut bits = include[j * words + k] & valid[k];
+                    while bits != 0 {
+                        let f = feature(k * WORD_BITS + bits.trailing_zeros() as usize);
+                        match only {
+                            None => only = Some(f),
+                            Some(g) if g == f => {}
+                            Some(_) => return None,
+                        }
+                        bits &= bits - 1;
+                    }
+                }
+                only
+            })
+            .collect();
+        HeldOutIndex {
+            map: LiteralIndex::build(include, valid, n_clauses, words),
+            only_feature,
+            n_features,
+        }
+    }
+
+    /// Every clause's [`HeldOut`] verdict for packed literals `lit`.
+    pub(crate) fn classify(&self, lit: &[u64]) -> Vec<HeldOut> {
+        let m = &self.map;
+        let nc = m.nonempty.len();
+        const NONE: u32 = u32::MAX;
+        // The feature of each clause's first false literal; `MULTI` once its
+        // false literals span two features.
+        const MULTI: u32 = u32::MAX - 1;
+        let mut false_on = vec![NONE; nc];
+        for (k, (&used, &lit)) in m.used.iter().zip(lit).enumerate() {
+            let mut false_used = used & !lit;
+            while false_used != 0 {
+                let l = k * WORD_BITS + false_used.trailing_zeros() as usize;
+                let f = (if l < self.n_features {
+                    l
+                } else {
+                    l - self.n_features
+                }) as u32;
+                for &j in &m.clauses[m.start[l] as usize..m.start[l + 1] as usize] {
+                    let slot = &mut false_on[j as usize];
+                    if *slot == NONE {
+                        *slot = f;
+                    } else if *slot != f {
+                        *slot = MULTI;
+                    }
+                }
+                false_used &= false_used - 1;
+            }
+        }
+        (0..nc)
+            .map(
+                |j| match (m.nonempty[j], false_on[j], self.only_feature[j]) {
+                    (false, _, _) => HeldOut::Never,
+                    (true, NONE, Some(f)) => HeldOut::AllBut(f),
+                    (true, NONE, None) => HeldOut::All,
+                    (true, MULTI, _) => HeldOut::Never,
+                    // Every literal on f: hiding f empties the clause.
+                    (true, f, Some(g)) if g == f => HeldOut::Never,
+                    (true, f, _) => HeldOut::Only(f),
+                },
+            )
+            .collect()
+    }
+}
+
 /// Returns `true` if a clause fires for inference (no included literal is violated).
 ///
 /// `inc` is the clause include bitset (`words` u64s, 1 bit per literal).
@@ -1667,9 +1773,81 @@ pub(crate) fn type_iii_update(
     false
 }
 
+/// Clause `j` with feature `o`'s two literals removed, by [`fire_predict`]:
+/// the brute-force reference for held-out scoring in tests.
+#[cfg(test)]
+pub(crate) fn fires_hidden(
+    include: &[u64],
+    valid: &[u64],
+    words: usize,
+    nf: usize,
+    lit: &[u64],
+    j: usize,
+    o: usize,
+) -> bool {
+    let mut inc: Vec<u64> = include[j * words..(j + 1) * words].to_vec();
+    for l in [o, o + nf] {
+        inc[l / WORD_BITS] &= !(1u64 << (l % WORD_BITS));
+    }
+    fire_predict(&inc, lit, valid, words)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_out_index_matches_hiding_each_feature() {
+        let mut rng = Rng::new(31);
+        for (nf, n_clauses, negation) in [(3usize, 8usize, true), (40, 30, true), (100, 50, false)]
+        {
+            let n_lit = 2 * nf;
+            let words = n_lit.div_ceil(WORD_BITS);
+            let mut valid = vec![0u64; words];
+            for l in 0..if negation { n_lit } else { nf } {
+                valid[l / WORD_BITS] |= 1 << (l % WORD_BITS);
+            }
+            for _ in 0..20 {
+                // Few literals per clause, both kinds; some clauses empty,
+                // some with both literals of one feature.
+                let mut include = vec![0u64; n_clauses * words];
+                for j in 0..n_clauses {
+                    let k = rng.below(4);
+                    for _ in 0..k {
+                        let l = rng.below(n_lit);
+                        include[j * words + l / WORD_BITS] |= 1 << (l % WORD_BITS);
+                    }
+                    if rng.below(5) == 0 {
+                        let f = rng.below(nf);
+                        for l in [f, f + nf] {
+                            include[j * words + l / WORD_BITS] |= 1 << (l % WORD_BITS);
+                        }
+                    }
+                }
+                let index = HeldOutIndex::build(&include, &valid, n_clauses, words, nf);
+                for _ in 0..10 {
+                    let mut lit = vec![0u64; words];
+                    for f in 0..nf {
+                        let l = if rng.below(3) == 0 { f } else { f + nf };
+                        lit[l / WORD_BITS] |= 1 << (l % WORD_BITS);
+                    }
+                    let classes = index.classify(&lit);
+                    for (j, &c) in classes.iter().enumerate() {
+                        for o in 0..nf {
+                            let want = fires_hidden(&include, &valid, words, nf, &lit, j, o);
+                            let got = match c {
+                                HeldOut::All => true,
+                                HeldOut::AllBut(f) => f as usize != o,
+                                HeldOut::Only(f) => f as usize == o,
+                                HeldOut::Never => false,
+                            };
+                            assert_eq!(got, want, "clause {j}, output {o}, verdict {c:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn literal_index_matches_fire_predict() {
