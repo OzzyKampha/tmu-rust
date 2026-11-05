@@ -111,23 +111,39 @@ impl CudaTMCoalescedAutoEncoder {
 
     /// Run one shuffled training epoch, exactly like [`TMCoalescedAutoEncoder::fit_epoch`].
     pub fn fit_epoch(&mut self, batch: &EncodedBatch) -> Result<()> {
+        self.fit_epoch_progress(batch, &mut |_| {})
+    }
+
+    /// [`fit_epoch`](Self::fit_epoch), calling `progress` with the number of
+    /// rows queued on the device so far after each row. Trains the same model.
+    pub fn fit_epoch_progress(
+        &mut self,
+        batch: &EncodedBatch,
+        progress: &mut dyn FnMut(usize),
+    ) -> Result<()> {
         assert_eq!(batch.words, self.host.words);
         let order = shuffle(&mut self.host.rng, batch.n);
-        self.train(batch, &order)
+        self.train(batch, &order, progress)
     }
 
     /// Train on a single sample, exactly like [`TMCoalescedAutoEncoder::fit_one`].
     pub fn fit_one(&mut self, sample: &EncodedSample) -> Result<()> {
         let batch = EncodedBatch::from_words(sample.0.clone(), 1, self.host.words);
-        self.train(&batch, &[0])
+        self.train(&batch, &[0], &mut |_| {})
     }
 
-    fn train(&mut self, batch: &EncodedBatch, order: &[usize]) -> Result<()> {
+    fn train(
+        &mut self,
+        batch: &EncodedBatch,
+        order: &[usize],
+        progress: &mut dyn FnMut(usize),
+    ) -> Result<()> {
         let (words, nf) = (self.host.words, self.host.n_features);
         let literal_drop = self.host.literal_drop_p > 0.0;
         let mut lits = vec![0u64; self.chunk * words];
         let mut acts = vec![0u64; if literal_drop { self.chunk * words } else { 0 }];
 
+        let mut done = 0;
         for chunk in order.chunks(self.chunk) {
             let h = &mut self.host;
             for (s, &i) in chunk.iter().enumerate() {
@@ -156,6 +172,8 @@ impl CudaTMCoalescedAutoEncoder {
                 for o in 0..nf {
                     self.launch_output(o, lit, act, self.sums.at(s * nf + o), -1)?;
                 }
+                done += 1;
+                progress(done);
             }
         }
         Ok(())
@@ -170,6 +188,18 @@ impl CudaTMCoalescedAutoEncoder {
     /// result is bit-identical to the CPU's. (TMU's CUDA clause bank builds
     /// the examples in a kernel instead, the same algorithm.)
     pub fn fit_examples(&mut self, batch: &EncodedBatch, number_of_examples: usize) -> Result<()> {
+        self.fit_examples_progress(batch, number_of_examples, &mut |_| {})
+    }
+
+    /// [`fit_examples`](Self::fit_examples), calling `progress` with the
+    /// number of examples queued on the device so far after each example.
+    /// Trains the same model.
+    pub fn fit_examples_progress(
+        &mut self,
+        batch: &EncodedBatch,
+        number_of_examples: usize,
+        progress: &mut dyn FnMut(usize),
+    ) -> Result<()> {
         assert_eq!(batch.words, self.host.words);
         if batch.n == 0 {
             return Ok(());
@@ -188,7 +218,7 @@ impl CudaTMCoalescedAutoEncoder {
             None
         };
         let ex_sums: DevBuf<i32> = DevBuf::zeros(&self.dev, nf)?;
-        for _ in 0..number_of_examples {
+        for done in 1..=number_of_examples {
             // Host draws in the CPU's order: the output order, then per output
             // its example (master stream) and literal mask (literal stream).
             let order = self.host.output_order(true);
@@ -213,6 +243,7 @@ impl CudaTMCoalescedAutoEncoder {
                 };
                 self.launch_output(o, ex_lits.at(o * words), act, ex_sums.at(o), targets[o])?;
             }
+            progress(done);
         }
         Ok(())
     }
@@ -248,9 +279,8 @@ impl CudaTMCoalescedAutoEncoder {
     fn launch_output(&self, o: usize, lit: u64, act: u64, sum: u64, target: i32) -> Result<()> {
         let h = &self.host;
         let (words, nc, nf) = (h.words, h.n_clauses, h.n_features);
-        let ib = self.dev.inner.item_block();
         let cb = self.dev.inner.clause_block(words);
-        let n_fire_blocks = blocks(nc, ib);
+        let n_fire_blocks = nc as u32;
         let fp = SharedFireParams {
             include: self.st.include.ptr(),
             valid: self.st.valid.ptr(),
@@ -275,7 +305,7 @@ impl CudaTMCoalescedAutoEncoder {
         };
         self.dev
             .inner
-            .launch("shared_fire", n_fire_blocks + 1, ib, 0, &fp)?;
+            .launch("shared_fire", n_fire_blocks + 1, cb, 0, &fp)?;
         let up = CaeUpdateParams {
             ta: self.st.ta.ptr(),
             include: self.st.include.ptr(),

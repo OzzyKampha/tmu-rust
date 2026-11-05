@@ -177,3 +177,13 @@ harness = false
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+[[example]]
+name = "cuda_coalesced_sparse"  # GPU vs CPU training speed on wide sparse inputs (coalesced)
+path = "examples/cuda_coalesced_sparse.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "cuda_sparse_bank"  # GPU vs CPU training speed of the sparse clause bank (absorbing, sampling)
+path = "examples/cuda_sparse_bank.rs"
+required-features = ["cuda"]

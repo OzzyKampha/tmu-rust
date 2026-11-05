@@ -6,7 +6,7 @@ use super::common::{
     dense_scores, dense_scores_resident, digits_mask, max_inc, restore_rngs, rng_states, shuffle,
 };
 use super::device::{CudaDevice, DevBuf};
-use super::params::{CoPlanParams, CoUpdateParams, SCORE_SHARED, SharedFireParams};
+use super::params::{CoMasksParams, CoPlanParams, CoUpdateParams, SCORE_SHARED, SharedFireParams};
 use super::resident::CudaEncodedBatch;
 use crate::clause_bank::dense::bmask_word;
 use crate::encoder::{EncodedBatch, EncodedSample};
@@ -14,9 +14,10 @@ use crate::models::CoalescedTsetlinMachine;
 
 /// A [`CoalescedTsetlinMachine`] whose shared clause bank lives on a CUDA device.
 ///
-/// Per sample: one launch evaluates every shared clause, a single-block launch
-/// plans the step (clause dropout, negative class — including focused negative
-/// sampling — and feedback masks), and one launch applies both class passes.
+/// Per sample: one launch evaluates every shared clause (a block per clause), a
+/// single-block launch plans the step (clause dropout, negative class —
+/// including focused negative sampling), one launch draws the feedback masks (a
+/// thread per mask word), and one launch applies both class passes.
 /// The master RNG stays on the device during training. Bit-identical to the CPU
 /// model.
 /// Where the training samples come from: a host batch (copied up chunk by
@@ -41,6 +42,7 @@ pub struct CudaCoalescedTsetlinMachine {
     plan: DevBuf<i32>,
     inv: DevBuf<u64>,
     keep: DevBuf<u64>,
+    mask_s0: DevBuf<u64>,
 }
 
 impl CoalescedTsetlinMachine {
@@ -88,6 +90,7 @@ impl CudaCoalescedTsetlinMachine {
             plan: DevBuf::zeros(dev, 5)?,
             inv: DevBuf::zeros(dev, 2 * w)?,
             keep: DevBuf::zeros(dev, 2 * w)?,
+            mask_s0: DevBuf::zeros(dev, 2)?,
             host,
             dev: dev.clone(),
             st,
@@ -228,14 +231,14 @@ impl CudaCoalescedTsetlinMachine {
                     fire: self.fire.ptr(),
                     n_clauses: nc as u32,
                     words: words as u32,
-                    n_fire_blocks: blocks(nc, ib),
+                    n_fire_blocks: nc as u32,
                     ex_a: -1,
                     ex_b: -1,
                     ..Default::default()
                 };
                 self.dev
                     .inner
-                    .launch("shared_fire", fp.n_fire_blocks, ib, 0, &fp)?;
+                    .launch("shared_fire", fp.n_fire_blocks, cb, 0, &fp)?;
                 let pp = CoPlanParams {
                     master_rng: self.master_rng.ptr(),
                     class_rngs: self.class_rngs.ptr(),
@@ -245,6 +248,7 @@ impl CudaCoalescedTsetlinMachine {
                     plan: self.plan.ptr(),
                     inv: self.inv.ptr(),
                     keep: self.keep.ptr(),
+                    mask_s0: self.mask_s0.ptr(),
                     drop_p: h.clause_drop_p,
                     n_clauses: nc as u32,
                     n_classes: ncls as u32,
@@ -260,6 +264,18 @@ impl CudaCoalescedTsetlinMachine {
                 self.dev
                     .inner
                     .launch("co_plan", 1, ib, (ncls * 4) as u32, &pp)?;
+                let mp = CoMasksParams {
+                    mask_s0: self.mask_s0.ptr(),
+                    inv: self.inv.ptr(),
+                    keep: self.keep.ptr(),
+                    words: words as u32,
+                    dig_inv: pp.dig_inv,
+                    dig_keep: pp.dig_keep,
+                    n_digits: N_DIGITS,
+                };
+                self.dev
+                    .inner
+                    .launch("co_masks", blocks(4 * words, ib), ib, 0, &mp)?;
                 let up = CoUpdateParams {
                     ta: self.st.ta.ptr(),
                     include: self.st.include.ptr(),

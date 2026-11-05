@@ -1015,6 +1015,12 @@ impl TMCoalescedAutoEncoder {
 
     /// Run one training epoch over an encoded batch, shuffling the order each epoch.
     pub fn fit_epoch(&mut self, batch: &EncodedBatch) {
+        self.fit_epoch_progress(batch, &mut |_| {});
+    }
+
+    /// [`fit_epoch`](Self::fit_epoch), calling `progress` with the number of
+    /// rows trained so far after each row. Trains the same model.
+    pub fn fit_epoch_progress(&mut self, batch: &EncodedBatch, progress: &mut dyn FnMut(usize)) {
         self.reset_literal_index();
         debug_assert_eq!(batch.words, self.words);
         let n = batch.n;
@@ -1025,8 +1031,9 @@ impl TMCoalescedAutoEncoder {
         }
         let w = self.words;
         let data = batch.data.as_slice();
-        for &i in &order {
+        for (done, &i) in order.iter().enumerate() {
             self.fit_one_lit(&data[i * w..(i + 1) * w]);
+            progress(done + 1);
         }
     }
 
@@ -1049,6 +1056,18 @@ impl TMCoalescedAutoEncoder {
     /// time. The confidence gate is drawn once per example, the literal
     /// dropout mask once per output example.
     pub fn fit_examples(&mut self, batch: &EncodedBatch, number_of_examples: usize) {
+        self.fit_examples_progress(batch, number_of_examples, &mut |_| {});
+    }
+
+    /// [`fit_examples`](Self::fit_examples), calling `progress` with the
+    /// number of examples trained so far after each example. Trains the same
+    /// model.
+    pub fn fit_examples_progress(
+        &mut self,
+        batch: &EncodedBatch,
+        number_of_examples: usize,
+        progress: &mut dyn FnMut(usize),
+    ) {
         self.reset_literal_index();
         debug_assert_eq!(batch.words, self.words);
         let n = batch.n;
@@ -1061,7 +1080,7 @@ impl TMCoalescedAutoEncoder {
         let mut clause_outputs = vec![false; nc];
         let mut update_clause = vec![true; nc];
         let mut union = vec![false; self.n_features];
-        for _ in 0..number_of_examples {
+        for done in 1..=number_of_examples {
             let order = self.output_order(true);
             self.confidence_gate(&mut update_clause);
             for o in order {
@@ -1079,6 +1098,7 @@ impl TMCoalescedAutoEncoder {
                     &update_clause,
                 );
             }
+            progress(done);
         }
     }
 
