@@ -1,6 +1,6 @@
 [package]
 name = "tmu-rs"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.96"
 description = "Bit-packed weighted multiclass Tsetlin Machine in Rust, with bit-parallel/multi-threaded training, a fast booleanizer, and ports of the TMU classification demos."
@@ -70,6 +70,14 @@ path = "examples/sparse.rs"
 [[example]]
 name = "sparse_vs_dense"   # dense vs sparse head-to-head (accuracy / memory / speed)
 path = "examples/sparse_vs_dense.rs"
+
+[[example]]
+name = "fuzzy_pattern"     # TMFuzzyPatternClassifier on noisy XOR, next to the vanilla machine
+path = "examples/fuzzy_pattern.rs"
+
+[[example]]
+name = "fuzzy_pattern_dump"  # trains a small FPTM and prints it as JSON for scripts/check_fuzzy_pattern.py
+path = "examples/fuzzy_pattern_dump.rs"
 
 [[example]]
 name = "breast_cancer"     # TMU BreastCancerDemo

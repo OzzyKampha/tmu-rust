@@ -16,6 +16,7 @@ This document tracks the porting status of [cair/tmu](https://github.com/cair/tm
 | `TMCompositeClassifier` | ✅ Ported | Ensemble of `TsetlinMachine` models; class scores summed at inference |
 | Convolutional TM | ✅ Ported | 1-D receptive-field clauses; weight tying across patch positions |
 | `ClauseBankSparse` / `TMSparseClassifier` | ✅ Ported | Per-clause included/excluded index lists with **absorbing actions** (literals removed at the exclude floor); vanilla-only, scalar, no Type III / parallel / AVX2 in v1 |
+| `TMFuzzyPatternClassifier` | ✅ Ported (not TMU) | The Fuzzy-Pattern TM (arXiv:2508.08350), from the reference Julia code `BooBSD/FuzzyPatternTM` (`src/FuzzyPatternTM.jl`, MIT): fuzzy clause scores (`LF`), unweighted positive/negative clauses, Feedback 1/2, `L`, `S`, `include_limit`. Bit-identical to a line-by-line transliteration of the Julia code driven by the same RNG (`scripts/check_fuzzy_pattern.py`). Deterministic per seed (the reference trains samples in unsynchronised threads); classes train in parallel with `--features parallel`, same result. CPU only |
 
 ---
 
@@ -170,6 +171,7 @@ that reach the absorbing exclude floor are permanently removed from the pool.
 | Convolutional demo | `convolutional` | ✅ Ported | 4 features, kernel=2, stride=1 (3 patches); learns XOR of features 0,1 despite 2 noisy patches; ~77% test accuracy |
 | Composite demo | `composite` | ✅ Ported | 3×20-clause ensemble vs 60-clause single model on 4-class XOR |
 | Sparse demo | `sparse` | ✅ Validated | 12-feature noisy XOR; 100% test accuracy, absorbing fraction climbs as irrelevant literals are dropped |
+| *(FPTM)* Fuzzy-pattern demo | `fuzzy_pattern` | ✅ Validated | 12-feature noisy XOR; 100% test accuracy at its best epochs, next to the vanilla machine |
 | *(extra)* Dense vs sparse | `sparse_vs_dense` | ✅ Complete | Head-to-head accuracy / memory / throughput; at high feature counts sparse reaches ~2.4× smaller memory at near-parity accuracy |
 | Regression demo | `regression` | ✅ Ported | Continuous target (count function scaled to `[0, T]`); MAE + RMSE metrics |
 | Autoencoder demos | `autoencoder`, `coalesced_autoencoder` | ✅ Ported | `TMAutoEncoder` (vanilla) + `TMCoalescedAutoEncoder` (shared-bank) |

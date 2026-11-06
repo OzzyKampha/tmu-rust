@@ -43,7 +43,8 @@ pub use clause_inspect::ClauseInspect;
 pub use encoder::{EncodedBatch, EncodedSample, Encoder};
 pub use models::{
     CoalescedTsetlinMachine, ConvolutionalTsetlinMachine, HeldOutVotes, TMAutoEncoder,
-    TMCoalescedAutoEncoder, TMCompositeClassifier, TMRegressor, TMSparseClassifier, TsetlinMachine,
+    TMCoalescedAutoEncoder, TMCompositeClassifier, TMFuzzyPatternClassifier, TMRegressor,
+    TMSparseClassifier, TsetlinMachine,
 };
 pub use rng::Rng;
 #[cfg(feature = "serde")]
