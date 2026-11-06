@@ -6,6 +6,12 @@ All notable changes to tmu-rs are documented here.
 
 ## [Unreleased]
 
+### Added
+- **`TMFuzzyPatternClassifier::ta_state_histogram()`** (the other classifiers'
+  name and type, replacing `state_histogram()`) and **`inclusion_state()`**,
+  the state from which a literal is included: the fuzzy machine's include
+  limit need not be the middle state.
+
 ---
 
 ## [1.1.0] — 2026-11-06
@@ -23,8 +29,7 @@ All notable changes to tmu-rs are documented here.
   the same result. `scripts/check_fuzzy_pattern.py` retrains the reference
   algorithm (transliterated from `src/FuzzyPatternTM.jl`, same RNG) and
   compares every state: identical over four settings. Save/load (tag 10) and
-  `ClauseInspect`, `grow_features`, `ta_state_histogram` (states from
-  `inclusion_state()` up include). Example: `fuzzy_pattern`.
+  `ClauseInspect`, `grow_features`. Example: `fuzzy_pattern`.
 - **TA state histograms:** `ta_state_histogram()` on `TsetlinMachine`,
   `CoalescedTsetlinMachine` and `TMSparseClassifier` counts the automata at
   each state `0..=max_state`, for watching a machine converge (how many sit at
