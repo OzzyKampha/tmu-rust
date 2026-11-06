@@ -392,16 +392,23 @@ impl TMFuzzyPatternClassifier {
         self.s_draws = (n as f64 / self.specificity).round_ties_even() as usize;
     }
 
-    /// How many literal automata sit at each state, over every clause of
-    /// every class.
-    pub fn state_histogram(&self) -> [u64; 256] {
-        let mut h = [0u64; 256];
+    /// How many literal automata sit at each state `0..=255`, over every
+    /// clause of every class (as the other classifiers'
+    /// `ta_state_histogram`). States from
+    /// [`inclusion_state`](Self::inclusion_state) up include their literal.
+    pub fn ta_state_histogram(&self) -> Vec<u64> {
+        let mut h = vec![0u64; usize::from(STATE_MAX) + 1];
         for team in &self.teams {
             for &s in &team.states {
-                h[s as usize] += 1;
+                h[usize::from(s)] += 1;
             }
         }
         h
+    }
+
+    /// The state from which a literal is included (the include limit).
+    pub fn inclusion_state(&self) -> u8 {
+        self.include_limit
     }
 }
 
@@ -724,6 +731,20 @@ mod tests {
             assert_eq!(a.teams[c].states, b.teams[c].states, "class {c}");
             assert_eq!(a.teams[c].included, b.teams[c].included, "class {c}");
         }
+    }
+
+    #[test]
+    fn the_histogram_counts_every_automaton() {
+        let tm = TMFuzzyPatternClassifier::new(3, 5, 4, 10, 2.0).include_limit(200);
+        let h = tm.ta_state_histogram();
+        assert_eq!(h.len(), 256);
+        assert_eq!(h.iter().sum::<u64>(), 3 * 4 * 10);
+        assert_eq!(
+            h[199],
+            3 * 4 * 10,
+            "every literal starts one below the limit"
+        );
+        assert_eq!(tm.inclusion_state(), 200);
     }
 
     #[test]

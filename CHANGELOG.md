@@ -6,6 +6,12 @@ All notable changes to tmu-rs are documented here.
 
 ## [Unreleased]
 
+### Added
+- **`TMFuzzyPatternClassifier::ta_state_histogram()`** (the other classifiers'
+  name and type, replacing `state_histogram()`) and **`inclusion_state()`**,
+  the state from which a literal is included: the fuzzy machine's include
+  limit need not be the middle state.
+
 ---
 
 ## [1.1.0] — 2026-11-06
