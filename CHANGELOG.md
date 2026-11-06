@@ -6,6 +6,10 @@ All notable changes to tmu-rs are documented here.
 
 ## [Unreleased]
 
+---
+
+## [1.1.0] — 2026-11-06
+
 ### Added
 - **Fuzzy-Pattern Tsetlin Machine:** `TMFuzzyPatternClassifier`, a port of
   Artem Hnilov's FPTM ([arXiv:2508.08350](https://arxiv.org/abs/2508.08350);
