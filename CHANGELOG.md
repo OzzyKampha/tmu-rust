@@ -21,6 +21,10 @@ All notable changes to tmu-rs are documented here.
   survive training, `grow_features`, `literal_sampling` and save/load; the
   flags live in the high bits of the absorbed count, so the file format is
   unchanged. CPU training only: the CUDA sparse path does not know them.
+- **`inject_clause_with_candidates`:** a fixed clause that can still learn:
+  a random share of the other literals are its candidates, so training can
+  add e.g. a negated literal that excludes its false positives. Its memory
+  is that share; there is no unallocated pool.
 - **`Encoder::token_bit(token)`:** a categorical encoder's bit for a token,
   the inverse of `vocab_token`.
 - **`TMFuzzyPatternClassifier::ta_state_histogram()`** (the other classifiers'

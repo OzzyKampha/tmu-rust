@@ -424,6 +424,23 @@ impl TMSparseClassifier {
     /// weight; it cannot add a literal. Even `j` votes for the class, odd `j`
     /// against.
     pub fn inject_fixed_clause(&mut self, class: usize, j: usize, literals: &[usize], weight: i32) {
+        self.inject_clause_with_candidates(class, j, literals, weight, 0.0);
+    }
+
+    /// [`inject_fixed_clause`](Self::inject_fixed_clause), with a random
+    /// `candidates` share (0 to 1) of the other literals as candidates the
+    /// clause can learn to include, as an ordinary clause does: e.g. a negated
+    /// literal that excludes the clause's false positives. Its literals stay a
+    /// closed set (no unallocated pool, nothing new when the vocabulary grows),
+    /// so its memory is that share of the literals.
+    pub fn inject_clause_with_candidates(
+        &mut self,
+        class: usize,
+        j: usize,
+        literals: &[usize],
+        weight: i32,
+        candidates: f64,
+    ) {
         assert!(class < self.n_classes, "class {class} out of range");
         assert!(j < self.clauses_per_class, "clause {j} out of range");
         assert!(weight >= 1, "weight must be >= 1");
@@ -435,7 +452,12 @@ impl TMSparseClassifier {
             })
             .collect();
         let cj = class * self.clauses_per_class + j;
-        self.bank.fix_clause(cj, &lits, self.bank.max_state);
+        assert!(
+            (0.0..=1.0).contains(&candidates),
+            "candidates must be in [0, 1]"
+        );
+        self.bank
+            .fix_clause(cj, &lits, self.bank.max_state, candidates);
         self.weights[cj] = weight;
     }
 
@@ -884,7 +906,10 @@ mod tests {
         let check = |tm: &TMSparseClassifier, n_literals: usize| {
             let c = &tm.bank.clauses[fixed];
             assert!(c.is_fixed() && c.unallocated.is_empty());
-            assert!(c.included.len() + c.excluded.len() <= 2, "only its own literals");
+            assert!(
+                c.included.len() + c.excluded.len() <= 2,
+                "only its own literals"
+            );
             assert_eq!(
                 c.included.len() + c.excluded.len() + c.absorbed_count() as usize,
                 n_literals
@@ -909,7 +934,10 @@ mod tests {
         let lit = sample(0, 0).0;
         let all = vec![u64::MAX; lit.len()];
         assert!(!tm.bank.fire_train(fixed + 1, &lit, &all));
-        assert!(tm.bank.fire_train(fixed + 3, &lit, &all), "an empty clause does");
+        assert!(
+            tm.bank.fire_train(fixed + 3, &lit, &all),
+            "an empty clause does"
+        );
 
         let (xs, ys) = make_xor(400, 0.0, 9);
         let enc = Encoder::for_binary(N_FEATURES);
@@ -939,6 +967,55 @@ mod tests {
             std::fs::remove_file(&dir).ok();
             check(&back, 2 * (N_FEATURES + 4));
         }
+    }
+
+    #[test]
+    fn a_rule_clause_with_candidates_can_learn_a_literal() {
+        // Class 1 is "feature 0 present and feature 1 absent"; the injected
+        // clause knows only feature 0 and has every other literal as a
+        // candidate, so training can add NOT feature 1.
+        let mut tm = TMSparseClassifier::new(2, N_FEATURES, 4, 10, 3.0);
+        tm.inject_clause_with_candidates(1, 0, &[0], 5, 1.0);
+        for j in 1..4 {
+            tm.disable_clause(1, j);
+            tm.disable_clause(0, j);
+        }
+        tm.disable_clause(0, 0);
+        let fixed = tm.clauses_per_class;
+        {
+            let c = &tm.bank.clauses[fixed];
+            assert!(c.is_fixed() && c.unallocated.is_empty());
+            assert_eq!(c.excluded.len(), 2 * N_FEATURES - 1);
+        }
+        let mut rng = crate::rng::Rng::new(5);
+        let (mut xs, mut ys) = (Vec::new(), Vec::new());
+        for _ in 0..600 {
+            let mut x = vec![0u8; N_FEATURES];
+            for v in x.iter_mut() {
+                *v = (rng.next_u64() & 1) as u8;
+            }
+            ys.push(usize::from(x[0] == 1 && x[1] == 0));
+            xs.push(x);
+        }
+        let enc = Encoder::for_binary(N_FEATURES);
+        let data = encode(&xs, &enc);
+        for _ in 0..30 {
+            tm.fit_epoch(&data, &ys);
+        }
+        let c = &tm.bank.clauses[fixed];
+        assert!(
+            c.included.contains(&(N_FEATURES as u32 + 1)),
+            "learned NOT feature 1: {:?}",
+            c.included
+        );
+        assert!(c.unallocated.is_empty());
+        let without = TMSparseClassifier::new(2, N_FEATURES, 4, 10, 3.0);
+        let mut without = without;
+        without.inject_fixed_clause(1, 0, &[0], 5);
+        assert!(
+            without.bank.clauses[fixed].excluded.is_empty(),
+            "none by default"
+        );
     }
 
     #[test]

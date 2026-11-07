@@ -98,9 +98,10 @@ pub(crate) struct SparseClause {
     pub(crate) absorbed: u32,
 }
 
-/// A fixed clause holds only the literals it was given: it has no
-/// candidates, and growing the vocabulary or re-initialising the bank leaves
-/// it as it is. Feedback still moves its literals' states.
+/// A fixed clause holds a closed set of literals: those it was given, and
+/// any candidates it was given with them. It has no unallocated pool, and
+/// growing the vocabulary or re-initialising the bank leaves it as it is.
+/// Feedback still moves its literals' states (and can include candidates).
 pub(crate) const FIXED: u32 = 1 << 31;
 /// A disabled clause never fires, in training or prediction.
 pub(crate) const DISABLED: u32 = 1 << 30;
@@ -741,21 +742,49 @@ impl SparseClauseBank {
 
 impl SparseClauseBank {
     /// Make clause `cj` hold exactly `literals` (at `state`, at least `half`)
-    /// and nothing else: no candidates, now or when the vocabulary grows. The
-    /// other literals count as absorbed out of it.
-    pub(crate) fn fix_clause(&mut self, cj: usize, literals: &[u32], state: u8) {
+    /// plus a random `candidates` share of the other usable literals as
+    /// candidates (at the least-forgotten state, as `reinit` starts them), and
+    /// nothing else: no unallocated pool, and nothing new when the vocabulary
+    /// grows. With `candidates` 0 the clause can never gain a literal. The
+    /// literals it does not hold count as absorbed out of it.
+    pub(crate) fn fix_clause(&mut self, cj: usize, literals: &[u32], state: u8, candidates: f64) {
         let state = state.max(self.half);
+        let least_forgotten = self.half - 1;
         let n_literals = self.n_literals as u32;
+        let usable = if self.feature_negation {
+            n_literals
+        } else {
+            n_literals / 2
+        };
         let c = &mut self.clauses[cj];
         let mut lits = literals.to_vec();
         lits.sort_unstable();
         lits.dedup();
+        let mut pool: Vec<u32> = if candidates > 0.0 {
+            (0..usable)
+                .filter(|l| lits.binary_search(l).is_err())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let k = ((pool.len() as f64) * candidates.min(1.0)) as usize;
+        if k < pool.len() {
+            let mut rng = Rng::new(
+                0x4649_5845_445f_u64 ^ (cj as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            );
+            for i in 0..k {
+                let r = i + (rng.next_u64() % (pool.len() - i) as u64) as usize;
+                pool.swap(i, r);
+            }
+            pool.truncate(k);
+            pool.shrink_to_fit();
+        }
         c.included_state = vec![state; lits.len()];
         c.included = lits;
-        c.excluded.clear();
-        c.excluded_state.clear();
+        c.excluded_state = vec![least_forgotten; pool.len()];
+        c.excluded = pool;
         c.unallocated = Vec::new();
-        c.absorbed = FIXED | (n_literals - c.included.len() as u32);
+        c.absorbed = FIXED | (n_literals - (c.included.len() + c.excluded.len()) as u32);
     }
 
     /// Disable clause `cj`: it never fires, holds nothing and takes nothing.
