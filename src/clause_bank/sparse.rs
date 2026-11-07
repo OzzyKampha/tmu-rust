@@ -89,10 +89,34 @@ pub(crate) struct SparseClause {
     /// `literal_sampling`, handed out by `literal_insertion_state` when a
     /// candidate is absorbed. Popped from the end.
     pub(crate) unallocated: Vec<u32>,
-    /// Literals absorbed out of this clause (dropped for good, as TMU).
+    /// Literals absorbed out of this clause (dropped for good, as TMU), in the
+    /// low 30 bits; the top two bits mark a [fixed](FIXED) or
+    /// [disabled](DISABLED) clause. Kept in one field so the saved format is
+    /// unchanged (old files have neither bit set). Read the count with
+    /// [`SparseClause::absorbed_count`].
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) absorbed: u32,
 }
+
+/// A fixed clause holds a closed set of literals: those it was given, and
+/// any candidates it was given with them. It has no unallocated pool, and
+/// growing the vocabulary or re-initialising the bank leaves it as it is.
+/// Feedback still moves its literals' states (and can include candidates).
+pub(crate) const FIXED: u32 = 1 << 31;
+/// A disabled clause never fires, in training or prediction.
+pub(crate) const DISABLED: u32 = 1 << 30;
+/// A fixed clause that learns exceptions only: its candidates rise only by
+/// Type II feedback (on samples of other classes it fires on), never by
+/// Type I, so it can add literals that exclude its false positives and
+/// nothing that narrows it to the samples it already catches.
+pub(crate) const EXCEPTIONS_ONLY: u32 = 1 << 29;
+/// Bits 19..29: the most literals a fixed clause may include (0 = no cap).
+const CAP_SHIFT: u32 = 19;
+const CAP_MASK: u32 = 0x3FF << CAP_SHIFT;
+/// The most a cap can be.
+pub(crate) const MAX_CAP: usize = 0x3FF;
+/// Bits 0..19: the absorbed count (up to 524,287 literals).
+const ABSORBED_COUNT: u32 = (1 << CAP_SHIFT) - 1;
 
 /// TMU's sparse-bank training options (see the classifier's builders).
 #[derive(Clone, Copy, Debug)]
@@ -157,21 +181,68 @@ fn lit_active(lit_active: &[u64], l: u32) -> bool {
 }
 
 impl SparseClause {
+    /// Literals absorbed out of this clause.
+    #[inline]
+    pub(crate) fn absorbed_count(&self) -> u32 {
+        self.absorbed & ABSORBED_COUNT
+    }
+
+    #[inline]
+    pub(crate) fn is_fixed(&self) -> bool {
+        self.absorbed & FIXED != 0
+    }
+
+    #[inline]
+    pub(crate) fn is_disabled(&self) -> bool {
+        self.absorbed & DISABLED != 0
+    }
+
+    #[inline]
+    pub(crate) fn exceptions_only(&self) -> bool {
+        self.absorbed & EXCEPTIONS_ONLY != 0
+    }
+
+    /// The most literals this clause may include, if capped.
+    #[inline]
+    pub(crate) fn literal_cap(&self) -> Option<usize> {
+        match ((self.absorbed & CAP_MASK) >> CAP_SHIFT) as usize {
+            0 => None,
+            n => Some(n),
+        }
+    }
+
+    /// Whether the clause may include one more literal.
+    #[inline]
+    fn below_cap(&self) -> bool {
+        self.literal_cap()
+            .is_none_or(|cap| self.included.len() < cap)
+    }
+
+    /// Add `n` to the absorbed count, keeping the flags.
+    #[inline]
+    fn add_absorbed(&mut self, n: u32) {
+        let count = (self.absorbed_count() + n).min(ABSORBED_COUNT);
+        self.absorbed = (self.absorbed & !ABSORBED_COUNT) | count;
+    }
+
     /// Predict-semantics fire check: an **empty** clause returns `false`.
     #[inline]
     fn fire_predict(&self, lit: &[u64]) -> bool {
-        if self.included.is_empty() {
+        if self.included.is_empty() || self.is_disabled() {
             return false;
         }
         self.included.iter().all(|&l| lit_present(lit, l))
     }
 
-    /// Train-semantics fire check: an **empty** clause returns `true`.
+    /// Train-semantics fire check: an **empty** clause returns `true` (a
+    /// disabled one `false`).
     #[inline]
     pub(crate) fn fire_train(&self, lit: &[u64], lit_active_mask: &[u64]) -> bool {
-        self.included
-            .iter()
-            .all(|&l| !lit_active(lit_active_mask, l) || lit_present(lit, l))
+        !self.is_disabled()
+            && self
+                .included
+                .iter()
+                .all(|&l| !lit_active(lit_active_mask, l) || lit_present(lit, l))
     }
 
     /// Number of included literals (for the `max_included` gate).
@@ -233,7 +304,11 @@ impl SparseClause {
                     }
                     let state = self.excluded_state[i];
                     if lit_present(lit, l) {
-                        if self.included.len() < max_included && (boost || rng.next_f64() <= keep_p)
+                        // An exceptions-only clause gains literals by Type II alone.
+                        if !self.exceptions_only()
+                            && self.included.len() < max_included
+                            && self.below_cap()
+                            && (boost || rng.next_f64() <= keep_p)
                         {
                             let new_state = state.saturating_add(rate).min(max_state);
                             if new_state >= half {
@@ -330,7 +405,7 @@ impl SparseClause {
             self.excluded_state[i] = new_state;
             return false;
         }
-        self.absorbed += 1;
+        self.add_absorbed(1);
         match (opts.insertion_state >= 0, self.unallocated.pop()) {
             // TMU's literal insertion: an unallocated literal takes the slot.
             (true, Some(l)) => {
@@ -374,6 +449,13 @@ impl SparseClause {
             if active && !lit_present(lit, l) {
                 let new_state = state.saturating_add(rate).min(max_state);
                 if new_state >= half {
+                    // A capped clause that is full keeps the candidate just
+                    // below inclusion.
+                    if !self.below_cap() {
+                        self.excluded_state[i] = half - 1;
+                        i += 1;
+                        continue;
+                    }
                     promote_to_included(self, i, new_state);
                     continue;
                 } else {
@@ -447,6 +529,9 @@ impl SparseClauseBank {
         let least_forgotten = self.half - 1;
         let k = ((usable.len() as f64) * self.literal_sampling) as usize;
         for (j, c) in self.clauses.iter_mut().enumerate() {
+            if c.is_fixed() || c.is_disabled() {
+                continue;
+            }
             let mut order = usable.clone();
             if k < order.len() {
                 // Per-clause shuffle, deterministic per clause index.
@@ -506,6 +591,12 @@ impl SparseClauseBank {
             c.included.iter_mut().for_each(remap);
             c.excluded.iter_mut().for_each(remap);
             c.unallocated.iter_mut().for_each(remap);
+            // A fixed or disabled clause takes no candidates: the new literals
+            // count as absorbed out of it.
+            if c.is_fixed() || c.is_disabled() {
+                c.add_absorbed(n_new as u32);
+                continue;
+            }
 
             // Append the new literals as just-excluded candidates: new positives
             // [old_nf, new_nf) and new negateds [new_nf + old_nf, 2*new_nf).
@@ -652,7 +743,10 @@ impl SparseClauseBank {
     /// clause's `unallocated` pool, which under the v1 init policy only grows via
     /// absorbing removal).
     pub(crate) fn count_absorbed_exclude(&self) -> u64 {
-        self.clauses.iter().map(|c| u64::from(c.absorbed)).sum()
+        self.clauses
+            .iter()
+            .map(|c| u64::from(c.absorbed_count()))
+            .sum()
     }
 
     /// Total number of (clause, literal) slots, for fraction denominators.
@@ -668,6 +762,142 @@ fn demote_to_excluded(c: &mut SparseClause, idx: usize, state: u8) {
     c.included_state.swap_remove(idx);
     c.excluded.push(l);
     c.excluded_state.push(state);
+}
+
+impl SparseClauseBank {
+    /// Include literal `l` in clause `cj` at `state` (at least the inclusion
+    /// threshold), wherever it was: a candidate, unallocated, already included
+    /// (its state is raised), or absorbed (it comes back). Every literal stays
+    /// accounted for exactly once.
+    pub(crate) fn include_literal(&mut self, cj: usize, l: u32, state: u8) {
+        let state = state.max(self.half);
+        let c = &mut self.clauses[cj];
+        if let Some(i) = c.included.iter().position(|&x| x == l) {
+            c.included_state[i] = c.included_state[i].max(state);
+            return;
+        }
+        if let Some(i) = c.excluded.iter().position(|&x| x == l) {
+            promote_to_included(c, i, state);
+            return;
+        }
+        if let Some(i) = c.unallocated.iter().position(|&x| x == l) {
+            c.unallocated.swap_remove(i);
+        } else if c.absorbed_count() > 0 {
+            c.absorbed -= 1;
+        }
+        c.included.push(l);
+        c.included_state.push(state);
+    }
+}
+
+impl SparseClauseBank {
+    /// Make clause `cj` hold exactly `literals` (at `state`, at least `half`)
+    /// plus a random `candidates` share of the other usable literals as
+    /// candidates (at the least-forgotten state, as `reinit` starts them), and
+    /// nothing else: no unallocated pool, and nothing new when the vocabulary
+    /// grows. With `candidates` 0 the clause can never gain a literal. The
+    /// literals it does not hold count as absorbed out of it.
+    pub(crate) fn fix_clause(
+        &mut self,
+        cj: usize,
+        literals: &[u32],
+        state: u8,
+        learn: crate::RuleLearning,
+    ) {
+        let candidates = learn.candidates;
+        let state = state.max(self.half);
+        let least_forgotten = self.half - 1;
+        let n_literals = self.n_literals as u32;
+        let n_features = n_literals / 2;
+        // Negated-only candidates are the negated literals; otherwise the
+        // usable ones (positives, and negations when feature_negation is on).
+        let usable = if learn.negated_only {
+            n_features..n_literals
+        } else if self.feature_negation {
+            0..n_literals
+        } else {
+            0..n_features
+        };
+        let c = &mut self.clauses[cj];
+        let mut lits = literals.to_vec();
+        lits.sort_unstable();
+        lits.dedup();
+        // Neither its own literals nor their complements: "x AND NOT x"
+        // would never fire.
+        let complement = |l: u32| {
+            if l < n_features {
+                l + n_features
+            } else {
+                l - n_features
+            }
+        };
+        let mut pool: Vec<u32> = if candidates > 0.0 {
+            usable
+                .filter(|&l| {
+                    lits.binary_search(&l).is_err() && lits.binary_search(&complement(l)).is_err()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let k = ((pool.len() as f64) * candidates.min(1.0)) as usize;
+        if k < pool.len() {
+            let mut rng = Rng::new(
+                0x4649_5845_445f_u64 ^ (cj as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            );
+            for i in 0..k {
+                let r = i + (rng.next_u64() % (pool.len() - i) as u64) as usize;
+                pool.swap(i, r);
+            }
+            pool.truncate(k);
+            pool.shrink_to_fit();
+        }
+        c.included_state = vec![state; lits.len()];
+        c.included = lits;
+        c.excluded_state = vec![least_forgotten; pool.len()];
+        c.excluded = pool;
+        c.unallocated = Vec::new();
+        let count = (n_literals - (c.included.len() + c.excluded.len()) as u32).min(ABSORBED_COUNT);
+        let cap = match learn.max_gained {
+            0 => 0,
+            n => (c.included.len() + n).min(MAX_CAP) as u32,
+        };
+        let exceptions = if learn.negated_only {
+            EXCEPTIONS_ONLY
+        } else {
+            0
+        };
+        c.absorbed = FIXED | exceptions | (cap << CAP_SHIFT) | count;
+    }
+
+    /// Insert `n` disabled clauses before clause `at` (`at` may be the
+    /// number of clauses, to append).
+    pub(crate) fn insert_disabled(&mut self, at: usize, n: usize) {
+        let n_literals = (self.n_literals as u32).min(ABSORBED_COUNT);
+        let disabled = SparseClause {
+            included: Vec::new(),
+            included_state: Vec::new(),
+            excluded: Vec::new(),
+            excluded_state: Vec::new(),
+            unallocated: Vec::new(),
+            absorbed: DISABLED | n_literals,
+        };
+        self.clauses
+            .splice(at..at, std::iter::repeat_n(disabled, n));
+        self.n_clauses += n;
+    }
+
+    /// Disable clause `cj`: it never fires, holds nothing and takes nothing.
+    pub(crate) fn disable_clause(&mut self, cj: usize) {
+        let n_literals = self.n_literals as u32;
+        let c = &mut self.clauses[cj];
+        c.included = Vec::new();
+        c.included_state = Vec::new();
+        c.excluded = Vec::new();
+        c.excluded_state = Vec::new();
+        c.unallocated = Vec::new();
+        c.absorbed = DISABLED | n_literals.min(ABSORBED_COUNT);
+    }
 }
 
 /// Move excluded literal at `idx` to the included pool with state `state`.

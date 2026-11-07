@@ -6,7 +6,55 @@ All notable changes to tmu-rs are documented here.
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-11-07
+
 ### Added
+- **Rule clauses on the GPU:** `CudaTMSparseClassifier` trains fixed,
+  disabled, exceptions-only and capped clauses and `fixed_clauses_only`
+  exactly as the CPU does (bit-identical states, weights and RNGs, checked
+  against the CPU in the emulator tests): disabled slots never fire, a fixed
+  clause takes no Type Ib, an exceptions-only clause raises no candidate under
+  Type Ia, the literal cap holds under Type Ia and Type II, and the absorbed
+  count keeps the clause's flags.
+- **Clause injection:** `TMSparseClassifier::inject_clause(class, j, literals,
+  weight)` seeds a clause with prior knowledge (its literals included at the
+  maximum state, its weight set) before or between training; feedback then
+  refines it like any other clause. Every literal stays accounted for once
+  (candidate, unallocated, included or absorbed).
+- **Fixed and disabled clauses:** `TMSparseClassifier::inject_fixed_clause`
+  seeds a clause that holds only the given literals and never takes a
+  candidate, so it costs memory for its own literals alone whatever the
+  vocabulary (thousands of rule clauses fit). Feedback still moves its
+  literals' states and its weight. `disable_clause` makes a slot that never
+  fires, in training too (an empty clause otherwise fires there). Both
+  survive training, `grow_features`, `literal_sampling` and save/load; the
+  flags live in the high bits of the absorbed count, so the file format is
+  unchanged. CPU training only: the CUDA sparse path does not know them.
+- **`inject_clause_with_candidates`:** a fixed clause that can still learn:
+  a random share of the other literals are its candidates, so training can
+  add e.g. a negated literal that excludes its false positives. Its memory
+  is that share; there is no unallocated pool.
+- **`fixed_clauses_only(true)`:** train only the fixed clauses, leaving
+  every other clause as it is: adapts seeded rules to a site by ordinary
+  feedback on its normal samples (a rule firing on them loses weight, or
+  learns a literal excluding them) without the learned clauses forgetting
+  what those samples do not show. Not saved.
+- **`TMSparseClassifier::add_clauses(per_class)`:** appends disabled clause
+  slots to every class of a trained machine, keeping everything learned and
+  each clause's index within its class, so new rule clauses can be injected
+  without retraining.
+- **`inject_rule_clause` with `RuleLearning`:** how a seeded rule clause may
+  learn: a share of candidates, `negated_only` (candidates are negated
+  literals and rise by Type II only, so the rule learns exceptions, "except
+  when x is present", and nothing narrower), and `max_gained`, a cap on the
+  literals it adds that also holds under Type II and survives saving.
+  Candidates never include the complement of one of the rule's own literals
+  ("x AND NOT x" never fires).
+- Fixed clauses learn only where they fire: no Type Ib feedback when they
+  do not, so a seeded rule the training data never triggers keeps its
+  literals and weight instead of being worn away.
+- **`Encoder::token_bit(token)`:** a categorical encoder's bit for a token,
+  the inverse of `vocab_token`.
 - **`TMFuzzyPatternClassifier::ta_state_histogram()`** (the other classifiers'
   name and type, replacing `state_histogram()`) and **`inclusion_state()`**,
   the state from which a literal is included: the fuzzy machine's include

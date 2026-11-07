@@ -342,6 +342,15 @@ impl Encoder {
         }
     }
 
+    /// For categorical encoders: the bit of token `token` (`"col::val"`), if it
+    /// is in the vocabulary. The inverse of [`vocab_token`](Self::vocab_token).
+    pub fn token_bit(&self, token: &str) -> Option<usize> {
+        match &self.kind {
+            EncoderKind::Categorical { vocab, .. } => vocab.get(token).copied(),
+            _ => None,
+        }
+    }
+
     /// For categorical encoders: return the `"col::val"` token string for bit `bit`.
     ///
     /// Useful for printing interpretable clause rules.
@@ -704,6 +713,23 @@ mod grow_tests {
 }
 
 #[cfg(all(test, feature = "serde"))]
+mod token_bit_tests {
+    use super::*;
+
+    #[test]
+    fn token_bit_inverts_vocab_token() {
+        let rows: Vec<Vec<&str>> = vec![vec!["a::1", "b::x"], vec!["a::2"]];
+        let refs: Vec<&[&str]> = rows.iter().map(|r| r.as_slice()).collect();
+        let enc = Encoder::fit_categorical(&refs);
+        for bit in 0..enc.n_features() {
+            assert_eq!(enc.token_bit(enc.vocab_token(bit)), Some(bit));
+        }
+        assert_eq!(enc.token_bit("c::never"), None);
+        assert_eq!(Encoder::for_binary(3).token_bit("a::1"), None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::serial::{self, SaveLoad};

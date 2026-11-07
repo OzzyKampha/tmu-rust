@@ -1174,13 +1174,29 @@ struct SparseBank {
     u32* n_inc;
     u32* n_exc;
     u32* n_una;
-    u32* n_abs;   // literals absorbed out, per clause
+    u32* n_abs;   // literals absorbed out, per clause, with the clause's flags (below)
 };
+
+// SparseClause::absorbed: the count in bits 0..19, a literal cap in bits
+// 19..29 (0 = none), and the flags of rule clauses in the top bits.
+#define SP_FIXED (1u << 31)          // a seeded clause: no Type Ib
+#define SP_DISABLED (1u << 30)       // an empty slot: never fires
+#define SP_EXC_ONLY (1u << 29)       // gains literals by Type II alone
+#define SP_CAP_SHIFT 19
+#define SP_CAP_MASK (0x3FFu << SP_CAP_SHIFT)
+#define SP_COUNT ((1u << SP_CAP_SHIFT) - 1)
+
+// Whether a clause with `n_inc` included literals may include one more.
+__device__ __forceinline__ bool sp_below_cap(u32 abs, u32 n_inc) {
+    u32 cap = (abs & SP_CAP_MASK) >> SP_CAP_SHIFT;
+    return cap == 0 || n_inc < cap;
+}
 
 __device__ __forceinline__ bool bit_of(const u64* v, u32 l) { return (v[l >> 6] >> (l & 63)) & 1ULL; }
 
 __device__ bool sparse_fire_train(const SparseBank& b, u64 cj, u32 nl, const u64* lit,
                                   const u64* act) {
+    if (b.n_abs[cj] & SP_DISABLED) return false;
     u32 n = b.n_inc[cj];
     const u32* idx = b.inc_idx + cj * nl;
     for (u32 i = 0; i < n; i++)
@@ -1190,7 +1206,7 @@ __device__ bool sparse_fire_train(const SparseBank& b, u64 cj, u32 nl, const u64
 
 __device__ bool sparse_fire_predict(const SparseBank& b, u64 cj, u32 nl, const u64* lit) {
     u32 n = b.n_inc[cj];
-    if (n == 0) return false;
+    if (n == 0 || (b.n_abs[cj] & SP_DISABLED)) return false;
     const u32* idx = b.inc_idx + cj * nl;
     for (u32 i = 0; i < n; i++)
         if (!bit_of(lit, idx[i])) return false;
@@ -1261,6 +1277,7 @@ struct SpUpdateParams {
     int insertion;               // TMU's literal_insertion_state; -1 = off
     u32 rate;                    // TMU's feedback_rate_excluded_literals (>= 1)
     u32 confidence, weighted;    // TMU's confidence_driven_updating, weighted_clauses
+    u32 fixed_only, _pad;        // feedback for fixed clauses only
 };
 
 // Lower candidate i to `ns`, absorbing at or below `absorbing` (TMU's
@@ -1271,7 +1288,7 @@ __device__ int sp_lower(const SpUpdateParams& p, u32* exc_idx, u8* exc_st, u32* 
         exc_st[i] = (u8)ns;
         return 0;
     }
-    (*n_abs)++;
+    if ((*n_abs & SP_COUNT) < SP_COUNT) (*n_abs)++;  // the count saturates below the flags
     if (p.insertion >= 0 && *n_una > 0) {
         (*n_una)--;
         exc_idx[i] = una_idx[*n_una];
@@ -1299,6 +1316,7 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
         prob = feedback_p(target, sum, p.threshold, p.class_weights[gid]);
     }
     if (p.drop_p > 0.0 && u64_to_f64(rng_peek(p.drop_s0[g], j)) < p.drop_p) return;
+    if (p.fixed_only && !(p.bank.n_abs[cj] & SP_FIXED)) return;
     int positive = (j & 1u) == 0;
     int type_i = target == positive;
     u64 s = p.rngs[cj];
@@ -1320,6 +1338,12 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
     long long inv_rate = rng_cut(1.0 / (double)rate);
     long long keep_p = rng_cut(p.keep_p), inv_p = rng_cut(p.inv_p);
     if (type_i) {
+        // A fixed clause learns only where it fires: Type Ib would wear down a
+        // seeded rule whose events the data lacks.
+        if (!fired && (n_abs & SP_FIXED)) {
+            p.rngs[cj] = s;
+            return;
+        }
         int fu = fired && (p.max_inc == NO_LIMIT || (u64)n_inc < p.max_inc);
         if (fu && p.weighted) *w = imin(*w + 1, p.threshold);
         for (int phase = 0; phase < 2; phase++) {
@@ -1359,8 +1383,10 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
                     }
                     u32 st = exc_st[i];
                     if (fu && bit_of(p.lit, l)) {
-                        if ((p.max_inc == NO_LIMIT || (u64)n_inc < p.max_inc) &&
-                            (p.boost || rng_le(&s, keep_p))) {
+                        // An exceptions-only clause gains literals by Type II alone.
+                        if (!(n_abs & SP_EXC_ONLY) &&
+                            (p.max_inc == NO_LIMIT || (u64)n_inc < p.max_inc) &&
+                            sp_below_cap(n_abs, n_inc) && (p.boost || rng_le(&s, keep_p))) {
                             u32 ns = st + rate < p.max_state ? st + rate : p.max_state;
                             if (ns >= p.half) {
                                 sp_swap_remove(exc_idx, exc_st, &n_exc, i);
@@ -1390,6 +1416,12 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
                 if (bit_of(p.act, l) && !bit_of(p.lit, l)) {
                     u32 ns = st + rate < p.max_state ? st + rate : p.max_state;
                     if (ns >= p.half) {
+                        // A capped clause that is full keeps the candidate just below inclusion.
+                        if (!sp_below_cap(n_abs, n_inc)) {
+                            exc_st[i] = (u8)(p.half - 1);
+                            i++;
+                            continue;
+                        }
                         sp_swap_remove(exc_idx, exc_st, &n_exc, i);
                         inc_idx[n_inc] = l;
                         inc_st[n_inc] = (u8)ns;

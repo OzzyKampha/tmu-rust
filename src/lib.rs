@@ -42,9 +42,9 @@ pub use booleanizer::Booleanizer;
 pub use clause_inspect::ClauseInspect;
 pub use encoder::{EncodedBatch, EncodedSample, Encoder};
 pub use models::{
-    CoalescedTsetlinMachine, ConvolutionalTsetlinMachine, HeldOutVotes, TMAutoEncoder,
-    TMCoalescedAutoEncoder, TMCompositeClassifier, TMFuzzyPatternClassifier, TMRegressor,
-    TMSparseClassifier, TsetlinMachine,
+    ClauseKind, CoalescedTsetlinMachine, ConvolutionalTsetlinMachine, HeldOutVotes, RuleLearning,
+    TMAutoEncoder, TMCoalescedAutoEncoder, TMCompositeClassifier, TMFuzzyPatternClassifier,
+    TMRegressor, TMSparseClassifier, TsetlinMachine,
 };
 pub use rng::Rng;
 #[cfg(feature = "serde")]
