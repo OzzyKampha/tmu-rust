@@ -90,6 +90,10 @@ pub struct TMSparseClassifier {
         serde(skip, default = "crate::clause_bank::dense::serde_one")
     )]
     pub(crate) type_ii_p: f64,
+    /// Give feedback only to fixed clauses (see
+    /// [`TMSparseClassifier::fixed_clauses_only`]). Training setting.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) fixed_only: bool,
 }
 
 #[cfg(feature = "serde")]
@@ -187,6 +191,7 @@ impl TMSparseClassifier {
             class_weights: vec![1.0f64; n_classes],
             weighted_clauses: true,
             confidence_driven_updating: false,
+            fixed_only: false,
             type_i_p: 1.0,
             type_ii_p: 1.0,
         }
@@ -225,6 +230,17 @@ impl TMSparseClassifier {
     /// `(T - |class sum|) / T` for the true and the negative class alike.
     pub fn confidence_driven_updating(mut self, on: bool) -> Self {
         self.confidence_driven_updating = on;
+        self
+    }
+
+    /// Train only the fixed clauses (default false): every other clause is
+    /// left as it is. For adapting seeded rules to a site by ordinary Type I /
+    /// II feedback (a rule firing on the site's normal events loses weight, or
+    /// learns a literal that excludes them) without the learned clauses
+    /// forgetting what the site's data does not show. A training setting, not
+    /// saved.
+    pub fn fixed_clauses_only(mut self, on: bool) -> Self {
+        self.fixed_only = on;
         self
     }
 
@@ -606,6 +622,7 @@ impl TMSparseClassifier {
         let (type_i_p, type_ii_p) = (self.type_i_p, self.type_ii_p);
         let max_inc = self.max_included_literals;
         let drop_p = self.clause_drop_p;
+        let fixed_only = self.fixed_only;
         let cw = self.class_weights[c];
         let inv_p = 1.0 / self.s;
         let keep_p = (self.s - 1.0) / self.s;
@@ -646,6 +663,9 @@ impl TMSparseClassifier {
                      w: &mut i32,
                      rng: &mut Rng| {
             if !drop_mask.is_empty() && drop_mask[j] {
+                return;
+            }
+            if fixed_only && !clause.is_fixed() {
                 return;
             }
             let positive = j & 1 == 0;
@@ -1078,6 +1098,47 @@ mod tests {
         assert_eq!(tm.bank.clauses[cj].included, vec![7]);
         assert_eq!(tm.bank.clauses[cj].included_state, vec![tm.bank.max_state]);
         assert_eq!(tm.weights[cj], 5);
+    }
+
+    #[test]
+    fn feedback_on_normal_samples_wears_down_a_rule_that_fires_on_them() {
+        // Class 1's fixed clause on feature 3; the samples are all class 0
+        // (normal), half with feature 3. Only fixed clauses train.
+        let mut tm = TMSparseClassifier::new(2, N_FEATURES, 4, 20, 3.0).fixed_clauses_only(true);
+        tm.inject_fixed_clause(1, 0, &[3], 20);
+        tm.inject_fixed_clause(1, 2, &[5], 20);
+        tm.disable_clause(1, 1);
+        tm.disable_clause(1, 3);
+        let learned_before = tm.bank.clauses[0].clone();
+        let mut rng = crate::rng::Rng::new(9);
+        let xs: Vec<Vec<u8>> = (0..400)
+            .map(|i| {
+                let mut x = vec![0u8; N_FEATURES];
+                x[3] = (i % 2) as u8;
+                x[0] = (rng.next_u64() & 1) as u8;
+                x
+            })
+            .collect();
+        let ys = vec![0usize; xs.len()];
+        let enc = Encoder::for_binary(N_FEATURES);
+        tm.fit_epoch(&encode(&xs, &enc), &ys);
+        let cps = tm.clauses_per_class;
+        assert_eq!(
+            tm.weights[cps], 1,
+            "the rule firing on normal samples is worn down"
+        );
+        assert_eq!(
+            tm.weights[cps + 2],
+            20,
+            "the one that never fires keeps its weight"
+        );
+        assert_eq!(tm.bank.clauses[cps + 2].included, vec![5]);
+        let after = &tm.bank.clauses[0];
+        assert_eq!(
+            after.included, learned_before.included,
+            "learned clauses are frozen"
+        );
+        assert_eq!(after.excluded_state, learned_before.excluded_state);
     }
 
     #[test]

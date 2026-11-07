@@ -25,6 +25,11 @@ All notable changes to tmu-rs are documented here.
   a random share of the other literals are its candidates, so training can
   add e.g. a negated literal that excludes its false positives. Its memory
   is that share; there is no unallocated pool.
+- **`fixed_clauses_only(true)`:** train only the fixed clauses, leaving
+  every other clause as it is: adapts seeded rules to a site by ordinary
+  feedback on its normal samples (a rule firing on them loses weight, or
+  learns a literal excluding them) without the learned clauses forgetting
+  what those samples do not show. Not saved.
 - Fixed clauses learn only where they fire: no Type Ib feedback when they
   do not, so a seeded rule the training data never triggers keeps its
   literals and weight instead of being worn away.
