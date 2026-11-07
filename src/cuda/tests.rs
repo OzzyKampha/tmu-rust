@@ -902,6 +902,77 @@ mod sparse {
         };
         check(make, 3, 6, &device_serial());
     }
+
+    /// Every kind of rule clause in one machine: fixed (no Type Ib), disabled
+    /// slots, learning exceptions only with a cap, and learning with a cap.
+    fn with_rule_clauses(fixed_only: bool) -> TMSparseClassifier {
+        use crate::RuleLearning;
+        let mut tm = TMSparseClassifier::with_config(3, 12, 8, 6, 3.0, 4, false, 13)
+            .absorbing(2)
+            .literal_insertion_state(5)
+            .literal_sampling(0.5)
+            .fixed_clauses_only(fixed_only);
+        // Slots 8..14 of every class, disabled until a rule takes one.
+        tm.add_clauses(6);
+        // Features 0 and 1 carry the XOR; 3 shifts the class. Literal 12 + i
+        // is NOT feature i.
+        tm.inject_fixed_clause(0, 8, &[0, 13], 6);
+        tm.inject_fixed_clause(1, 9, &[3], 3);
+        tm.inject_rule_clause(
+            1,
+            10,
+            &[1, 12],
+            6,
+            RuleLearning {
+                candidates: 1.0,
+                negated_only: true,
+                max_gained: 2,
+            },
+        );
+        tm.inject_rule_clause(
+            2,
+            8,
+            &[3, 0],
+            6,
+            RuleLearning {
+                candidates: 1.0,
+                negated_only: false,
+                max_gained: 1,
+            },
+        );
+        tm.inject_fixed_clause(2, 12, &[15], 2);
+        // Fires on half the samples (feature 2 is noise), so its exceptions-only
+        // flag decides often.
+        tm.inject_rule_clause(
+            0,
+            10,
+            &[2],
+            4,
+            RuleLearning {
+                candidates: 1.0,
+                negated_only: true,
+                max_gained: 3,
+            },
+        );
+        tm
+    }
+
+    #[test]
+    fn matches_cpu_with_rule_clauses() {
+        if skip() {
+            return;
+        }
+        check(|| with_rule_clauses(false), 3, 6, &device_serial());
+        check(|| with_rule_clauses(false), 3, 2, &device());
+    }
+
+    #[test]
+    fn matches_cpu_training_rule_clauses_only() {
+        if skip() {
+            return;
+        }
+        check(|| with_rule_clauses(true), 3, 6, &device_serial());
+    }
 }
 
 mod refusals {

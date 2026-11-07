@@ -137,6 +137,7 @@ params! {
         boost: u32, half: u32, max_state: u32, absorbing: i32,
         type_i_p: f64, type_ii_p: f64,
         insertion: i32, rate: u32, confidence: u32, weighted: u32,
+        fixed_only: u32, _pad: u32,
     }
     ScoresParams {
         include: u64, valid: u64, lits: u64, weights: u64, out: u64,

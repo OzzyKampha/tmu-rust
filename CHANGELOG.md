@@ -7,6 +7,13 @@ All notable changes to tmu-rs are documented here.
 ## [Unreleased]
 
 ### Added
+- **Rule clauses on the GPU:** `CudaTMSparseClassifier` trains fixed,
+  disabled, exceptions-only and capped clauses and `fixed_clauses_only`
+  exactly as the CPU does (bit-identical states, weights and RNGs, checked
+  against the CPU in the emulator tests): disabled slots never fire, a fixed
+  clause takes no Type Ib, an exceptions-only clause raises no candidate under
+  Type Ia, the literal cap holds under Type Ia and Type II, and the absorbed
+  count keeps the clause's flags.
 - **Clause injection:** `TMSparseClassifier::inject_clause(class, j, literals,
   weight)` seeds a clause with prior knowledge (its literals included at the
   maximum state, its weight set) before or between training; feedback then

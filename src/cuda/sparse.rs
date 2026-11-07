@@ -285,6 +285,8 @@ impl CudaTMSparseClassifier {
                     rate: u32::from(h.bank.feedback_rate),
                     confidence: h.confidence_driven_updating as u32,
                     weighted: h.weighted_clauses as u32,
+                    fixed_only: h.fixed_only as u32,
+                    _pad: 0,
                 };
                 self.dev
                     .inner
