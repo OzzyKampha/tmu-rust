@@ -12,6 +12,15 @@ All notable changes to tmu-rs are documented here.
   maximum state, its weight set) before or between training; feedback then
   refines it like any other clause. Every literal stays accounted for once
   (candidate, unallocated, included or absorbed).
+- **Fixed and disabled clauses:** `TMSparseClassifier::inject_fixed_clause`
+  seeds a clause that holds only the given literals and never takes a
+  candidate, so it costs memory for its own literals alone whatever the
+  vocabulary (thousands of rule clauses fit). Feedback still moves its
+  literals' states and its weight. `disable_clause` makes a slot that never
+  fires, in training too (an empty clause otherwise fires there). Both
+  survive training, `grow_features`, `literal_sampling` and save/load; the
+  flags live in the high bits of the absorbed count, so the file format is
+  unchanged. CPU training only: the CUDA sparse path does not know them.
 - **`Encoder::token_bit(token)`:** a categorical encoder's bit for a token,
   the inverse of `vocab_token`.
 - **`TMFuzzyPatternClassifier::ta_state_histogram()`** (the other classifiers'

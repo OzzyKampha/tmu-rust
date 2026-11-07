@@ -417,6 +417,38 @@ impl TMSparseClassifier {
         self.weights[cj] = weight;
     }
 
+    /// Seed clause `j` of `class` with a fixed rule: it holds exactly
+    /// `literals` (at the maximum state) and never takes a candidate, so it
+    /// costs memory only for its own literals, however large the vocabulary.
+    /// Training still wears its literals down or restores them and changes its
+    /// weight; it cannot add a literal. Even `j` votes for the class, odd `j`
+    /// against.
+    pub fn inject_fixed_clause(&mut self, class: usize, j: usize, literals: &[usize], weight: i32) {
+        assert!(class < self.n_classes, "class {class} out of range");
+        assert!(j < self.clauses_per_class, "clause {j} out of range");
+        assert!(weight >= 1, "weight must be >= 1");
+        let lits: Vec<u32> = literals
+            .iter()
+            .map(|&l| {
+                assert!(l < self.n_literals, "literal {l} out of range");
+                l as u32
+            })
+            .collect();
+        let cj = class * self.clauses_per_class + j;
+        self.bank.fix_clause(cj, &lits, self.bank.max_state);
+        self.weights[cj] = weight;
+    }
+
+    /// Disable clause `j` of `class`: it never fires (in training either, where
+    /// an empty clause otherwise does), holds nothing and takes no candidates.
+    /// For slots kept unused, e.g. the opposite-polarity partners of fixed
+    /// clauses.
+    pub fn disable_clause(&mut self, class: usize, j: usize) {
+        assert!(class < self.n_classes, "class {class} out of range");
+        assert!(j < self.clauses_per_class, "clause {j} out of range");
+        self.bank.disable_clause(class * self.clauses_per_class + j);
+    }
+
     /// Predict the class for an encoded sample.
     #[inline]
     pub fn predict(&self, sample: &EncodedSample) -> usize {
@@ -816,7 +848,7 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(
-            seen.len() + c.absorbed as usize,
+            seen.len() + c.absorbed_count() as usize,
             2 * N_FEATURES,
             "every literal once"
         );
@@ -839,6 +871,74 @@ mod tests {
         let (xs, ys) = make_xor(400, 0.0, 9);
         let enc = Encoder::for_binary(N_FEATURES);
         tm.fit_epoch(&encode(&xs, &enc), &ys);
+    }
+
+    #[test]
+    fn a_fixed_clause_holds_only_its_literals_through_training_growth_and_saving() {
+        let mut tm = TMSparseClassifier::new(2, N_FEATURES, 10, 50, 3.0)
+            .absorbing(10)
+            .literal_insertion_state(100);
+        tm.inject_fixed_clause(1, 0, &[2, N_FEATURES + 5], 7);
+        tm.disable_clause(1, 1);
+        let fixed = tm.clauses_per_class;
+        let check = |tm: &TMSparseClassifier, n_literals: usize| {
+            let c = &tm.bank.clauses[fixed];
+            assert!(c.is_fixed() && c.unallocated.is_empty());
+            assert!(c.included.len() + c.excluded.len() <= 2, "only its own literals");
+            assert_eq!(
+                c.included.len() + c.excluded.len() + c.absorbed_count() as usize,
+                n_literals
+            );
+            let d = &tm.bank.clauses[fixed + 1];
+            assert!(d.is_disabled());
+            assert!(d.included.is_empty() && d.excluded.is_empty() && d.unallocated.is_empty());
+        };
+        check(&tm, 2 * N_FEATURES);
+        let sample = |f2: u8, f5: u8| {
+            let mut x = vec![0u8; N_FEATURES];
+            x[2] = f2;
+            x[5] = f5;
+            EncodedSample::from_bits(&x, N_FEATURES)
+        };
+        let mut out = [0i32; 2];
+        tm.scores(&sample(1, 0), &mut out);
+        assert_eq!(out, [0, 7]);
+        tm.scores(&sample(1, 1), &mut out);
+        assert_eq!(out, [0, 0]);
+        // A disabled clause does not fire in training, where empty ones do.
+        let lit = sample(0, 0).0;
+        let all = vec![u64::MAX; lit.len()];
+        assert!(!tm.bank.fire_train(fixed + 1, &lit, &all));
+        assert!(tm.bank.fire_train(fixed + 3, &lit, &all), "an empty clause does");
+
+        let (xs, ys) = make_xor(400, 0.0, 9);
+        let enc = Encoder::for_binary(N_FEATURES);
+        for _ in 0..5 {
+            tm.fit_epoch(&encode(&xs, &enc), &ys);
+        }
+        check(&tm, 2 * N_FEATURES);
+
+        tm.grow_features(N_FEATURES + 4);
+        check(&tm, 2 * (N_FEATURES + 4));
+        assert!(
+            !tm.bank.clauses[fixed + 2].unallocated.is_empty()
+                || !tm.bank.clauses[fixed + 2].excluded.is_empty(),
+            "an ordinary clause gets the new literals"
+        );
+
+        // Re-initialising the bank (literal_sampling) leaves them alone.
+        let tm = tm.literal_sampling(0.5);
+        check(&tm, 2 * (N_FEATURES + 4));
+
+        #[cfg(feature = "serde")]
+        {
+            use crate::serial::SaveLoad;
+            let dir = std::env::temp_dir().join(format!("tmu-fixed-{}", std::process::id()));
+            tm.save(&dir).unwrap();
+            let back = TMSparseClassifier::load(&dir).unwrap();
+            std::fs::remove_file(&dir).ok();
+            check(&back, 2 * (N_FEATURES + 4));
+        }
     }
 
     #[test]
