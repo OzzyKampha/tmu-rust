@@ -30,6 +30,10 @@ All notable changes to tmu-rs are documented here.
   feedback on its normal samples (a rule firing on them loses weight, or
   learns a literal excluding them) without the learned clauses forgetting
   what those samples do not show. Not saved.
+- **`TMSparseClassifier::add_clauses(per_class)`:** appends disabled clause
+  slots to every class of a trained machine, keeping everything learned and
+  each clause's index within its class, so new rule clauses can be injected
+  without retraining.
 - **`inject_rule_clause` with `RuleLearning`:** how a seeded rule clause may
   learn: a share of candidates, `negated_only` (candidates are negated
   literals and rise by Type II only, so the rule learns exceptions, "except

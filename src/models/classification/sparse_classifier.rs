@@ -414,6 +414,39 @@ impl TMSparseClassifier {
         self.words = words_for(self.n_literals);
     }
 
+    /// Add `per_class` clause slots (an even number, so voting for and against
+    /// stay paired) to the end of every class's clauses, disabled: they never
+    /// fire until [`inject_rule_clause`](Self::inject_rule_clause) or another
+    /// injection fills them. Everything learned is kept; existing clauses keep
+    /// their index within their class. For adding seeded rules to a trained
+    /// machine.
+    pub fn add_clauses(&mut self, per_class: usize) {
+        assert!(
+            per_class.is_multiple_of(2),
+            "add_clauses: {per_class} is odd; polarity pairs need an even number"
+        );
+        if per_class == 0 {
+            return;
+        }
+        let old = self.clauses_per_class;
+        let new = old + per_class;
+        // Back to front, so earlier insert points stay valid.
+        for c in (0..self.n_classes).rev() {
+            let at = c * old + old;
+            self.bank.insert_disabled(at, per_class);
+            self.weights
+                .splice(at..at, std::iter::repeat_n(1, per_class));
+            let rngs: Vec<Rng> = (0..per_class)
+                .map(|k| {
+                    let cj = c * new + old + k;
+                    Rng::new(0x4144_445f_434c_u64 ^ (cj as u64 + 1).wrapping_mul(GOLDEN))
+                })
+                .collect();
+            self.rngs.splice(at..at, rngs);
+        }
+        self.clauses_per_class = new;
+    }
+
     // ---- inference -------------------------------------------------------
 
     /// Internal: predict from a raw literal slice.
@@ -1255,6 +1288,47 @@ mod tests {
             assert_eq!(c.literal_cap(), Some(3), "the cap survives saving");
             assert!(c.is_fixed());
         }
+    }
+
+    #[test]
+    fn clauses_added_to_a_trained_machine_keep_what_it_learned() {
+        let (xs, ys) = make_xor(600, 0.0, 21);
+        let enc = Encoder::for_binary(N_FEATURES);
+        let data = encode(&xs, &enc);
+        let mut tm = TMSparseClassifier::new(2, N_FEATURES, 10, 15, 3.9);
+        for _ in 0..10 {
+            tm.fit_epoch(&data, &ys);
+        }
+        let before: Vec<Vec<i32>> = xs
+            .iter()
+            .take(50)
+            .map(|x| {
+                let mut out = vec![0i32; 2];
+                tm.scores(&EncodedSample::from_bits(x, N_FEATURES), &mut out);
+                out
+            })
+            .collect();
+        let class1_clause3 = tm.bank.clauses[10 + 3].included.clone();
+        tm.add_clauses(4);
+        assert_eq!(tm.clauses_per_class, 14);
+        assert_eq!(tm.bank.clauses.len(), 28);
+        assert_eq!(tm.weights.len(), 28);
+        assert_eq!(tm.rngs.len(), 28);
+        assert_eq!(
+            tm.bank.clauses[14 + 3].included,
+            class1_clause3,
+            "class 1 kept its clauses"
+        );
+        assert_eq!(tm.clause_kind(1, 12), ClauseKind::Disabled);
+        for (x, want) in xs.iter().take(50).zip(&before) {
+            let mut out = vec![0i32; 2];
+            tm.scores(&EncodedSample::from_bits(x, N_FEATURES), &mut out);
+            assert_eq!(&out, want, "the new slots vote nothing");
+        }
+        // A new slot takes a rule, and the machine keeps training.
+        tm.inject_fixed_clause(1, 10, &[0], 7);
+        assert_eq!(tm.clause_kind(1, 10), ClauseKind::Fixed);
+        tm.fit_epoch(&data, &ys);
     }
 
     #[test]

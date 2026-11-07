@@ -870,6 +870,23 @@ impl SparseClauseBank {
         c.absorbed = FIXED | exceptions | (cap << CAP_SHIFT) | count;
     }
 
+    /// Insert `n` disabled clauses before clause `at` (`at` may be the
+    /// number of clauses, to append).
+    pub(crate) fn insert_disabled(&mut self, at: usize, n: usize) {
+        let n_literals = (self.n_literals as u32).min(ABSORBED_COUNT);
+        let disabled = SparseClause {
+            included: Vec::new(),
+            included_state: Vec::new(),
+            excluded: Vec::new(),
+            excluded_state: Vec::new(),
+            unallocated: Vec::new(),
+            absorbed: DISABLED | n_literals,
+        };
+        self.clauses
+            .splice(at..at, std::iter::repeat_n(disabled, n));
+        self.n_clauses += n;
+    }
+
     /// Disable clause `cj`: it never fires, holds nothing and takes nothing.
     pub(crate) fn disable_clause(&mut self, cj: usize) {
         let n_literals = self.n_literals as u32;
