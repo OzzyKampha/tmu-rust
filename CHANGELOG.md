@@ -6,6 +6,8 @@ All notable changes to tmu-rs are documented here.
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-11-07
+
 ### Added
 - **Rule clauses on the GPU:** `CudaTMSparseClassifier` trains fixed,
   disabled, exceptions-only and capped clauses and `fixed_clauses_only`
