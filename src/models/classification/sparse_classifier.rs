@@ -97,6 +97,23 @@ pub struct TMSparseClassifier {
 }
 
 #[cfg(feature = "serde")]
+/// How a seeded rule clause may learn (see
+/// [`TMSparseClassifier::inject_rule_clause`]). The default learns nothing:
+/// only the weight and its own literals' states train.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RuleLearning {
+    /// Share (0 to 1) of the other literals given as candidates it can add.
+    pub candidates: f64,
+    /// Candidates are negated literals only, and rise by Type II feedback
+    /// only (on samples of other classes the clause fires on): it learns
+    /// exceptions, "except when x is present", and nothing that narrows it
+    /// to the samples it already catches.
+    pub negated_only: bool,
+    /// The most literals it may add to the ones it was given (0 = no cap; at
+    /// most 1,023 literals in all).
+    pub max_gained: usize,
+}
+
 /// What a clause slot holds (see [`TMSparseClassifier::clause_kind`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClauseKind {
@@ -454,7 +471,7 @@ impl TMSparseClassifier {
     /// rule the training data never triggers keeps what it was given. It
     /// cannot add a literal. Even `j` votes for the class, odd `j` against.
     pub fn inject_fixed_clause(&mut self, class: usize, j: usize, literals: &[usize], weight: i32) {
-        self.inject_clause_with_candidates(class, j, literals, weight, 0.0);
+        self.inject_rule_clause(class, j, literals, weight, RuleLearning::default());
     }
 
     /// [`inject_fixed_clause`](Self::inject_fixed_clause), with a random
@@ -471,6 +488,30 @@ impl TMSparseClassifier {
         weight: i32,
         candidates: f64,
     ) {
+        self.inject_rule_clause(
+            class,
+            j,
+            literals,
+            weight,
+            RuleLearning {
+                candidates,
+                ..RuleLearning::default()
+            },
+        );
+    }
+
+    /// Seed a fixed clause (see [`inject_fixed_clause`](Self::inject_fixed_clause))
+    /// that may learn as `learn` says: candidates to add, negated ones only
+    /// (exceptions), and a cap on how many it adds.
+    pub fn inject_rule_clause(
+        &mut self,
+        class: usize,
+        j: usize,
+        literals: &[usize],
+        weight: i32,
+        learn: RuleLearning,
+    ) {
+        let candidates = learn.candidates;
         assert!(class < self.n_classes, "class {class} out of range");
         assert!(j < self.clauses_per_class, "clause {j} out of range");
         assert!(weight >= 1, "weight must be >= 1");
@@ -486,8 +527,7 @@ impl TMSparseClassifier {
             (0.0..=1.0).contains(&candidates),
             "candidates must be in [0, 1]"
         );
-        self.bank
-            .fix_clause(cj, &lits, self.bank.max_state, candidates);
+        self.bank.fix_clause(cj, &lits, self.bank.max_state, learn);
         self.weights[cj] = weight;
     }
 
@@ -1040,7 +1080,9 @@ mod tests {
         {
             let c = &tm.bank.clauses[fixed];
             assert!(c.is_fixed() && c.unallocated.is_empty());
-            assert_eq!(c.excluded.len(), 2 * N_FEATURES - 1);
+            // Every literal but its own and that one's complement.
+            assert_eq!(c.excluded.len(), 2 * N_FEATURES - 2);
+            assert!(!c.excluded.contains(&(N_FEATURES as u32)));
         }
         let mut rng = crate::rng::Rng::new(5);
         let (mut xs, mut ys) = (Vec::new(), Vec::new());
@@ -1139,6 +1181,80 @@ mod tests {
             "learned clauses are frozen"
         );
         assert_eq!(after.excluded_state, learned_before.excluded_state);
+    }
+
+    /// Class 1 = feature 0 present and feature 1 absent; features 2..6 noise.
+    fn exception_data() -> (Vec<Vec<u8>>, Vec<usize>) {
+        let mut rng = crate::rng::Rng::new(11);
+        let (mut xs, mut ys) = (Vec::new(), Vec::new());
+        for _ in 0..800 {
+            let mut x = vec![0u8; N_FEATURES];
+            for v in x.iter_mut().take(6) {
+                *v = (rng.next_u64() & 1) as u8;
+            }
+            ys.push(usize::from(x[0] == 1 && x[1] == 0));
+            xs.push(x);
+        }
+        (xs, ys)
+    }
+
+    fn rule_only(learn: RuleLearning) -> TMSparseClassifier {
+        let mut tm = TMSparseClassifier::new(2, N_FEATURES, 2, 10, 3.0);
+        tm.inject_rule_clause(1, 0, &[0], 5, learn);
+        tm.disable_clause(1, 1);
+        tm.disable_clause(0, 0);
+        tm.disable_clause(0, 1);
+        let (xs, ys) = exception_data();
+        let data = encode(&xs, &Encoder::for_binary(N_FEATURES));
+        for _ in 0..30 {
+            tm.fit_epoch(&data, &ys);
+        }
+        tm
+    }
+
+    #[test]
+    fn a_rule_clause_learning_exceptions_only_adds_the_negation_that_excludes_its_misses() {
+        let tm = rule_only(RuleLearning {
+            candidates: 1.0,
+            negated_only: true,
+            max_gained: 1,
+        });
+        let c = &tm.bank.clauses[tm.clauses_per_class];
+        assert!(c.exceptions_only() && c.literal_cap() == Some(2));
+        assert!(
+            c.excluded.iter().all(|&l| l as usize >= N_FEATURES),
+            "candidates are negated literals only"
+        );
+        let mut inc = c.included.clone();
+        inc.sort_unstable();
+        assert_eq!(
+            inc,
+            vec![0, N_FEATURES as u32 + 1],
+            "feature 0 AND NOT feature 1"
+        );
+    }
+
+    #[test]
+    fn a_rule_clause_never_gains_more_literals_than_its_cap() {
+        let tm = rule_only(RuleLearning {
+            candidates: 1.0,
+            negated_only: false,
+            max_gained: 2,
+        });
+        let c = &tm.bank.clauses[tm.clauses_per_class];
+        assert!(c.included.len() <= 3, "{:?}", c.included);
+        assert!(!c.exceptions_only());
+        #[cfg(feature = "serde")]
+        {
+            use crate::serial::SaveLoad;
+            let path = std::env::temp_dir().join(format!("tmu-cap-{}", std::process::id()));
+            tm.save(&path).unwrap();
+            let back = TMSparseClassifier::load(&path).unwrap();
+            std::fs::remove_file(&path).ok();
+            let c = &back.bank.clauses[back.clauses_per_class];
+            assert_eq!(c.literal_cap(), Some(3), "the cap survives saving");
+            assert!(c.is_fixed());
+        }
     }
 
     #[test]

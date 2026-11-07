@@ -30,6 +30,13 @@ All notable changes to tmu-rs are documented here.
   feedback on its normal samples (a rule firing on them loses weight, or
   learns a literal excluding them) without the learned clauses forgetting
   what those samples do not show. Not saved.
+- **`inject_rule_clause` with `RuleLearning`:** how a seeded rule clause may
+  learn: a share of candidates, `negated_only` (candidates are negated
+  literals and rise by Type II only, so the rule learns exceptions, "except
+  when x is present", and nothing narrower), and `max_gained`, a cap on the
+  literals it adds that also holds under Type II and survives saving.
+  Candidates never include the complement of one of the rule's own literals
+  ("x AND NOT x" never fires).
 - Fixed clauses learn only where they fire: no Type Ib feedback when they
   do not, so a seeded rule the training data never triggers keeps its
   literals and weight instead of being worn away.
