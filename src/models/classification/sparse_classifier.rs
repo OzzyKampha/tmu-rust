@@ -420,9 +420,11 @@ impl TMSparseClassifier {
     /// Seed clause `j` of `class` with a fixed rule: it holds exactly
     /// `literals` (at the maximum state) and never takes a candidate, so it
     /// costs memory only for its own literals, however large the vocabulary.
-    /// Training still wears its literals down or restores them and changes its
-    /// weight; it cannot add a literal. Even `j` votes for the class, odd `j`
-    /// against.
+    /// It learns only where it fires: its weight rises on the class's samples
+    /// it fires on and falls on the others, its literals' states move there,
+    /// but a sample it does not fire on leaves it as it is (no Type Ib), so a
+    /// rule the training data never triggers keeps what it was given. It
+    /// cannot add a literal. Even `j` votes for the class, odd `j` against.
     pub fn inject_fixed_clause(&mut self, class: usize, j: usize, literals: &[usize], weight: i32) {
         self.inject_clause_with_candidates(class, j, literals, weight, 0.0);
     }
@@ -630,6 +632,12 @@ impl TMSparseClassifier {
             if type_i {
                 // Type I.
                 let fired = clause.fire_train(lit, lit_active);
+                // A fixed clause learns only where it fires: Type Ib, which
+                // wears down the literals of a clause that does not fire,
+                // would erase a seeded rule whose events the data lacks.
+                if !fired && clause.is_fixed() {
+                    return;
+                }
                 let fired_under = fired && clause.n_included() < max_inc;
                 if fired_under && weighted {
                     *w = (*w + 1).min(wmax);
@@ -1016,6 +1024,33 @@ mod tests {
             without.bank.clauses[fixed].excluded.is_empty(),
             "none by default"
         );
+    }
+
+    #[test]
+    fn a_fixed_clause_the_data_never_triggers_keeps_its_literals_and_weight() {
+        // Feature 7 never occurs in the data; a clause on it must survive.
+        let mut tm = TMSparseClassifier::new(2, N_FEATURES, 6, 10, 2.0);
+        tm.inject_fixed_clause(1, 0, &[7], 5);
+        tm.disable_clause(1, 1);
+        let mut rng = crate::rng::Rng::new(3);
+        let (mut xs, mut ys) = (Vec::new(), Vec::new());
+        for _ in 0..500 {
+            let mut x = vec![0u8; N_FEATURES];
+            for v in x.iter_mut().take(7) {
+                *v = (rng.next_u64() & 1) as u8;
+            }
+            ys.push(usize::from(x[0] == 1));
+            xs.push(x);
+        }
+        let enc = Encoder::for_binary(N_FEATURES);
+        let data = encode(&xs, &enc);
+        for _ in 0..20 {
+            tm.fit_epoch(&data, &ys);
+        }
+        let cj = tm.clauses_per_class;
+        assert_eq!(tm.bank.clauses[cj].included, vec![7]);
+        assert_eq!(tm.bank.clauses[cj].included_state, vec![tm.bank.max_state]);
+        assert_eq!(tm.weights[cj], 5);
     }
 
     #[test]

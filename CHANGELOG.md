@@ -25,6 +25,9 @@ All notable changes to tmu-rs are documented here.
   a random share of the other literals are its candidates, so training can
   add e.g. a negated literal that excludes its false positives. Its memory
   is that share; there is no unallocated pool.
+- Fixed clauses learn only where they fire: no Type Ib feedback when they
+  do not, so a seeded rule the training data never triggers keeps its
+  literals and weight instead of being worn away.
 - **`Encoder::token_bit(token)`:** a categorical encoder's bit for a token,
   the inverse of `vocab_token`.
 - **`TMFuzzyPatternClassifier::ta_state_histogram()`** (the other classifiers'
