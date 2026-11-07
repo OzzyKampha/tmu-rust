@@ -93,6 +93,18 @@ pub struct TMSparseClassifier {
 }
 
 #[cfg(feature = "serde")]
+/// What a clause slot holds (see [`TMSparseClassifier::clause_kind`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClauseKind {
+    /// An ordinary clause, learned from data.
+    Learned,
+    /// A seeded clause with a closed set of literals
+    /// ([`TMSparseClassifier::inject_fixed_clause`]).
+    Fixed,
+    /// A slot that never fires ([`TMSparseClassifier::disable_clause`]).
+    Disabled,
+}
+
 impl crate::serial::SaveLoad for TMSparseClassifier {
     const TAG: u8 = crate::serial::TAG_SPARSE;
 }
@@ -461,6 +473,18 @@ impl TMSparseClassifier {
         self.bank
             .fix_clause(cj, &lits, self.bank.max_state, candidates);
         self.weights[cj] = weight;
+    }
+
+    /// What clause `j` of `class` is: learned, fixed or disabled.
+    pub fn clause_kind(&self, class: usize, j: usize) -> ClauseKind {
+        let c = &self.bank.clauses[class * self.clauses_per_class + j];
+        if c.is_disabled() {
+            ClauseKind::Disabled
+        } else if c.is_fixed() {
+            ClauseKind::Fixed
+        } else {
+            ClauseKind::Learned
+        }
     }
 
     /// Disable clause `j` of `class`: it never fires (in training either, where
@@ -911,6 +935,9 @@ mod tests {
         tm.inject_fixed_clause(1, 0, &[2, N_FEATURES + 5], 7);
         tm.disable_clause(1, 1);
         let fixed = tm.clauses_per_class;
+        assert_eq!(tm.clause_kind(1, 0), ClauseKind::Fixed);
+        assert_eq!(tm.clause_kind(1, 1), ClauseKind::Disabled);
+        assert_eq!(tm.clause_kind(1, 2), ClauseKind::Learned);
         let check = |tm: &TMSparseClassifier, n_literals: usize| {
             let c = &tm.bank.clauses[fixed];
             assert!(c.is_fixed() && c.unallocated.is_empty());

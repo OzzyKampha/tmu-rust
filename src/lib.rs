@@ -42,7 +42,7 @@ pub use booleanizer::Booleanizer;
 pub use clause_inspect::ClauseInspect;
 pub use encoder::{EncodedBatch, EncodedSample, Encoder};
 pub use models::{
-    CoalescedTsetlinMachine, ConvolutionalTsetlinMachine, HeldOutVotes, TMAutoEncoder,
+    ClauseKind, CoalescedTsetlinMachine, ConvolutionalTsetlinMachine, HeldOutVotes, TMAutoEncoder,
     TMCoalescedAutoEncoder, TMCompositeClassifier, TMFuzzyPatternClassifier, TMRegressor,
     TMSparseClassifier, TsetlinMachine,
 };

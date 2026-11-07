@@ -8,7 +8,7 @@ pub mod regression;
 
 pub use autoencoder::{HeldOutVotes, TMAutoEncoder, TMCoalescedAutoEncoder};
 pub use classification::{
-    CoalescedTsetlinMachine, ConvolutionalTsetlinMachine, TMCompositeClassifier,
+    ClauseKind, CoalescedTsetlinMachine, ConvolutionalTsetlinMachine, TMCompositeClassifier,
     TMFuzzyPatternClassifier, TMSparseClassifier, TsetlinMachine,
 };
 pub use regression::TMRegressor;

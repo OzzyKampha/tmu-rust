@@ -13,5 +13,5 @@ pub use coalesced_classifier::CoalescedTsetlinMachine;
 pub use composite_classifier::TMCompositeClassifier;
 pub use convolutional_classifier::ConvolutionalTsetlinMachine;
 pub use fuzzy_pattern_classifier::TMFuzzyPatternClassifier;
-pub use sparse_classifier::TMSparseClassifier;
+pub use sparse_classifier::{ClauseKind, TMSparseClassifier};
 pub use vanilla_classifier::TsetlinMachine;
