@@ -670,6 +670,32 @@ fn demote_to_excluded(c: &mut SparseClause, idx: usize, state: u8) {
     c.excluded_state.push(state);
 }
 
+impl SparseClauseBank {
+    /// Include literal `l` in clause `cj` at `state` (at least the inclusion
+    /// threshold), wherever it was: a candidate, unallocated, already included
+    /// (its state is raised), or absorbed (it comes back). Every literal stays
+    /// accounted for exactly once.
+    pub(crate) fn include_literal(&mut self, cj: usize, l: u32, state: u8) {
+        let state = state.max(self.half);
+        let c = &mut self.clauses[cj];
+        if let Some(i) = c.included.iter().position(|&x| x == l) {
+            c.included_state[i] = c.included_state[i].max(state);
+            return;
+        }
+        if let Some(i) = c.excluded.iter().position(|&x| x == l) {
+            promote_to_included(c, i, state);
+            return;
+        }
+        if let Some(i) = c.unallocated.iter().position(|&x| x == l) {
+            c.unallocated.swap_remove(i);
+        } else {
+            c.absorbed = c.absorbed.saturating_sub(1);
+        }
+        c.included.push(l);
+        c.included_state.push(state);
+    }
+}
+
 /// Move excluded literal at `idx` to the included pool with state `state`.
 #[inline]
 fn promote_to_included(c: &mut SparseClause, idx: usize, state: u8) {

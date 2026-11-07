@@ -399,6 +399,24 @@ impl TMSparseClassifier {
         best
     }
 
+    /// Seed clause `j` of `class` with prior knowledge before (or between)
+    /// training: include `literals` (literal indices: feature `f` is `f`, its
+    /// negation `n_features + f`) at the maximum state and set the clause's
+    /// weight. Even `j` votes for the class, odd `j` against. Training then
+    /// refines the clause like any other: feedback can add literals to it,
+    /// wear its literals down, or change its weight.
+    pub fn inject_clause(&mut self, class: usize, j: usize, literals: &[usize], weight: i32) {
+        assert!(class < self.n_classes, "class {class} out of range");
+        assert!(j < self.clauses_per_class, "clause {j} out of range");
+        assert!(weight >= 1, "weight must be >= 1");
+        let cj = class * self.clauses_per_class + j;
+        for &l in literals {
+            assert!(l < self.n_literals, "literal {l} out of range");
+            self.bank.include_literal(cj, l as u32, self.bank.max_state);
+        }
+        self.weights[cj] = weight;
+    }
+
     /// Predict the class for an encoded sample.
     #[inline]
     pub fn predict(&self, sample: &EncodedSample) -> usize {
@@ -777,6 +795,50 @@ mod tests {
     fn encode(xs: &[Vec<u8>], enc: &Encoder) -> EncodedBatch {
         let rows: Vec<&[u8]> = xs.iter().map(|v| v.as_slice()).collect();
         enc.encode_batch(&rows)
+    }
+
+    #[test]
+    fn an_injected_clause_votes_on_its_literals_and_keeps_training() {
+        let mut tm = TMSparseClassifier::new(2, N_FEATURES, 10, 50, 3.0)
+            .absorbing(10)
+            .literal_sampling(0.5);
+        // Clause 0 of class 1 (votes for it): feature 2 present, feature 5 absent.
+        tm.inject_clause(1, 0, &[2, N_FEATURES + 5], 7);
+        tm.inject_clause(1, 0, &[2], 7); // idempotent
+        let c = &tm.bank.clauses[tm.clauses_per_class];
+        let mut seen: Vec<u32> = c
+            .included
+            .iter()
+            .chain(&c.excluded)
+            .chain(&c.unallocated)
+            .copied()
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len() + c.absorbed as usize,
+            2 * N_FEATURES,
+            "every literal once"
+        );
+        assert_eq!(c.included.len(), 2);
+        assert!(c.included_state.iter().all(|&s| s == tm.bank.max_state));
+        let sample = |f2: u8, f5: u8| {
+            let mut x = vec![0u8; N_FEATURES];
+            x[2] = f2;
+            x[5] = f5;
+            EncodedSample::from_bits(&x, N_FEATURES)
+        };
+        let mut out = [0i32; 2];
+        tm.scores(&sample(1, 0), &mut out);
+        assert_eq!(out, [0, 7], "only the injected clause has literals yet");
+        tm.scores(&sample(1, 1), &mut out);
+        assert_eq!(out, [0, 0], "feature 5 present: the clause stays silent");
+        tm.scores(&sample(0, 0), &mut out);
+        assert_eq!(out, [0, 0]);
+        // Training continues from the injected state.
+        let (xs, ys) = make_xor(400, 0.0, 9);
+        let enc = Encoder::for_binary(N_FEATURES);
+        tm.fit_epoch(&encode(&xs, &enc), &ys);
     }
 
     #[test]

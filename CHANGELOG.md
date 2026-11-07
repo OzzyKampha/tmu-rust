@@ -7,6 +7,13 @@ All notable changes to tmu-rs are documented here.
 ## [Unreleased]
 
 ### Added
+- **Clause injection:** `TMSparseClassifier::inject_clause(class, j, literals,
+  weight)` seeds a clause with prior knowledge (its literals included at the
+  maximum state, its weight set) before or between training; feedback then
+  refines it like any other clause. Every literal stays accounted for once
+  (candidate, unallocated, included or absorbed).
+- **`Encoder::token_bit(token)`:** a categorical encoder's bit for a token,
+  the inverse of `vocab_token`.
 - **`TMFuzzyPatternClassifier::ta_state_histogram()`** (the other classifiers'
   name and type, replacing `state_histogram()`) and **`inclusion_state()`**,
   the state from which a literal is included: the fuzzy machine's include
