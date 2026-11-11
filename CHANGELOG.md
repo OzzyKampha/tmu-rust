@@ -6,6 +6,18 @@ All notable changes to tmu-rs are documented here.
 
 ## [Unreleased]
 
+### Changed
+- **Faster sparse-bank training on the GPU:** `CudaTMSparseClassifier` stores
+  each clause's included, excluded and unallocated lists slot-major (slot `i`
+  of clause `c` at `i * n_clauses + c`) instead of clause by clause. One thread
+  walks one clause's lists, so the 32 threads of a warp used to read 32 rows
+  `n_literals` apart on every step, one memory transaction each; they now read
+  adjacent words. The training sample's literal and active-literal rows are
+  staged in shared memory (up to 3,072 words, 196,608 literals), so testing a
+  literal no longer costs a global load. The algorithm, and so every state,
+  weight and RNG, is unchanged: the emulator tests still match the CPU
+  bit for bit, with the rows in shared and in global memory.
+
 ## [1.2.0] — 2026-11-07
 
 ### Added

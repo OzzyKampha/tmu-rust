@@ -807,7 +807,19 @@ mod sparse {
         epochs: usize,
         dev: &CudaDevice,
     ) {
-        let nf = 12;
+        check_with(make, n_classes, epochs, dev, 12, true);
+    }
+
+    /// `nf` features; `staged` = the sample's literal rows in shared memory
+    /// (else read from global memory, as for too many literals).
+    fn check_with(
+        make: impl Fn() -> TMSparseClassifier,
+        n_classes: usize,
+        epochs: usize,
+        dev: &CudaDevice,
+        nf: usize,
+        staged: bool,
+    ) {
         let (xs, mut ys) = xor_data(150, nf, 0.1, 31);
         for (y, x) in ys.iter_mut().zip(&xs) {
             *y = (*y + x[3] as usize) % n_classes;
@@ -815,6 +827,9 @@ mod sparse {
         let batch = encode(&xs, nf);
         let mut cpu = make();
         let mut gpu = make().to_cuda(dev).unwrap();
+        if !staged {
+            gpu.stage_literals(false);
+        }
         for _ in 0..epochs {
             cpu.fit_epoch(&batch, &ys);
             gpu.fit_epoch(&batch, &ys).unwrap();
@@ -964,6 +979,37 @@ mod sparse {
         }
         check(|| with_rule_clauses(false), 3, 6, &device_serial());
         check(|| with_rule_clauses(false), 3, 2, &device());
+    }
+
+    #[test]
+    fn matches_cpu_with_literals_in_global_memory() {
+        if skip() {
+            return;
+        }
+        // The path for more literals than fit shared memory.
+        check_with(|| with_rule_clauses(false), 3, 3, &device_serial(), 12, false);
+        let make = || {
+            TMSparseClassifier::with_config(2, 12, 10, 8, 3.9, 8, true, 1)
+                .literal_drop_p(0.2)
+        };
+        check_with(make, 2, 3, &device(), 12, false);
+    }
+
+    #[test]
+    fn matches_cpu_with_several_literal_words() {
+        if skip() {
+            return;
+        }
+        // 100 features: 200 literals in 4 words, staged by several threads.
+        let make = || {
+            TMSparseClassifier::with_config(2, 100, 10, 8, 3.9, 8, true, 3)
+                .absorbing(2)
+                .literal_sampling(0.3)
+                .literal_insertion_state(4)
+                .literal_drop_p(0.1)
+        };
+        check_with(make, 2, 3, &device(), 100, true);
+        check_with(make, 2, 2, &device(), 100, false);
     }
 
     #[test]
