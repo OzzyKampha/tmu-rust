@@ -6,6 +6,17 @@ All notable changes to tmu-rs are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Rule clauses in the coalesced machine:** `CoalescedTsetlinMachine::add_clauses(n)`
+  appends clauses to the shared bank, keeping everything learned, and
+  `inject_fixed_clause(j, literals, class_weights)` makes clause `j` hold
+  exactly a rule's literals, with a starting weight per class. A fixed clause
+  takes no literal feedback (Type I, II or III), so its literals never change,
+  while its per-class weights learn like any clause's. Which clauses are fixed
+  is a training setting, not saved (the format is unchanged): `set_fixed(j,
+  true)` marks them again after loading, and `is_fixed(j)` reads it. CPU only:
+  `to_cuda` refuses a machine with fixed clauses.
+
 ### Changed
 - **Faster sparse-bank training on the GPU:** `CudaTMSparseClassifier` stores
   each clause's included, excluded and unallocated lists slot-major (slot `i`

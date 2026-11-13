@@ -155,7 +155,11 @@ impl CudaTMSparseClassifier {
     #[cfg(test)]
     pub(crate) fn stage_literals(&mut self, on: bool) {
         let w = self.host.words;
-        self.smem_words = if on && 2 * w * 8 <= SMEM_LIMIT { w as u32 } else { 0 };
+        self.smem_words = if on && 2 * w * 8 <= SMEM_LIMIT {
+            w as u32
+        } else {
+            0
+        };
     }
 
     /// The device this model lives on.

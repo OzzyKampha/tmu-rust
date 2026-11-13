@@ -54,6 +54,11 @@ impl CoalescedTsetlinMachine {
                     .into(),
             ));
         }
+        if self.fixed.iter().any(|&f| f) {
+            return Err(CudaError::Invalid(
+                "fixed (rule) clauses in a coalesced machine train on the CPU only".into(),
+            ));
+        }
         CudaCoalescedTsetlinMachine::new(self.clone(), device)
     }
 }

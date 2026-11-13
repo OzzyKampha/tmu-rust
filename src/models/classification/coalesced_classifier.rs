@@ -85,6 +85,12 @@ pub struct CoalescedTsetlinMachine {
         serde(skip, default = "crate::clause_bank::dense::serde_true")
     )]
     pub(crate) reuse_random_feedback: bool,
+    /// Fixed clauses (rule clauses, [`inject_fixed_clause`](Self::inject_fixed_clause)):
+    /// their literals never change; only their per-class weights learn.
+    /// Indexed by clause; empty = none. Training setting, not saved: mark
+    /// them again with [`set_fixed`](Self::set_fixed) after loading.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) fixed: Vec<bool>,
 
     /// Dedicated RNG for the per-sample literal-active mask.
     pub(crate) literal_rng: Rng,
@@ -209,6 +215,7 @@ fn apply_one_clause_coalesced(
     allow_inc: bool,
     out_j: bool,
     active_j: bool,
+    fixed_j: bool,
     // Packed arrays:
     val: &[u64],
     words: usize,
@@ -229,8 +236,9 @@ fn apply_one_clause_coalesced(
     let positive = *w >= 0;
     let give_type_i = if target == 1 { positive } else { !positive };
 
-    // Literal (TA) feedback, scaled by TMU's Type I / II ratio factors.
-    if rng.next_f64() <= p * if give_type_i { pf.0 } else { pf.1 } {
+    // Literal (TA) feedback, scaled by TMU's Type I / II ratio factors. A
+    // fixed clause keeps its literals: only its weight learns.
+    if !fixed_j && rng.next_f64() <= p * if give_type_i { pf.0 } else { pf.1 } {
         if give_type_i {
             let under_limit = max_inc == usize::MAX || {
                 let n: u32 = (0..words).map(|k| (inc[k] & val[k]).count_ones()).sum();
@@ -385,6 +393,7 @@ impl CoalescedTsetlinMachine {
             output_balancing: false,
             ind_states: (0, 0),
             reuse_random_feedback: true,
+            fixed: Vec::new(),
             literal_rng,
             dig_lit_active: digits_of(1.0, MASK_BITS),
             ta,
@@ -637,6 +646,112 @@ impl CoalescedTsetlinMachine {
         }
     }
 
+    // ---- fixed (rule) clauses --------------------------------------------
+
+    /// Append `n` clauses to the shared bank, initialised as
+    /// [`with_config`](Self::with_config) initialises clauses (random states
+    /// either side of inclusion, `±1` weights), for rule clauses to be
+    /// injected into. Everything learned so far is kept.
+    pub fn add_clauses(&mut self, n: usize) {
+        self.reset_literal_index();
+        if n == 0 {
+            return;
+        }
+        let (old, nl, words, half) = (self.n_clauses, self.n_literals, self.words, self.half);
+        let nc = old + n;
+        let mut init = Rng::new(0x4144_445F_434C_4155 ^ (old as u64).wrapping_mul(GOLDEN));
+        self.ta.reserve(n * nl);
+        self.include.resize(nc * words, 0);
+        for j in old..nc {
+            let tb = self.ta.len();
+            self.ta.extend((0..nl).map(|_| {
+                if init.next_u64() & 1 == 0 {
+                    half - 1
+                } else {
+                    half
+                }
+            }));
+            rebuild_include(
+                &self.ta[tb..tb + nl],
+                &mut self.include[j * words..(j + 1) * words],
+                &self.valid,
+                words,
+                nl,
+                half,
+            );
+            self.rngs.push(Rng::new(
+                init.next_u64() ^ (j as u64).wrapping_add(1).wrapping_mul(GOLDEN),
+            ));
+        }
+        let mut weights = Vec::with_capacity(self.n_classes * nc);
+        for c in 0..self.n_classes {
+            weights.extend_from_slice(&self.weights[c * old..(c + 1) * old]);
+            weights.extend((0..n).map(|_| if init.next_u64() & 1 == 0 { 1 } else { -1 }));
+        }
+        self.weights = weights;
+        let half_ind = self.ind_range().0;
+        self.ind.resize(nc * nl, half_ind);
+        self.cat.resize(nc * words, 0);
+        if !self.fixed.is_empty() {
+            self.fixed.resize(nc, false);
+        }
+        self.n_clauses = nc;
+    }
+
+    /// Make clause `j` a fixed clause holding exactly `literals` (a rule's
+    /// condition: literal `l < n_features` is feature `l`, `n_features + f` is
+    /// NOT feature `f`), with weight `class_weights[c]` for class `c`. Its
+    /// literals then never change; its weights learn from the data like any
+    /// clause's.
+    ///
+    /// # Panics
+    /// If `j` or a literal is out of range, a literal is not a valid one (a
+    /// negated literal without feature negation), or `class_weights` does not
+    /// have one weight per class.
+    pub fn inject_fixed_clause(&mut self, j: usize, literals: &[usize], class_weights: &[i32]) {
+        assert!(j < self.n_clauses, "clause {j} out of range");
+        assert_eq!(class_weights.len(), self.n_classes, "one weight per class");
+        self.reset_literal_index();
+        let (nl, words, nc) = (self.n_literals, self.words, self.n_clauses);
+        let ta = &mut self.ta[j * nl..(j + 1) * nl];
+        ta.fill(0);
+        for &l in literals {
+            assert!(l < nl, "literal {l} out of range");
+            assert!(
+                self.valid[l / WORD_BITS] >> (l % WORD_BITS) & 1 == 1,
+                "literal {l} is not used by this machine"
+            );
+            ta[l] = self.max_state;
+        }
+        rebuild_include(
+            ta,
+            &mut self.include[j * words..(j + 1) * words],
+            &self.valid,
+            words,
+            nl,
+            self.half,
+        );
+        for (c, &w) in class_weights.iter().enumerate() {
+            self.weights[c * nc + j] = w;
+        }
+        self.set_fixed(j, true);
+    }
+
+    /// Mark clause `j` fixed (its literals never change) or not. Fixed
+    /// clauses are not saved: mark them again after loading.
+    pub fn set_fixed(&mut self, j: usize, on: bool) {
+        assert!(j < self.n_clauses, "clause {j} out of range");
+        if self.fixed.len() < self.n_clauses {
+            self.fixed.resize(self.n_clauses, false);
+        }
+        self.fixed[j] = on;
+    }
+
+    /// Whether clause `j` is fixed.
+    pub fn is_fixed(&self, j: usize) -> bool {
+        self.fixed.get(j).copied().unwrap_or(false)
+    }
+
     // ---- inference -------------------------------------------------------
 
     /// Compute the firing state of every shared clause for `lit` (inference semantics).
@@ -844,8 +959,10 @@ impl CoalescedTsetlinMachine {
             dig_keep,
             ind,
             cat,
+            fixed,
             ..
         } = self;
+        let fixed = fixed.as_slice();
         let val = valid.as_slice();
         let crng = &mut class_rngs[c];
 
@@ -885,6 +1002,7 @@ impl CoalescedTsetlinMachine {
                             allow_inc,
                             clause_outputs[j],
                             clause_active[j],
+                            fixed.get(j).copied().unwrap_or(false),
                             val,
                             words,
                             lit_b,
@@ -898,6 +1016,7 @@ impl CoalescedTsetlinMachine {
                             max_state,
                         );
                         if clause_active[j]
+                            && !fixed.get(j).copied().unwrap_or(false)
                             && type_iii_update(
                                 ta_j,
                                 ind_j,
@@ -943,6 +1062,7 @@ impl CoalescedTsetlinMachine {
                             allow_inc,
                             clause_outputs[j],
                             clause_active[j],
+                            fixed.get(j).copied().unwrap_or(false),
                             val,
                             words,
                             lit_b,
@@ -977,6 +1097,7 @@ impl CoalescedTsetlinMachine {
                 allow_inc,
                 clause_outputs[j],
                 clause_active[j],
+                fixed.get(j).copied().unwrap_or(false),
                 val,
                 words,
                 lit_b,
@@ -991,6 +1112,7 @@ impl CoalescedTsetlinMachine {
             );
             if type_iii_en
                 && clause_active[j]
+                && !fixed.get(j).copied().unwrap_or(false)
                 && type_iii_update(
                     &mut ta[j * n_literals..(j + 1) * n_literals],
                     &mut ind[j * n_literals..(j + 1) * n_literals],
@@ -2112,5 +2234,63 @@ mod tests {
         }
         assert_ne!(fresh.ta, reused.ta, "per-clause masks change training");
         assert!(fresh.accuracy(&b, &ys) > 0.6, "and still learns");
+    }
+
+    #[test]
+    fn fixed_clauses_keep_their_literals_and_learn_their_weights() {
+        let (xs, ys) = make_xor(2000, 0.0, 7);
+        let b = enc(12).encode_batch(&as_slices(&xs));
+        let mut tm = CoalescedTsetlinMachine::with_config(2, 12, 10, 50, 3.9, 8, true, 1);
+        tm.add_clauses(3);
+        assert_eq!(tm.n_clauses(), 13);
+        // Rules: b0 AND NOT b1, and NOT b0 AND b1, mean class 1 (literal
+        // 12 + f is NOT feature f); b2 alone says nothing about the class.
+        tm.inject_fixed_clause(10, &[0, 13], &[-20, 20]);
+        tm.inject_fixed_clause(11, &[12, 1], &[-20, 20]);
+        tm.inject_fixed_clause(12, &[2], &[0, 20]);
+        assert_eq!(tm.clause_rule(10), vec![(0, false), (1, true)]);
+        let row = |tm: &CoalescedTsetlinMachine, j: usize| tm.ta[j * 24..(j + 1) * 24].to_vec();
+        let rows: Vec<_> = (10..13).map(|j| row(&tm, j)).collect();
+        let learned = row(&tm, 0);
+        for _ in 0..10 {
+            tm.fit_epoch(&b, &ys);
+        }
+        for (k, j) in (10..13).enumerate() {
+            assert!(tm.is_fixed(j));
+            assert_eq!(row(&tm, j), rows[k], "a fixed clause keeps its literals");
+        }
+        assert_ne!(row(&tm, 0), learned, "the other clauses learn");
+        assert_ne!(
+            tm.clause_weight(1, 12),
+            20,
+            "the weights of a fixed clause learn"
+        );
+        assert!(tm.accuracy(&b, &ys) > 0.9);
+    }
+
+    #[test]
+    fn added_clauses_keep_what_was_learned() {
+        let (xs, ys) = make_4class(800, 3);
+        let b = enc(8).encode_batch(&as_slices(&xs));
+        let mut tm = CoalescedTsetlinMachine::with_config(4, 8, 12, 20, 3.9, 8, true, 5);
+        for _ in 0..5 {
+            tm.fit_epoch(&b, &ys);
+        }
+        let before = tm.clone();
+        tm.add_clauses(4);
+        assert_eq!(tm.n_clauses(), 16);
+        assert_eq!(&tm.ta[..before.ta.len()], &before.ta[..]);
+        assert_eq!(&tm.include[..before.include.len()], &before.include[..]);
+        for c in 0..4 {
+            for j in 0..12 {
+                assert_eq!(tm.clause_weight(c, j), before.clause_weight(c, j));
+            }
+            for j in 12..16 {
+                assert_eq!(tm.clause_weight(c, j).abs(), 1);
+            }
+        }
+        assert!(!tm.is_fixed(13));
+        tm.fit_epoch(&b, &ys); // trains with the new clauses
+        assert_eq!(tm.weights.len(), 4 * 16);
     }
 }

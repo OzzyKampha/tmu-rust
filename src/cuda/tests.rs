@@ -987,11 +987,16 @@ mod sparse {
             return;
         }
         // The path for more literals than fit shared memory.
-        check_with(|| with_rule_clauses(false), 3, 3, &device_serial(), 12, false);
-        let make = || {
-            TMSparseClassifier::with_config(2, 12, 10, 8, 3.9, 8, true, 1)
-                .literal_drop_p(0.2)
-        };
+        check_with(
+            || with_rule_clauses(false),
+            3,
+            3,
+            &device_serial(),
+            12,
+            false,
+        );
+        let make =
+            || TMSparseClassifier::with_config(2, 12, 10, 8, 3.9, 8, true, 1).literal_drop_p(0.2);
         check_with(make, 2, 3, &device(), 12, false);
     }
 
@@ -1035,6 +1040,17 @@ mod refusals {
         assert!(v.to_cuda(&device()).is_err());
         let c = CoalescedTsetlinMachine::with_config(2, 12, 4, 8, 3.9, 8, true, 1)
             .reuse_random_feedback(false);
+        assert!(c.to_cuda(&device()).is_err());
+    }
+
+    #[test]
+    fn coalesced_rule_clauses_are_refused_on_the_gpu() {
+        if skip() {
+            return;
+        }
+        let mut c = CoalescedTsetlinMachine::with_config(2, 12, 4, 8, 3.9, 8, true, 1);
+        assert!(c.to_cuda(&device()).is_ok());
+        c.inject_fixed_clause(1, &[0, 13], &[-4, 4]);
         assert!(c.to_cuda(&device()).is_err());
     }
 
