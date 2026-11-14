@@ -585,6 +585,18 @@ impl TMSparseClassifier {
         self.bank.add_candidates(cj, &lits);
     }
 
+    /// The candidates clause `j` of `class` holds: the literals it may
+    /// learn to include (in no particular order).
+    pub fn rule_candidates(&self, class: usize, j: usize) -> Vec<usize> {
+        assert!(class < self.n_classes, "class {class} out of range");
+        assert!(j < self.clauses_per_class, "clause {j} out of range");
+        self.bank.clauses[class * self.clauses_per_class + j]
+            .excluded
+            .iter()
+            .map(|&l| l as usize)
+            .collect()
+    }
+
     /// What clause `j` of `class` is: learned, fixed or disabled.
     pub fn clause_kind(&self, class: usize, j: usize) -> ClauseKind {
         let c = &self.bank.clauses[class * self.clauses_per_class + j];
@@ -1306,11 +1318,11 @@ mod tests {
         assert!(tm.bank.clauses[j].excluded.is_empty());
         let not = |f: usize| N_FEATURES + f;
         tm.add_rule_candidates(1, 0, &[not(1), not(4), 0, not(0), not(1)]);
-        let mut cand = tm.bank.clauses[j].excluded.clone();
+        let mut cand = tm.rule_candidates(1, 0);
         cand.sort_unstable();
         assert_eq!(
             cand,
-            vec![not(1) as u32, not(4) as u32],
+            vec![not(1), not(4)],
             "its own literal, its complement and repeats are skipped"
         );
         let c = &tm.bank.clauses[j];
