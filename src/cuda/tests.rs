@@ -341,6 +341,51 @@ mod coalesced {
         );
     }
 
+    /// Rule clauses: fixed clauses added after the learned ones, which keep
+    /// their literals while their weights learn.
+    fn with_rule_clauses(n_classes: usize) -> CoalescedTsetlinMachine {
+        let mut tm = CoalescedTsetlinMachine::with_config(n_classes, 12, 10, 10, 3.9, 8, true, 6)
+            .type_iii_feedback(5.0);
+        tm.add_clauses(4);
+        let w = |v: i32| {
+            (0..n_classes)
+                .map(|c| if c == 1 { v } else { -v })
+                .collect::<Vec<_>>()
+        };
+        // Literal 12 + f is NOT feature f.
+        tm.inject_fixed_clause(10, &[0, 13], &w(6));
+        tm.inject_fixed_clause(11, &[12, 1], &w(6));
+        tm.inject_fixed_clause(12, &[2], &w(3));
+        tm.inject_fixed_clause(13, &[3, 15], &w(2));
+        tm
+    }
+
+    #[test]
+    fn matches_cpu_with_rule_clauses() {
+        if skip() {
+            return;
+        }
+        check(|| with_rule_clauses(2), 2, &device());
+        check(
+            || with_rule_clauses(3).clause_drop_p(0.2).literal_drop_p(0.1),
+            3,
+            &device(),
+        );
+        // The fixed clauses kept their literals on the GPU too.
+        let (xs, ys) = xor_data(150, 12, 0.1, 13);
+        let batch = encode(&xs, 12);
+        let tm = with_rule_clauses(2);
+        let mut gpu = tm.to_cuda(&device()).unwrap();
+        for _ in 0..3 {
+            gpu.fit_epoch(&batch, &ys).unwrap();
+        }
+        let back = gpu.to_cpu().unwrap();
+        for j in 10..14 {
+            assert!(back.is_fixed(j));
+            assert_eq!(back.clause_rule(j), tm.clause_rule(j), "clause {j}");
+        }
+    }
+
     #[test]
     fn matches_cpu_all_options() {
         if skip() {
@@ -1040,17 +1085,6 @@ mod refusals {
         assert!(v.to_cuda(&device()).is_err());
         let c = CoalescedTsetlinMachine::with_config(2, 12, 4, 8, 3.9, 8, true, 1)
             .reuse_random_feedback(false);
-        assert!(c.to_cuda(&device()).is_err());
-    }
-
-    #[test]
-    fn coalesced_rule_clauses_are_refused_on_the_gpu() {
-        if skip() {
-            return;
-        }
-        let mut c = CoalescedTsetlinMachine::with_config(2, 12, 4, 8, 3.9, 8, true, 1);
-        assert!(c.to_cuda(&device()).is_ok());
-        c.inject_fixed_clause(1, &[0, 13], &[-4, 4]);
         assert!(c.to_cuda(&device()).is_err());
     }
 

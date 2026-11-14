@@ -14,8 +14,9 @@ All notable changes to tmu-rs are documented here.
   takes no literal feedback (Type I, II or III), so its literals never change,
   while its per-class weights learn like any clause's. Which clauses are fixed
   is a training setting, not saved (the format is unchanged): `set_fixed(j,
-  true)` marks them again after loading, and `is_fixed(j)` reads it. CPU only:
-  `to_cuda` refuses a machine with fixed clauses.
+  true)` marks them again after loading, and `is_fixed(j)` reads it. They
+  train on the GPU as on the CPU (`co_update` skips a fixed clause's literal
+  feedback and its draw), bit-identical in the emulator tests.
 
 ### Changed
 - **Faster sparse-bank training on the GPU:** `CudaTMSparseClassifier` stores

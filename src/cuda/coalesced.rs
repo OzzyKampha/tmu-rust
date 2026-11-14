@@ -43,6 +43,8 @@ pub struct CudaCoalescedTsetlinMachine {
     inv: DevBuf<u64>,
     keep: DevBuf<u64>,
     mask_s0: DevBuf<u64>,
+    /// Fixed (rule) clauses, one byte per clause; `None` when there are none.
+    fixed: Option<DevBuf<u8>>,
 }
 
 impl CoalescedTsetlinMachine {
@@ -52,11 +54,6 @@ impl CoalescedTsetlinMachine {
             return Err(CudaError::Invalid(
                 "reuse_random_feedback(false) is not available on the GPU; train it on the CPU"
                     .into(),
-            ));
-        }
-        if self.fixed.iter().any(|&f| f) {
-            return Err(CudaError::Invalid(
-                "fixed (rule) clauses in a coalesced machine train on the CPU only".into(),
             ));
         }
         CudaCoalescedTsetlinMachine::new(self.clone(), device)
@@ -96,6 +93,12 @@ impl CudaCoalescedTsetlinMachine {
             inv: DevBuf::zeros(dev, 2 * w)?,
             keep: DevBuf::zeros(dev, 2 * w)?,
             mask_s0: DevBuf::zeros(dev, 2)?,
+            fixed: if host.fixed.iter().any(|&f| f) {
+                let flags: Vec<u8> = (0..nc).map(|j| u8::from(host.is_fixed(j))).collect();
+                Some(DevBuf::from_slice(dev, &flags)?)
+            } else {
+                None
+            },
             host,
             dev: dev.clone(),
             st,
@@ -296,6 +299,7 @@ impl CudaCoalescedTsetlinMachine {
                     plan: self.plan.ptr(),
                     inv: self.inv.ptr(),
                     keep: self.keep.ptr(),
+                    fixed: self.fixed.as_ref().map_or(0, DevBuf::ptr),
                     d: h.d,
                     type_i_p: h.type_i_p,
                     type_ii_p: h.type_ii_p,

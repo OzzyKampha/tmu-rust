@@ -734,14 +734,16 @@ __device__ void coalesced_pass(u8* ta, u64* inc, int* w, u64* rng_sh, u8* ind, u
                                int n_literals, int target, double prob, int out_j, int active,
                                u64 max_inc, double d, u32 boost, u32 half, u32 max_state,
                                u32 type_iii, double pf_i, double pf_ii, int allow_inc,
-                               u32 half_ind, u32 max_ind) {
+                               u32 half_ind, u32 max_ind, int fixed_j) {
     __shared__ int s_action, s_count;
     if (!active) return;
     if (threadIdx.x == 0) {
         int positive = *w >= 0;
         int give_i = target ? positive : !positive;
         int action = ACT_NONE;
-        if (rng_f64(rng_sh) <= prob * (give_i ? pf_i : pf_ii)) {
+        // A fixed (rule) clause keeps its literals: no literal feedback, and no
+        // draw for it; only its weight learns.
+        if (!fixed_j && rng_f64(rng_sh) <= prob * (give_i ? pf_i : pf_ii)) {
             if (give_i) {
                 action = out_j ? ACT_IA : ACT_IB;
             } else if (out_j) {
@@ -768,7 +770,7 @@ __device__ void coalesced_pass(u8* ta, u64* inc, int* w, u64* rng_sh, u8* ind, u
     }
     ta_feedback_block(ta, inc, valid, lit, act, ex_a, ex_b, inv, keep, words, n_literals, s_action,
                       boost, half, max_state);
-    if (type_iii)
+    if (type_iii && !fixed_j)
         type_iii_block(ta, ind, cat, inc, lit, valid, act, ex_a, ex_b, words, n_literals, d, prob,
                        target, rng_sh, half, max_state, half_ind, max_ind);
 }
@@ -911,6 +913,7 @@ struct CoUpdateParams {
     const int* plan;
     const u64* inv;
     const u64* keep;
+    const u8* fixed;       // [n_clauses]: fixed (rule) clauses, or null for none
     double d;
     double type_i_p, type_ii_p;  // TMU's type_i_ii_ratio factors
     u64 max_inc;
@@ -930,6 +933,7 @@ extern "C" __global__ void co_update(const CoUpdateParams p) {
     u8* ind = p.type_iii ? p.ind + (u64)j * p.n_literals : 0;
     u64* cat = p.type_iii ? p.cat + (u64)j * p.words : 0;
     int out_j = p.fire[j], active = p.active[j];
+    int fixed_j = p.fixed ? p.fixed[j] : 0;
     if (threadIdx.x == 0) s_rng = p.rngs[j];
     for (int pass = 0; pass < 2; pass++) {
         int c = p.plan[pass];
@@ -942,7 +946,8 @@ extern "C" __global__ void co_update(const CoUpdateParams p) {
                        p.inv + (u64)pass * p.words, p.keep + (u64)pass * p.words, p.words,
                        p.n_literals, target, prob, out_j, active, p.max_inc, p.d, p.boost, p.half,
                        p.max_state, p.type_iii, p.type_i_p, p.type_ii_p,
-                       p.max_pos == NO_LIMIT || (u64)p.plan[4] < p.max_pos, p.half_ind, p.max_ind);
+                       p.max_pos == NO_LIMIT || (u64)p.plan[4] < p.max_pos, p.half_ind, p.max_ind,
+                       fixed_j);
         __syncthreads();
         if (threadIdx.x == 0) p.weights[(u64)c * p.n_clauses + j] = s_w;
         __syncthreads();
@@ -1020,7 +1025,7 @@ extern "C" __global__ void cae_update(const CaeUpdateParams p) {
                    p.type_iii ? p.cat + (u64)j * p.words : 0, p.valid, p.lit, p.act, (int)p.o,
                    (int)p.o + p.nf, p.inv, p.keep, p.words, p.n_literals, target, prob, p.fire[j],
                    active, p.max_inc, p.d, p.boost, p.half, p.max_state, p.type_iii, 1.0, 1.0,
-                   1, p.half, p.max_state);
+                   1, p.half, p.max_state, 0);
     __syncthreads();
     if (threadIdx.x == 0) {
         p.rngs[j] = s_rng;
