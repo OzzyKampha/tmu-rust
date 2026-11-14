@@ -899,6 +899,23 @@ impl TMSparseClassifier {
 
     // ---- absorbing-state introspection -----------------------------------
 
+    /// Drop what only training needs, for a model that is done training:
+    /// each clause's candidate literals (`excluded`, with their states) and its
+    /// pool of unallocated ones. Prediction reads only the included literals,
+    /// so scores, predictions and clause inspection are unchanged; the saved
+    /// file shrinks to roughly the included literals (a model with many
+    /// features and few included literals per clause goes from hundreds of MB
+    /// to a few). Training a compacted model further is possible, but its
+    /// clauses can then only drop literals or re-include ones still included:
+    /// compact a copy if you mean to keep training.
+    pub fn compact(&mut self) {
+        for c in &mut self.bank.clauses {
+            c.excluded = Vec::new();
+            c.excluded_state = Vec::new();
+            c.unallocated = Vec::new();
+        }
+    }
+
     /// Fraction of (clause, literal) slots whose TA is at the absorbing **include**
     /// state.  Grows toward the converged clause size as training proceeds.
     pub fn absorbed_include_fraction(&self) -> f64 {
@@ -1752,6 +1769,44 @@ mod tests {
         assert!(
             acc >= 0.95,
             "grown sparse TM failed to learn new feature: {acc}"
+        );
+    }
+
+    /// Compacting keeps every score, and a saved compacted model is a
+    /// fraction of the size.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn compact_keeps_scores_and_shrinks_the_file() {
+        use crate::serial::SaveLoad;
+        let (xtr, ytr) = make_xor(3000, 0.1, 21);
+        let (xte, _) = make_xor(500, 0.0, 22);
+        let e = Encoder::for_binary(N_FEATURES);
+        let mut tm = TMSparseClassifier::with_config(2, N_FEATURES, 10, 15, 3.9, 8, true, 7)
+            .max_included_literals(8);
+        for _ in 0..15 {
+            tm.fit_epoch(&encode(&xtr, &e), &ytr);
+        }
+        let bte = encode(&xte, &e);
+        let mut full = Vec::new();
+        tm.write_to(&mut full).unwrap();
+        let mut small = tm.clone();
+        small.compact();
+        let mut buf = Vec::new();
+        small.write_to(&mut buf).unwrap();
+        let loaded = TMSparseClassifier::read_from(&mut buf.as_slice()).unwrap();
+        assert_eq!(tm.predict_batch(&bte), loaded.predict_batch(&bte));
+        for (i, row) in xte.iter().enumerate() {
+            let x = e.encode_one(row);
+            let (mut a, mut b) = (vec![0; 2], vec![0; 2]);
+            tm.scores(&x, &mut a);
+            loaded.scores(&x, &mut b);
+            assert_eq!(a, b, "sample {i}");
+        }
+        assert!(
+            buf.len() * 2 < full.len(),
+            "{} vs {}",
+            buf.len(),
+            full.len()
         );
     }
 
