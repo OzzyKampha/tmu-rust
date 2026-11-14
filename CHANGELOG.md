@@ -18,6 +18,12 @@ All notable changes to tmu-rs are documented here.
   train on the GPU as on the CPU (`co_update` skips a fixed clause's literal
   feedback and its draw), bit-identical in the emulator tests.
 
+- **Chosen exception candidates for rule clauses:**
+  `TMSparseClassifier::add_rule_candidates(class, j, literals)` gives a rule
+  clause specific literals as candidates, next to any random share: e.g. the
+  negations of tokens present when the rule fires on normal events, so it can
+  learn the exception that stops its false alarms.
+
 ### Changed
 - **Faster sparse-bank training on the GPU:** `CudaTMSparseClassifier` stores
   each clause's included, excluded and unallocated lists slot-major (slot `i`

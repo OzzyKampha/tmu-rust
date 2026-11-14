@@ -1000,6 +1000,8 @@ mod sparse {
                 max_gained: 1,
             },
         );
+        // Hand-picked exception candidates too (NOT features 4 and 5).
+        tm.add_rule_candidates(1, 10, &[16, 17]);
         tm.inject_fixed_clause(2, 12, &[15], 2);
         // Fires on half the samples (feature 2 is noise), so its exceptions-only
         // flag decides often.

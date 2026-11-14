@@ -564,6 +564,27 @@ impl TMSparseClassifier {
         self.weights[cj] = weight;
     }
 
+    /// Give rule clause `j` of `class` these literals as candidates it may
+    /// learn to include, next to any it has: e.g. the negations of tokens
+    /// present when the rule fires on normal events, the exceptions that
+    /// could stop its false alarms. Its own literals and their complements are
+    /// skipped. Whether and how many it adds follows its [`RuleLearning`].
+    ///
+    /// # Panics
+    /// If `class`, `j` or a literal is out of range, or the clause is not a
+    /// fixed (rule) clause.
+    pub fn add_rule_candidates(&mut self, class: usize, j: usize, literals: &[usize]) {
+        assert!(class < self.n_classes, "class {class} out of range");
+        assert!(j < self.clauses_per_class, "clause {j} out of range");
+        let cj = class * self.clauses_per_class + j;
+        assert!(
+            self.bank.clauses[cj].is_fixed(),
+            "clause {j} of class {class} is not a rule clause"
+        );
+        let lits: Vec<u32> = literals.iter().map(|&l| l as u32).collect();
+        self.bank.add_candidates(cj, &lits);
+    }
+
     /// What clause `j` of `class` is: learned, fixed or disabled.
     pub fn clause_kind(&self, class: usize, j: usize) -> ClauseKind {
         let c = &self.bank.clauses[class * self.clauses_per_class + j];
@@ -1265,6 +1286,47 @@ mod tests {
             vec![0, N_FEATURES as u32 + 1],
             "feature 0 AND NOT feature 1"
         );
+    }
+
+    #[test]
+    fn a_rule_clause_learns_the_exception_it_is_given_as_a_candidate() {
+        // No random candidates: only NOT feature 1, given by hand (the token
+        // present when the rule fires on class 0), and a decoy, NOT feature 4.
+        let learn = RuleLearning {
+            candidates: 0.0,
+            negated_only: true,
+            max_gained: 1,
+        };
+        let mut tm = TMSparseClassifier::new(2, N_FEATURES, 2, 10, 3.0);
+        tm.inject_rule_clause(1, 0, &[0], 5, learn);
+        tm.disable_clause(1, 1);
+        tm.disable_clause(0, 0);
+        tm.disable_clause(0, 1);
+        let j = tm.clauses_per_class;
+        assert!(tm.bank.clauses[j].excluded.is_empty());
+        let not = |f: usize| N_FEATURES + f;
+        tm.add_rule_candidates(1, 0, &[not(1), not(4), 0, not(0), not(1)]);
+        let mut cand = tm.bank.clauses[j].excluded.clone();
+        cand.sort_unstable();
+        assert_eq!(
+            cand,
+            vec![not(1) as u32, not(4) as u32],
+            "its own literal, its complement and repeats are skipped"
+        );
+        let c = &tm.bank.clauses[j];
+        assert_eq!(
+            c.absorbed_count() as usize + c.included.len() + c.excluded.len(),
+            2 * N_FEATURES,
+            "every literal is held, a candidate or absorbed"
+        );
+        let (xs, ys) = exception_data();
+        let data = encode(&xs, &Encoder::for_binary(N_FEATURES));
+        for _ in 0..30 {
+            tm.fit_epoch(&data, &ys);
+        }
+        let mut inc = tm.bank.clauses[j].included.clone();
+        inc.sort_unstable();
+        assert_eq!(inc, vec![0, not(1) as u32], "feature 0 AND NOT feature 1");
     }
 
     #[test]
