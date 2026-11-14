@@ -870,6 +870,37 @@ impl SparseClauseBank {
         c.absorbed = FIXED | exceptions | (cap << CAP_SHIFT) | count;
     }
 
+    /// Give fixed clause `cj` these literals as candidates too (just below
+    /// inclusion, as [`fix_clause`](Self::fix_clause) gives its own): ones it
+    /// already holds, and its literals' complements, are skipped.
+    pub(crate) fn add_candidates(&mut self, cj: usize, literals: &[u32]) {
+        let n_literals = self.n_literals as u32;
+        let n_features = n_literals / 2;
+        let state = self.half - 1;
+        let c = &mut self.clauses[cj];
+        let complement = |l: u32| {
+            if l < n_features {
+                l + n_features
+            } else {
+                l - n_features
+            }
+        };
+        for &l in literals {
+            assert!(l < n_literals, "literal {l} out of range");
+            if c.included.contains(&l)
+                || c.included.contains(&complement(l))
+                || c.excluded.contains(&l)
+            {
+                continue;
+            }
+            c.excluded.push(l);
+            c.excluded_state.push(state);
+        }
+        let held = (c.included.len() + c.excluded.len() + c.unallocated.len()) as u32;
+        let count = n_literals.saturating_sub(held).min(ABSORBED_COUNT);
+        c.absorbed = (c.absorbed & !ABSORBED_COUNT) | count;
+    }
+
     /// Insert `n` disabled clauses before clause `at` (`at` may be the
     /// number of clauses, to append).
     pub(crate) fn insert_disabled(&mut self, at: usize, n: usize) {

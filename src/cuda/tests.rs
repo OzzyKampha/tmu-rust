@@ -341,6 +341,51 @@ mod coalesced {
         );
     }
 
+    /// Rule clauses: fixed clauses added after the learned ones, which keep
+    /// their literals while their weights learn.
+    fn with_rule_clauses(n_classes: usize) -> CoalescedTsetlinMachine {
+        let mut tm = CoalescedTsetlinMachine::with_config(n_classes, 12, 10, 10, 3.9, 8, true, 6)
+            .type_iii_feedback(5.0);
+        tm.add_clauses(4);
+        let w = |v: i32| {
+            (0..n_classes)
+                .map(|c| if c == 1 { v } else { -v })
+                .collect::<Vec<_>>()
+        };
+        // Literal 12 + f is NOT feature f.
+        tm.inject_fixed_clause(10, &[0, 13], &w(6));
+        tm.inject_fixed_clause(11, &[12, 1], &w(6));
+        tm.inject_fixed_clause(12, &[2], &w(3));
+        tm.inject_fixed_clause(13, &[3, 15], &w(2));
+        tm
+    }
+
+    #[test]
+    fn matches_cpu_with_rule_clauses() {
+        if skip() {
+            return;
+        }
+        check(|| with_rule_clauses(2), 2, &device());
+        check(
+            || with_rule_clauses(3).clause_drop_p(0.2).literal_drop_p(0.1),
+            3,
+            &device(),
+        );
+        // The fixed clauses kept their literals on the GPU too.
+        let (xs, ys) = xor_data(150, 12, 0.1, 13);
+        let batch = encode(&xs, 12);
+        let tm = with_rule_clauses(2);
+        let mut gpu = tm.to_cuda(&device()).unwrap();
+        for _ in 0..3 {
+            gpu.fit_epoch(&batch, &ys).unwrap();
+        }
+        let back = gpu.to_cpu().unwrap();
+        for j in 10..14 {
+            assert!(back.is_fixed(j));
+            assert_eq!(back.clause_rule(j), tm.clause_rule(j), "clause {j}");
+        }
+    }
+
     #[test]
     fn matches_cpu_all_options() {
         if skip() {
@@ -807,7 +852,19 @@ mod sparse {
         epochs: usize,
         dev: &CudaDevice,
     ) {
-        let nf = 12;
+        check_with(make, n_classes, epochs, dev, 12, true);
+    }
+
+    /// `nf` features; `staged` = the sample's literal rows in shared memory
+    /// (else read from global memory, as for too many literals).
+    fn check_with(
+        make: impl Fn() -> TMSparseClassifier,
+        n_classes: usize,
+        epochs: usize,
+        dev: &CudaDevice,
+        nf: usize,
+        staged: bool,
+    ) {
         let (xs, mut ys) = xor_data(150, nf, 0.1, 31);
         for (y, x) in ys.iter_mut().zip(&xs) {
             *y = (*y + x[3] as usize) % n_classes;
@@ -815,6 +872,9 @@ mod sparse {
         let batch = encode(&xs, nf);
         let mut cpu = make();
         let mut gpu = make().to_cuda(dev).unwrap();
+        if !staged {
+            gpu.stage_literals(false);
+        }
         for _ in 0..epochs {
             cpu.fit_epoch(&batch, &ys);
             gpu.fit_epoch(&batch, &ys).unwrap();
@@ -940,6 +1000,8 @@ mod sparse {
                 max_gained: 1,
             },
         );
+        // Hand-picked exception candidates too (NOT features 4 and 5).
+        tm.add_rule_candidates(1, 10, &[16, 17]);
         tm.inject_fixed_clause(2, 12, &[15], 2);
         // Fires on half the samples (feature 2 is noise), so its exceptions-only
         // flag decides often.
@@ -964,6 +1026,42 @@ mod sparse {
         }
         check(|| with_rule_clauses(false), 3, 6, &device_serial());
         check(|| with_rule_clauses(false), 3, 2, &device());
+    }
+
+    #[test]
+    fn matches_cpu_with_literals_in_global_memory() {
+        if skip() {
+            return;
+        }
+        // The path for more literals than fit shared memory.
+        check_with(
+            || with_rule_clauses(false),
+            3,
+            3,
+            &device_serial(),
+            12,
+            false,
+        );
+        let make =
+            || TMSparseClassifier::with_config(2, 12, 10, 8, 3.9, 8, true, 1).literal_drop_p(0.2);
+        check_with(make, 2, 3, &device(), 12, false);
+    }
+
+    #[test]
+    fn matches_cpu_with_several_literal_words() {
+        if skip() {
+            return;
+        }
+        // 100 features: 200 literals in 4 words, staged by several threads.
+        let make = || {
+            TMSparseClassifier::with_config(2, 100, 10, 8, 3.9, 8, true, 3)
+                .absorbing(2)
+                .literal_sampling(0.3)
+                .literal_insertion_state(4)
+                .literal_drop_p(0.1)
+        };
+        check_with(make, 2, 3, &device(), 100, true);
+        check_with(make, 2, 2, &device(), 100, false);
     }
 
     #[test]

@@ -6,6 +6,36 @@ All notable changes to tmu-rs are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Rule clauses in the coalesced machine:** `CoalescedTsetlinMachine::add_clauses(n)`
+  appends clauses to the shared bank, keeping everything learned, and
+  `inject_fixed_clause(j, literals, class_weights)` makes clause `j` hold
+  exactly a rule's literals, with a starting weight per class. A fixed clause
+  takes no literal feedback (Type I, II or III), so its literals never change,
+  while its per-class weights learn like any clause's. Which clauses are fixed
+  is a training setting, not saved (the format is unchanged): `set_fixed(j,
+  true)` marks them again after loading, and `is_fixed(j)` reads it. They
+  train on the GPU as on the CPU (`co_update` skips a fixed clause's literal
+  feedback and its draw), bit-identical in the emulator tests.
+
+- **Chosen exception candidates for rule clauses:**
+  `TMSparseClassifier::add_rule_candidates(class, j, literals)` gives a rule
+  clause specific literals as candidates, next to any random share: e.g. the
+  negations of tokens present when the rule fires on normal events, so it can
+  learn the exception that stops its false alarms.
+
+### Changed
+- **Faster sparse-bank training on the GPU:** `CudaTMSparseClassifier` stores
+  each clause's included, excluded and unallocated lists slot-major (slot `i`
+  of clause `c` at `i * n_clauses + c`) instead of clause by clause. One thread
+  walks one clause's lists, so the 32 threads of a warp used to read 32 rows
+  `n_literals` apart on every step, one memory transaction each; they now read
+  adjacent words. The training sample's literal and active-literal rows are
+  staged in shared memory (up to 3,072 words, 196,608 literals), so testing a
+  literal no longer costs a global load. The algorithm, and so every state,
+  weight and RNG, is unchanged: the emulator tests still match the CPU
+  bit for bit, with the rows in shared and in global memory.
+
 ## [1.2.0] — 2026-11-07
 
 ### Added

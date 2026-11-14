@@ -75,6 +75,7 @@ params! {
     CoUpdateParams {
         ta: u64, include: u64, weights: u64, rngs: u64, ind: u64, cat: u64, valid: u64,
         lit: u64, act: u64, fire: u64, active: u64, plan: u64, inv: u64, keep: u64,
+        fixed: u64,
         d: f64, type_i_p: f64, type_ii_p: f64, max_inc: u64, max_pos: u64,
         n_clauses: u32, words: u32, n_literals: u32,
         threshold: i32,
@@ -119,6 +120,7 @@ params! {
     SparseBank {
         inc_idx: u64, exc_idx: u64, una_idx: u64, inc_st: u64, exc_st: u64,
         n_inc: u64, n_exc: u64, n_una: u64, n_abs: u64,
+        stride: u64,
     }
     SpFireParams {
         bank: SparseBank,
@@ -126,6 +128,7 @@ params! {
         class_rngs: u64, drop_s0: u64,
         drop_p: f64,
         n_groups: u32, cpg: u32, n_literals: u32, n_fire_blocks: u32,
+        smem_words: u32, _pad: u32,
     }
     SpUpdateParams {
         bank: SparseBank,
@@ -137,7 +140,7 @@ params! {
         boost: u32, half: u32, max_state: u32, absorbing: i32,
         type_i_p: f64, type_ii_p: f64,
         insertion: i32, rate: u32, confidence: u32, weighted: u32,
-        fixed_only: u32, _pad: u32,
+        fixed_only: u32, smem_words: u32,
     }
     ScoresParams {
         include: u64, valid: u64, lits: u64, weights: u64, out: u64,

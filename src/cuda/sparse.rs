@@ -17,7 +17,10 @@ use crate::models::TMSparseClassifier;
 /// fixed-capacity device arrays, and one GPU thread per clause runs the same
 /// sequential absorbing-action algorithm as the CPU (so results are
 /// bit-identical). Parallelism is across clauses; device memory is
-/// `~14 bytes × n_clauses × n_literals`.
+/// `~14 bytes × n_clauses × n_literals`. The lists are stored slot-major
+/// (slot `i` of clause `c` at `i * n_clauses + c`), so the threads of a warp
+/// read adjacent words as they walk their clauses' lists in step, and a
+/// training sample's literal rows are staged in shared memory.
 pub struct CudaTMSparseClassifier {
     host: TMSparseClassifier,
     dev: CudaDevice,
@@ -33,7 +36,13 @@ pub struct CudaTMSparseClassifier {
     sums: DevBuf<i32>,
     fire: DevBuf<u8>,
     drop_s0: DevBuf<u64>,
+    /// Words of a sample's lit / act rows staged in shared memory (0 = too
+    /// many literals for it: read from global memory).
+    smem_words: u32,
 }
+
+/// Shared memory a block may use without opting in.
+const SMEM_LIMIT: usize = 48 * 1024;
 
 struct DevBank {
     inc_idx: DevBuf<u32>,
@@ -45,6 +54,8 @@ struct DevBank {
     n_exc: DevBuf<u32>,
     n_una: DevBuf<u32>,
     n_abs: DevBuf<u32>,
+    /// Clauses in the bank: the distance between a clause's slots.
+    stride: u64,
 }
 
 impl DevBank {
@@ -59,6 +70,7 @@ impl DevBank {
             n_exc: self.n_exc.ptr(),
             n_una: self.n_una.ptr(),
             n_abs: self.n_abs.ptr(),
+            stride: self.stride,
         }
     }
 }
@@ -83,13 +95,19 @@ impl CudaTMSparseClassifier {
         let mut exc_st = vec![0u8; n * nl];
         let (mut n_inc, mut n_exc, mut n_una) = (vec![0u32; n], vec![0u32; n], vec![0u32; n]);
         let n_abs: Vec<u32> = clauses.iter().map(|c| c.absorbed).collect();
+        // Slot-major: slot i of clause c at i * n + c.
         for (c, cl) in clauses.iter().enumerate() {
-            let b = c * nl;
-            inc_idx[b..b + cl.included.len()].copy_from_slice(&cl.included);
-            inc_st[b..b + cl.included.len()].copy_from_slice(&cl.included_state);
-            exc_idx[b..b + cl.excluded.len()].copy_from_slice(&cl.excluded);
-            exc_st[b..b + cl.excluded.len()].copy_from_slice(&cl.excluded_state);
-            una_idx[b..b + cl.unallocated.len()].copy_from_slice(&cl.unallocated);
+            for (i, (&l, &st)) in cl.included.iter().zip(&cl.included_state).enumerate() {
+                inc_idx[i * n + c] = l;
+                inc_st[i * n + c] = st;
+            }
+            for (i, (&l, &st)) in cl.excluded.iter().zip(&cl.excluded_state).enumerate() {
+                exc_idx[i * n + c] = l;
+                exc_st[i * n + c] = st;
+            }
+            for (i, &l) in cl.unallocated.iter().enumerate() {
+                una_idx[i * n + c] = l;
+            }
             n_inc[c] = cl.included.len() as u32;
             n_exc[c] = cl.excluded.len() as u32;
             n_una[c] = cl.unallocated.len() as u32;
@@ -104,6 +122,7 @@ impl CudaTMSparseClassifier {
             n_exc: DevBuf::from_slice(dev, &n_exc)?,
             n_una: DevBuf::from_slice(dev, &n_una)?,
             n_abs: DevBuf::from_slice(dev, &n_abs)?,
+            stride: n as u64,
         };
         let w = host.words;
         let chunk = (STAGE_BYTES / (w * 8)).clamp(1, TRAIN_CHUNK);
@@ -125,9 +144,22 @@ impl CudaTMSparseClassifier {
             sums: DevBuf::zeros(dev, chunk * 2)?,
             fire: DevBuf::zeros(dev, 2 * host.clauses_per_class)?,
             drop_s0: DevBuf::zeros(dev, 2)?,
+            smem_words: if 2 * w * 8 <= SMEM_LIMIT { w as u32 } else { 0 },
             host,
             dev: dev.clone(),
         })
+    }
+
+    /// Stage a training sample's literal rows in shared memory (the default
+    /// when they fit) or read them from global memory. Results are the same.
+    #[cfg(test)]
+    pub(crate) fn stage_literals(&mut self, on: bool) {
+        let w = self.host.words;
+        self.smem_words = if on && 2 * w * 8 <= SMEM_LIMIT {
+            w as u32
+        } else {
+            0
+        };
     }
 
     /// The device this model lives on.
@@ -143,8 +175,8 @@ impl CudaTMSparseClassifier {
     /// Copy the learned state back into a CPU [`TMSparseClassifier`].
     pub fn to_cpu(&self) -> Result<TMSparseClassifier> {
         let mut m = self.host.clone();
-        let nl = m.n_literals;
         let b = &self.bank;
+        let n = b.stride as usize;
         let (inc_idx, exc_idx, una_idx) = (
             b.inc_idx.download()?,
             b.exc_idx.download()?,
@@ -158,14 +190,14 @@ impl CudaTMSparseClassifier {
         );
         let n_abs = b.n_abs.download()?;
         for (c, cl) in m.bank.clauses.iter_mut().enumerate() {
-            let base = c * nl;
             let (ni, ne, nu) = (n_inc[c] as usize, n_exc[c] as usize, n_una[c] as usize);
+            let slots = |len: usize| (0..len).map(move |i| i * n + c);
             *cl = SparseClause {
-                included: inc_idx[base..base + ni].to_vec(),
-                included_state: inc_st[base..base + ni].to_vec(),
-                excluded: exc_idx[base..base + ne].to_vec(),
-                excluded_state: exc_st[base..base + ne].to_vec(),
-                unallocated: una_idx[base..base + nu].to_vec(),
+                included: slots(ni).map(|k| inc_idx[k]).collect(),
+                included_state: slots(ni).map(|k| inc_st[k]).collect(),
+                excluded: slots(ne).map(|k| exc_idx[k]).collect(),
+                excluded_state: slots(ne).map(|k| exc_st[k]).collect(),
+                unallocated: slots(nu).map(|k| una_idx[k]).collect(),
                 absorbed: n_abs[c],
             };
         }
@@ -252,10 +284,13 @@ impl CudaTMSparseClassifier {
                     cpg: cps as u32,
                     n_literals: h.n_literals as u32,
                     n_fire_blocks,
+                    smem_words: self.smem_words,
+                    _pad: 0,
                 };
+                let smem = 2 * 8 * self.smem_words;
                 self.dev
                     .inner
-                    .launch("sp_fire", n_fire_blocks + blocks(2, ib), ib, 0, &fp)?;
+                    .launch("sp_fire", n_fire_blocks + blocks(2, ib), ib, smem, &fp)?;
                 let up = SpUpdateParams {
                     bank: fp.bank,
                     weights: self.weights.ptr(),
@@ -286,11 +321,11 @@ impl CudaTMSparseClassifier {
                     confidence: h.confidence_driven_updating as u32,
                     weighted: h.weighted_clauses as u32,
                     fixed_only: h.fixed_only as u32,
-                    _pad: 0,
+                    smem_words: self.smem_words,
                 };
                 self.dev
                     .inner
-                    .launch("sp_update", blocks(2 * cps, ib), ib, 0, &up)?;
+                    .launch("sp_update", blocks(2 * cps, ib), ib, smem, &up)?;
             }
         }
         Ok(())

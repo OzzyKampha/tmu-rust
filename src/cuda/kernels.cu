@@ -734,14 +734,16 @@ __device__ void coalesced_pass(u8* ta, u64* inc, int* w, u64* rng_sh, u8* ind, u
                                int n_literals, int target, double prob, int out_j, int active,
                                u64 max_inc, double d, u32 boost, u32 half, u32 max_state,
                                u32 type_iii, double pf_i, double pf_ii, int allow_inc,
-                               u32 half_ind, u32 max_ind) {
+                               u32 half_ind, u32 max_ind, int fixed_j) {
     __shared__ int s_action, s_count;
     if (!active) return;
     if (threadIdx.x == 0) {
         int positive = *w >= 0;
         int give_i = target ? positive : !positive;
         int action = ACT_NONE;
-        if (rng_f64(rng_sh) <= prob * (give_i ? pf_i : pf_ii)) {
+        // A fixed (rule) clause keeps its literals: no literal feedback, and no
+        // draw for it; only its weight learns.
+        if (!fixed_j && rng_f64(rng_sh) <= prob * (give_i ? pf_i : pf_ii)) {
             if (give_i) {
                 action = out_j ? ACT_IA : ACT_IB;
             } else if (out_j) {
@@ -768,7 +770,7 @@ __device__ void coalesced_pass(u8* ta, u64* inc, int* w, u64* rng_sh, u8* ind, u
     }
     ta_feedback_block(ta, inc, valid, lit, act, ex_a, ex_b, inv, keep, words, n_literals, s_action,
                       boost, half, max_state);
-    if (type_iii)
+    if (type_iii && !fixed_j)
         type_iii_block(ta, ind, cat, inc, lit, valid, act, ex_a, ex_b, words, n_literals, d, prob,
                        target, rng_sh, half, max_state, half_ind, max_ind);
 }
@@ -911,6 +913,7 @@ struct CoUpdateParams {
     const int* plan;
     const u64* inv;
     const u64* keep;
+    const u8* fixed;       // [n_clauses]: fixed (rule) clauses, or null for none
     double d;
     double type_i_p, type_ii_p;  // TMU's type_i_ii_ratio factors
     u64 max_inc;
@@ -930,6 +933,7 @@ extern "C" __global__ void co_update(const CoUpdateParams p) {
     u8* ind = p.type_iii ? p.ind + (u64)j * p.n_literals : 0;
     u64* cat = p.type_iii ? p.cat + (u64)j * p.words : 0;
     int out_j = p.fire[j], active = p.active[j];
+    int fixed_j = p.fixed ? p.fixed[j] : 0;
     if (threadIdx.x == 0) s_rng = p.rngs[j];
     for (int pass = 0; pass < 2; pass++) {
         int c = p.plan[pass];
@@ -942,7 +946,8 @@ extern "C" __global__ void co_update(const CoUpdateParams p) {
                        p.inv + (u64)pass * p.words, p.keep + (u64)pass * p.words, p.words,
                        p.n_literals, target, prob, out_j, active, p.max_inc, p.d, p.boost, p.half,
                        p.max_state, p.type_iii, p.type_i_p, p.type_ii_p,
-                       p.max_pos == NO_LIMIT || (u64)p.plan[4] < p.max_pos, p.half_ind, p.max_ind);
+                       p.max_pos == NO_LIMIT || (u64)p.plan[4] < p.max_pos, p.half_ind, p.max_ind,
+                       fixed_j);
         __syncthreads();
         if (threadIdx.x == 0) p.weights[(u64)c * p.n_clauses + j] = s_w;
         __syncthreads();
@@ -1020,7 +1025,7 @@ extern "C" __global__ void cae_update(const CaeUpdateParams p) {
                    p.type_iii ? p.cat + (u64)j * p.words : 0, p.valid, p.lit, p.act, (int)p.o,
                    (int)p.o + p.nf, p.inv, p.keep, p.words, p.n_literals, target, prob, p.fire[j],
                    active, p.max_inc, p.d, p.boost, p.half, p.max_state, p.type_iii, 1.0, 1.0,
-                   1, p.half, p.max_state);
+                   1, p.half, p.max_state, 0);
     __syncthreads();
     if (threadIdx.x == 0) {
         p.rngs[j] = s_rng;
@@ -1175,6 +1180,9 @@ struct SparseBank {
     u32* n_exc;
     u32* n_una;
     u32* n_abs;   // literals absorbed out, per clause, with the clause's flags (below)
+    // Slot i of clause c is at [i * stride + c] (stride = the number of
+    // clauses): the threads of a warp, one clause each, read adjacent words.
+    u64 stride;
 };
 
 // SparseClause::absorbed: the count in bits 0..19, a literal cap in bits
@@ -1194,23 +1202,44 @@ __device__ __forceinline__ bool sp_below_cap(u32 abs, u32 n_inc) {
 
 __device__ __forceinline__ bool bit_of(const u64* v, u32 l) { return (v[l >> 6] >> (l & 63)) & 1ULL; }
 
-__device__ bool sparse_fire_train(const SparseBank& b, u64 cj, u32 nl, const u64* lit,
-                                  const u64* act) {
+__device__ bool sparse_fire_train(const SparseBank& b, u64 cj, const u64* lit, const u64* act) {
     if (b.n_abs[cj] & SP_DISABLED) return false;
     u32 n = b.n_inc[cj];
-    const u32* idx = b.inc_idx + cj * nl;
-    for (u32 i = 0; i < n; i++)
-        if (bit_of(act, idx[i]) && !bit_of(lit, idx[i])) return false;
+    const u32* idx = b.inc_idx + cj;
+    for (u32 i = 0; i < n; i++) {
+        u32 l = idx[(u64)i * b.stride];
+        if (bit_of(act, l) && !bit_of(lit, l)) return false;
+    }
     return true;
 }
 
-__device__ bool sparse_fire_predict(const SparseBank& b, u64 cj, u32 nl, const u64* lit) {
+__device__ bool sparse_fire_predict(const SparseBank& b, u64 cj, const u64* lit) {
     u32 n = b.n_inc[cj];
     if (n == 0 || (b.n_abs[cj] & SP_DISABLED)) return false;
-    const u32* idx = b.inc_idx + cj * nl;
+    const u32* idx = b.inc_idx + cj;
     for (u32 i = 0; i < n; i++)
-        if (!bit_of(lit, idx[i])) return false;
+        if (!bit_of(lit, idx[(u64)i * b.stride])) return false;
     return true;
+}
+
+// The sample's literal and active-literal rows, staged in dynamic shared
+// memory when `words` > 0 (every literal test of the clause scans then reads
+// shared memory, not global); else the global rows. All threads must call it.
+__device__ void sp_stage(const u64* lit, const u64* act, u32 words, const u64** lit_out,
+                         const u64** act_out) {
+    if (words == 0) {
+        *lit_out = lit;
+        *act_out = act;
+        return;
+    }
+    u64* sh = (u64*)tmu_dyn_smem;
+    for (u32 k = threadIdx.x; k < words; k += blockDim.x) {
+        sh[k] = lit[k];
+        sh[words + k] = act[k];
+    }
+    __syncthreads();
+    *lit_out = sh;
+    *act_out = sh + words;
 }
 
 struct SpFireParams {
@@ -1225,15 +1254,18 @@ struct SpFireParams {
     u64* drop_s0;          // [2]
     double drop_p;
     u32 n_groups, cpg, n_literals, n_fire_blocks;
+    u32 smem_words, _pad;  // words of lit/act staged in shared memory (0 = none)
 };
 
 extern "C" __global__ void sp_fire(const SpFireParams p) {
     if (blockIdx.x < p.n_fire_blocks) {
+        const u64 *lit, *act;
+        sp_stage(p.lit, p.act, p.smem_words, &lit, &act);
         u32 t = blockIdx.x * blockDim.x + threadIdx.x;
         if (t >= p.n_groups * p.cpg) return;
         u32 g = t / p.cpg, j = t % p.cpg;
         u64 cj = (u64)p.group_ids[g] * p.cpg + j;
-        bool f = sparse_fire_train(p.bank, cj, p.n_literals, p.lit, p.act);
+        bool f = sparse_fire_train(p.bank, cj, lit, act);
         p.fire[t] = f;
         if (f) {
             int w = p.weights[cj];
@@ -1248,10 +1280,13 @@ extern "C" __global__ void sp_fire(const SpFireParams p) {
     }
 }
 
-__device__ __forceinline__ void sp_swap_remove(u32* idx, u8* st, u32* n, u32 i) {
+// Slot i of a clause's list, `S` (the bank's stride) apart.
+#define SP(a, i) (a)[(u64)(i) * S]
+
+__device__ __forceinline__ void sp_swap_remove(u32* idx, u8* st, u32* n, u32 i, u64 S) {
     u32 last = *n - 1;
-    idx[i] = idx[last];
-    st[i] = st[last];
+    SP(idx, i) = SP(idx, last);
+    SP(st, i) = SP(st, last);
     *n = last;
 }
 
@@ -1277,29 +1312,32 @@ struct SpUpdateParams {
     int insertion;               // TMU's literal_insertion_state; -1 = off
     u32 rate;                    // TMU's feedback_rate_excluded_literals (>= 1)
     u32 confidence, weighted;    // TMU's confidence_driven_updating, weighted_clauses
-    u32 fixed_only, _pad;        // feedback for fixed clauses only
+    u32 fixed_only;              // feedback for fixed clauses only
+    u32 smem_words;              // words of lit/act staged in shared memory (0 = none)
 };
 
 // Lower candidate i to `ns`, absorbing at or below `absorbing` (TMU's
 // ClauseBankSparse). Returns 1 when slot i holds an unvisited literal now.
 __device__ int sp_lower(const SpUpdateParams& p, u32* exc_idx, u8* exc_st, u32* n_exc,
-                        const u32* una_idx, u32* n_una, u32* n_abs, u32 i, u32 ns) {
+                        const u32* una_idx, u32* n_una, u32* n_abs, u32 i, u32 ns, u64 S) {
     if ((int)ns > p.absorbing) {
-        exc_st[i] = (u8)ns;
+        SP(exc_st, i) = (u8)ns;
         return 0;
     }
     if ((*n_abs & SP_COUNT) < SP_COUNT) (*n_abs)++;  // the count saturates below the flags
     if (p.insertion >= 0 && *n_una > 0) {
         (*n_una)--;
-        exc_idx[i] = una_idx[*n_una];
-        exc_st[i] = (u8)p.insertion;
+        SP(exc_idx, i) = SP(una_idx, *n_una);
+        SP(exc_st, i) = (u8)p.insertion;
         return 0;
     }
-    sp_swap_remove(exc_idx, exc_st, n_exc, i);
+    sp_swap_remove(exc_idx, exc_st, n_exc, i, S);
     return 1;
 }
 
 extern "C" __global__ void sp_update(const SpUpdateParams p) {
+    const u64 *lit, *act;
+    sp_stage(p.lit, p.act, p.smem_words, &lit, &act);
     u32 t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= p.n_groups * p.cpg) return;
     u32 g = t / p.cpg, j = t % p.cpg;
@@ -1325,12 +1363,12 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
         return;
     }
     const SparseBank& b = p.bank;
-    u32 nl = p.n_literals;
-    u32* inc_idx = b.inc_idx + cj * nl;
-    u8* inc_st = b.inc_st + cj * nl;
-    u32* exc_idx = b.exc_idx + cj * nl;
-    u8* exc_st = b.exc_st + cj * nl;
-    u32* una_idx = b.una_idx + cj * nl;
+    const u64 S = b.stride;
+    u32* inc_idx = b.inc_idx + cj;
+    u8* inc_st = b.inc_st + cj;
+    u32* exc_idx = b.exc_idx + cj;
+    u8* exc_st = b.exc_st + cj;
+    const u32* una_idx = b.una_idx + cj;
     u32 n_inc = b.n_inc[cj], n_exc = b.n_exc[cj], n_una = b.n_una[cj], n_abs = b.n_abs[cj];
     int fired = p.fire[t];
     int* w = &p.weights[cj];
@@ -1352,53 +1390,53 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
             if (included_phase) {
                 u32 i = 0;
                 while (i < n_inc) {
-                    u32 l = inc_idx[i];
-                    if (!bit_of(p.act, l)) {
+                    u32 l = SP(inc_idx, i);
+                    if (!bit_of(act, l)) {
                         i++;
                         continue;
                     }
-                    u32 st = inc_st[i];
-                    if (fu && bit_of(p.lit, l)) {
-                        if (st < p.max_state && (p.boost || rng_le(&s, keep_p))) inc_st[i] = (u8)(st + 1);
+                    u32 st = SP(inc_st, i);
+                    if (fu && bit_of(lit, l)) {
+                        if (st < p.max_state && (p.boost || rng_le(&s, keep_p))) SP(inc_st, i) = (u8)(st + 1);
                     } else if (rng_le(&s, inv_p)) {
                         u32 ns = st - 1;
                         if (ns < p.half) {
-                            sp_swap_remove(inc_idx, inc_st, &n_inc, i);
-                            exc_idx[n_exc] = l;
-                            exc_st[n_exc] = (u8)ns;
+                            sp_swap_remove(inc_idx, inc_st, &n_inc, i, S);
+                            SP(exc_idx, n_exc) = l;
+                            SP(exc_st, n_exc) = (u8)ns;
                             n_exc++;
                             continue;
                         }
-                        inc_st[i] = (u8)ns;
+                        SP(inc_st, i) = (u8)ns;
                     }
                     i++;
                 }
             } else if (rate == 1 || rng_le(&s, inv_rate)) {
                 u32 i = 0;
                 while (i < n_exc) {
-                    u32 l = exc_idx[i];
-                    if (!bit_of(p.act, l)) {
+                    u32 l = SP(exc_idx, i);
+                    if (!bit_of(act, l)) {
                         i++;
                         continue;
                     }
-                    u32 st = exc_st[i];
-                    if (fu && bit_of(p.lit, l)) {
+                    u32 st = SP(exc_st, i);
+                    if (fu && bit_of(lit, l)) {
                         // An exceptions-only clause gains literals by Type II alone.
                         if (!(n_abs & SP_EXC_ONLY) &&
                             (p.max_inc == NO_LIMIT || (u64)n_inc < p.max_inc) &&
                             sp_below_cap(n_abs, n_inc) && (p.boost || rng_le(&s, keep_p))) {
                             u32 ns = st + rate < p.max_state ? st + rate : p.max_state;
                             if (ns >= p.half) {
-                                sp_swap_remove(exc_idx, exc_st, &n_exc, i);
-                                inc_idx[n_inc] = l;
-                                inc_st[n_inc] = (u8)ns;
+                                sp_swap_remove(exc_idx, exc_st, &n_exc, i, S);
+                                SP(inc_idx, n_inc) = l;
+                                SP(inc_st, n_inc) = (u8)ns;
                                 n_inc++;
                                 continue;
                             }
-                            exc_st[i] = (u8)ns;
+                            SP(exc_st, i) = (u8)ns;
                         }
                     } else if (st > rate && rng_le(&s, inv_p)) {
-                        if (sp_lower(p, exc_idx, exc_st, &n_exc, una_idx, &n_una, &n_abs, i, st - rate))
+                        if (sp_lower(p, exc_idx, exc_st, &n_exc, una_idx, &n_una, &n_abs, i, st - rate, S))
                             continue;
                     }
                     i++;
@@ -1411,24 +1449,24 @@ extern "C" __global__ void sp_update(const SpUpdateParams p) {
         if (rate == 1 || rng_le(&s, inv_rate)) {
             u32 i = 0;
             while (i < n_exc) {
-                u32 l = exc_idx[i];
-                u32 st = exc_st[i];
-                if (bit_of(p.act, l) && !bit_of(p.lit, l)) {
+                u32 l = SP(exc_idx, i);
+                u32 st = SP(exc_st, i);
+                if (bit_of(act, l) && !bit_of(lit, l)) {
                     u32 ns = st + rate < p.max_state ? st + rate : p.max_state;
                     if (ns >= p.half) {
                         // A capped clause that is full keeps the candidate just below inclusion.
                         if (!sp_below_cap(n_abs, n_inc)) {
-                            exc_st[i] = (u8)(p.half - 1);
+                            SP(exc_st, i) = (u8)(p.half - 1);
                             i++;
                             continue;
                         }
-                        sp_swap_remove(exc_idx, exc_st, &n_exc, i);
-                        inc_idx[n_inc] = l;
-                        inc_st[n_inc] = (u8)ns;
+                        sp_swap_remove(exc_idx, exc_st, &n_exc, i, S);
+                        SP(inc_idx, n_inc) = l;
+                        SP(inc_st, n_inc) = (u8)ns;
                         n_inc++;
                         continue;
                     }
-                    exc_st[i] = (u8)ns;
+                    SP(exc_st, i) = (u8)ns;
                 }
                 i++;
             }
@@ -1503,7 +1541,7 @@ extern "C" __global__ void sparse_scores(const SparseScoresParams p) {
     __syncthreads();
     const u64* lit = p.lits + s * p.words;
     for (u32 j = threadIdx.x; j < p.n_clauses; j += blockDim.x) {
-        if (!sparse_fire_predict(p.bank, j, p.n_literals, lit)) continue;
+        if (!sparse_fire_predict(p.bank, j, lit)) continue;
         int w = p.weights[j];
         atomicAdd(&acc[j / p.cpg], ((j % p.cpg) & 1u) ? -w : w);
     }
