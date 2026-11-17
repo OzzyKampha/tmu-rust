@@ -870,6 +870,30 @@ impl SparseClauseBank {
         c.absorbed = FIXED | exceptions | (cap << CAP_SHIFT) | count;
     }
 
+    /// Take these literals out of clause `cj` for good: wherever they are
+    /// (included, a candidate, or waiting to be one), they are dropped and
+    /// counted as absorbed, so neither feedback nor literal insertion brings
+    /// them back. Literals it does not hold are skipped.
+    pub(crate) fn forbid(&mut self, cj: usize, literals: &[u32]) {
+        let c = &mut self.clauses[cj];
+        let mut n = 0u32;
+        for &l in literals {
+            if let Some(i) = c.included.iter().position(|&x| x == l) {
+                c.included.swap_remove(i);
+                c.included_state.swap_remove(i);
+                n += 1;
+            } else if let Some(i) = c.excluded.iter().position(|&x| x == l) {
+                c.excluded.swap_remove(i);
+                c.excluded_state.swap_remove(i);
+                n += 1;
+            } else if let Some(i) = c.unallocated.iter().position(|&x| x == l) {
+                c.unallocated.remove(i);
+                n += 1;
+            }
+        }
+        c.add_absorbed(n);
+    }
+
     /// Give fixed clause `cj` these literals as candidates too (just below
     /// inclusion, as [`fix_clause`](Self::fix_clause) gives its own): ones it
     /// already holds, and its literals' complements, are skipped.

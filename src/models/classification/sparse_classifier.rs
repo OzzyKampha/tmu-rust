@@ -585,6 +585,35 @@ impl TMSparseClassifier {
         self.bank.add_candidates(cj, &lits);
     }
 
+    /// Keep these literals out of learned clause `j` of `class` for good: it
+    /// never includes them, whatever the feedback, and literal insertion
+    /// never hands them back. For steering what a share of the clauses may
+    /// rest on (e.g. most clauses on behaviour, not on novelty features).
+    /// Call it on a configured model, before training: re-initialising the
+    /// bank (setting `literal_sampling`) gives every literal back.
+    ///
+    /// # Panics
+    /// If `class`, `j` or a literal is out of range, or the clause is a fixed
+    /// (rule) or disabled clause.
+    pub fn forbid_literals(&mut self, class: usize, j: usize, literals: &[usize]) {
+        assert!(class < self.n_classes, "class {class} out of range");
+        assert!(j < self.clauses_per_class, "clause {j} out of range");
+        let cj = class * self.clauses_per_class + j;
+        let c = &self.bank.clauses[cj];
+        assert!(
+            !c.is_fixed() && !c.is_disabled(),
+            "clause {j} of class {class} is not a learned clause"
+        );
+        let lits: Vec<u32> = literals
+            .iter()
+            .map(|&l| {
+                assert!(l < self.n_literals, "literal {l} out of range");
+                l as u32
+            })
+            .collect();
+        self.bank.forbid(cj, &lits);
+    }
+
     /// The candidates clause `j` of `class` holds: the literals it may
     /// learn to include (in no particular order).
     pub fn rule_candidates(&self, class: usize, j: usize) -> Vec<usize> {
@@ -1145,6 +1174,61 @@ mod tests {
             std::fs::remove_file(&dir).ok();
             check(&back, 2 * (N_FEATURES + 4));
         }
+    }
+
+    #[test]
+    fn forbidden_literals_never_enter_a_clause() {
+        // Class 1 is "feature 0 present": a clause forbidden feature 0 (and
+        // its negation) must learn without it; the others may use it.
+        let mut tm = TMSparseClassifier::new(2, N_FEATURES, 4, 10, 3.0);
+        let banned = [0usize, N_FEATURES];
+        for c in 0..2 {
+            for j in 0..4 {
+                if j != 0 {
+                    tm.forbid_literals(c, j, &banned);
+                }
+            }
+        }
+        let mut rng = crate::rng::Rng::new(7);
+        let (mut xs, mut ys) = (Vec::new(), Vec::new());
+        for _ in 0..400 {
+            let mut x = vec![0u8; N_FEATURES];
+            for v in x.iter_mut() {
+                *v = (rng.next_u64() & 1) as u8;
+            }
+            ys.push(usize::from(x[0] == 1));
+            xs.push(x);
+        }
+        let enc = Encoder::for_binary(N_FEATURES);
+        let data = encode(&xs, &enc);
+        for _ in 0..20 {
+            tm.fit_epoch(&data, &ys);
+        }
+        let per = tm.clauses_per_class;
+        let holds = |cj: usize, l: u32| {
+            let c = &tm.bank.clauses[cj];
+            c.included.contains(&l) || c.excluded.contains(&l) || c.unallocated.contains(&l)
+        };
+        for c in 0..2 {
+            for j in 1..4 {
+                for &l in &banned {
+                    assert!(
+                        !holds(c * per + j, l as u32),
+                        "class {c} clause {j} holds {l}"
+                    );
+                }
+            }
+        }
+        // The clause left free learned feature 0, the class itself.
+        assert!(tm.bank.clauses[per].included.contains(&0));
+    }
+
+    #[test]
+    #[should_panic(expected = "not a learned clause")]
+    fn a_rule_clause_cannot_be_forbidden_literals() {
+        let mut tm = TMSparseClassifier::new(2, N_FEATURES, 4, 10, 3.0);
+        tm.inject_fixed_clause(1, 0, &[0], 5);
+        tm.forbid_literals(1, 0, &[1]);
     }
 
     #[test]
