@@ -17,7 +17,14 @@ use crate::models::TMSparseClassifier;
 /// fixed-capacity device arrays, and one GPU thread per clause runs the same
 /// sequential absorbing-action algorithm as the CPU (so results are
 /// bit-identical). Parallelism is across clauses; device memory is
-/// `~14 bytes × n_clauses × n_literals`. The lists are stored slot-major
+/// `~14 bytes × n_clauses × slots`, where `slots` is the longest list a clause
+/// can hold: its literals only move between its own lists (and absorbed ones
+/// leave), so a trainable clause never holds more than it had when uploaded,
+/// and a clause that never trains (any but the fixed ones, with
+/// [`fixed_clauses_only`](TMSparseClassifier::fixed_clauses_only)) keeps only
+/// its included literals on the device, which is all firing reads. A rule
+/// machine of a few literals per rule thus takes a few bytes per slot instead
+/// of a row the size of the vocabulary. The lists are stored slot-major
 /// (slot `i` of clause `c` at `i * n_clauses + c`), so the threads of a warp
 /// read adjacent words as they walk their clauses' lists in step, and a
 /// training sample's literal rows are staged in shared memory.
@@ -39,6 +46,12 @@ pub struct CudaTMSparseClassifier {
     /// Words of a sample's lit / act rows staged in shared memory (0 = too
     /// many literals for it: read from global memory).
     smem_words: u32,
+    /// Clauses that never train here (all but the fixed ones, with
+    /// `fixed_only`): only their included literals are on the device, and
+    /// [`to_cpu`](Self::to_cpu) keeps them as they were uploaded.
+    frozen: Vec<bool>,
+    /// Slots per list on the device (the longest list any clause can hold).
+    slots: usize,
 }
 
 /// Shared memory a block may use without opting in.
@@ -85,14 +98,34 @@ impl TMSparseClassifier {
 impl CudaTMSparseClassifier {
     fn new(host: TMSparseClassifier, dev: &CudaDevice) -> Result<Self> {
         check_smem_ints(host.n_classes, "classes")?;
-        let nl = host.n_literals;
         let clauses = &host.bank.clauses;
         let n = clauses.len();
-        let mut inc_idx = vec![0u32; n * nl];
-        let mut exc_idx = vec![0u32; n * nl];
-        let mut una_idx = vec![0u32; n * nl];
-        let mut inc_st = vec![0u8; n * nl];
-        let mut exc_st = vec![0u8; n * nl];
+        // A clause's literals only move between its own three lists (or are
+        // absorbed out), so none of them ever grows past the clause's total at
+        // upload; a clause that never trains needs room for its included
+        // literals only.
+        let frozen: Vec<bool> = clauses
+            .iter()
+            .map(|c| host.fixed_only && !c.is_fixed())
+            .collect();
+        let slots = clauses
+            .iter()
+            .zip(&frozen)
+            .map(|(c, &f)| {
+                if f {
+                    c.included.len()
+                } else {
+                    c.included.len() + c.excluded.len() + c.unallocated.len()
+                }
+            })
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let mut inc_idx = vec![0u32; n * slots];
+        let mut exc_idx = vec![0u32; n * slots];
+        let mut una_idx = vec![0u32; n * slots];
+        let mut inc_st = vec![0u8; n * slots];
+        let mut exc_st = vec![0u8; n * slots];
         let (mut n_inc, mut n_exc, mut n_una) = (vec![0u32; n], vec![0u32; n], vec![0u32; n]);
         let n_abs: Vec<u32> = clauses.iter().map(|c| c.absorbed).collect();
         // Slot-major: slot i of clause c at i * n + c.
@@ -101,6 +134,10 @@ impl CudaTMSparseClassifier {
                 inc_idx[i * n + c] = l;
                 inc_st[i * n + c] = st;
             }
+            n_inc[c] = cl.included.len() as u32;
+            if frozen[c] {
+                continue;
+            }
             for (i, (&l, &st)) in cl.excluded.iter().zip(&cl.excluded_state).enumerate() {
                 exc_idx[i * n + c] = l;
                 exc_st[i * n + c] = st;
@@ -108,7 +145,6 @@ impl CudaTMSparseClassifier {
             for (i, &l) in cl.unallocated.iter().enumerate() {
                 una_idx[i * n + c] = l;
             }
-            n_inc[c] = cl.included.len() as u32;
             n_exc[c] = cl.excluded.len() as u32;
             n_una[c] = cl.unallocated.len() as u32;
         }
@@ -145,6 +181,8 @@ impl CudaTMSparseClassifier {
             fire: DevBuf::zeros(dev, 2 * host.clauses_per_class)?,
             drop_s0: DevBuf::zeros(dev, 2)?,
             smem_words: if 2 * w * 8 <= SMEM_LIMIT { w as u32 } else { 0 },
+            frozen,
+            slots,
             host,
             dev: dev.clone(),
         })
@@ -160,6 +198,12 @@ impl CudaTMSparseClassifier {
         } else {
             0
         };
+    }
+
+    /// Slots per clause list on the device: the longest list a clause can
+    /// hold (see the type's docs).
+    pub fn list_slots(&self) -> usize {
+        self.slots
     }
 
     /// The device this model lives on.
@@ -190,6 +234,10 @@ impl CudaTMSparseClassifier {
         );
         let n_abs = b.n_abs.download()?;
         for (c, cl) in m.bank.clauses.iter_mut().enumerate() {
+            if self.frozen[c] {
+                // Never trained here: the clause as it was uploaded.
+                continue;
+            }
             let (ni, ne, nu) = (n_inc[c] as usize, n_exc[c] as usize, n_una[c] as usize);
             let slots = |len: usize| (0..len).map(move |i| i * n + c);
             *cl = SparseClause {
