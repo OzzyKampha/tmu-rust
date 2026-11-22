@@ -1071,6 +1071,50 @@ mod sparse {
         }
         check(|| with_rule_clauses(true), 3, 6, &device_serial());
     }
+
+    #[test]
+    fn rule_machine_lists_hold_only_what_its_clauses_can() {
+        if skip() {
+            return;
+        }
+        // Rules that do not learn (fixed clauses with their own literals),
+        // training the rules only: the learned clauses never train, so on the
+        // device they keep their included literals (none), and the lists are
+        // as long as the longest rule, not the vocabulary (24 literals).
+        let fixed = || {
+            let mut tm = TMSparseClassifier::with_config(3, 12, 8, 6, 3.0, 4, false, 13)
+                .literal_sampling(0.5)
+                .fixed_clauses_only(true);
+            tm.add_clauses(6);
+            tm.inject_fixed_clause(0, 8, &[0, 13], 6);
+            tm.inject_fixed_clause(1, 9, &[3], 3);
+            tm.inject_fixed_clause(2, 12, &[15, 4, 1], 2);
+            tm
+        };
+        assert_eq!(fixed().to_cuda(&device_serial()).unwrap().list_slots(), 3);
+        check(fixed, 3, 6, &device_serial());
+        // Rules that learn take candidates: their lists hold those too.
+        let total = |c: &crate::clause_bank::sparse::SparseClause| {
+            c.included.len() + c.excluded.len() + c.unallocated.len()
+        };
+        let rules = with_rule_clauses(true);
+        let longest = rules
+            .bank
+            .clauses
+            .iter()
+            .filter(|c| c.is_fixed())
+            .map(total)
+            .max()
+            .unwrap();
+        assert_eq!(
+            rules.to_cuda(&device_serial()).unwrap().list_slots(),
+            longest
+        );
+        // Every clause training: a learned clause can hold its whole pool.
+        let all = with_rule_clauses(false);
+        let pool = all.bank.clauses.iter().map(total).max().unwrap();
+        assert_eq!(all.to_cuda(&device_serial()).unwrap().list_slots(), pool);
+    }
 }
 
 mod refusals {
